@@ -1,4 +1,4 @@
-name: downloader-x
+name: downloader-x-a
 
 on:
   workflow_dispatch:

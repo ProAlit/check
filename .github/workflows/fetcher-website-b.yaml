@@ -1,4 +1,4 @@
-name: "website-capture"
+name: "website-capture-b"
 
 on:
   workflow_dispatch:

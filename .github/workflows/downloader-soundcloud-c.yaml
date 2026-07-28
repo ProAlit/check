@@ -1,4 +1,4 @@
-name: "soundcloud-downloader"
+name: "soundcloud-downloader-c"
 
 on:
   workflow_dispatch:

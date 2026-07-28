@@ -1,4 +1,4 @@
-name: leecher
+name: leecher-g
 
 on:
   workflow_dispatch:

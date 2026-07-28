@@ -1,4 +1,4 @@
-name: "fetcher-website"
+name: "fetcher-website-a"
 
 on:
   workflow_dispatch:

@@ -1,4 +1,4 @@
-name: direct-downloader
+name: direct-downloader-b
 
 on:
   workflow_dispatch:

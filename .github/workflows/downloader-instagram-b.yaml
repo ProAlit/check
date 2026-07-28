@@ -1,4 +1,4 @@
-name: instagram-downloader
+name: instagram-downloader-b
 
 on:
   workflow_dispatch:

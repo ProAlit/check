@@ -1,4 +1,4 @@
-name: downloader-youtube
+name: downloader-youtube-a
 
 on:
   workflow_dispatch:
