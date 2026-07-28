@@ -25,7 +25,7 @@ jobs:
           python -m playwright install-deps chromium
 
       - name: Run archiver
-        run: python telegram/fetch_telegram_pw.py
+        run: python scripts/fetch-telegram.py
 
       - name: Commit and push changes
         run: |
