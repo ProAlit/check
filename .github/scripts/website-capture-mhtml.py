@@ -21,8 +21,8 @@ async def save_mhtml(url: str, output_path: str):
         page = await browser.newPage()
         # Use 'load' instead of 'networkidle0' to avoid Prezi timeout
         await page.goto(url, waitUntil='load', timeout=120000)
-        # Extra wait for lazy content
-        await page.waitForTimeout(5000)
+        # Extra wait for lazy content (using asyncio.sleep instead of waitForTimeout)
+        await asyncio.sleep(5)
         mhtml_data = await page._client.send('Page.captureSnapshot', {})
         with open(output_path, 'wb') as f:
             f.write(mhtml_data['data'].encode())
