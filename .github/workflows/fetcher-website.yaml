@@ -161,7 +161,7 @@ jobs:
           capture_one_mhtml() {
             local url="$1"
             echo "→ MHTML: $url"
-            if python .github/scriptd/website-capture-mhtml.py --url "$url" --bundle "$BUNDLE_STR"; then
+            if python .github/scripts/website-capture-mhtml.py --url "$url" --bundle "$BUNDLE_STR"; then
               echo "✅ MHTML: $url"
             else
               echo "❌ MHTML failed: $url"
