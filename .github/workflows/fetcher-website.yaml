@@ -161,7 +161,7 @@ jobs:
           capture_one_mhtml() {
             local url="$1"
             echo "→ MHTML: $url"
-            if python .github/script/website-capture-mhtml.py --url "$url" --bundle "$BUNDLE_STR"; then
+            if python .github/scriptd/website-capture-mhtml.py --url "$url" --bundle "$BUNDLE_STR"; then
               echo "✅ MHTML: $url"
             else
               echo "❌ MHTML failed: $url"
@@ -193,7 +193,7 @@ jobs:
           capture_one_pdf() {
             local url="$1"
             echo "→ PDF: $url"
-            if node .github/script/website-capture-pdf.js "$url" --bundle "$BUNDLE_STR"; then
+            if node .github/scripts/website-capture-pdf.js "$url" --bundle "$BUNDLE_STR"; then
               echo "✅ PDF: $url"
             else
               echo "❌ PDF failed: $url"
