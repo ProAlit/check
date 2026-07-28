@@ -1,0 +1,36 @@
+name: fetcher-telegram
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install playwright requests
+
+      - name: Install Chromium for Playwright
+        run: |
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+
+      - name: Run archiver
+        run: python telegram/fetch_telegram_pw.py
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -d telegram/content ]; then git add telegram/content/; fi
+          git add telegram/last_ids.json telegram.md
+          git diff --staged --quiet || (git commit -m "Update Telegram messages" && git push)
