@@ -1,4 +1,4 @@
-name: google-play-downloader
+name: downloader-google-play
 
 on:
   workflow_dispatch:
