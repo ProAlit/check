@@ -1,0 +1,134 @@
+name: downloader-telegram-beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_links:
+        description: >
+          Telegram post links (max 1000).
+          Separate by commas, spaces, or newlines.
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      # ── Install tools ────────────────────────────
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 zip
+
+      # ── Download files directly from embed page ──
+      - name: Download files from public links
+        id: download
+        run: |
+          INPUT="${{ github.event.inputs.telegram_links }}"
+          URLS=$(echo "$INPUT" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+          echo "$URLS" | tr ' ' '\n' | grep -v '^$' > telegram_links.txt
+          echo "Links to process:"
+          cat telegram_links.txt
+
+          mkdir -p downloads_tmp
+          index=0
+          while IFS= read -r link; do
+            index=$((index + 1))
+            echo "----------------------------------------"
+            echo "Processing link $index: $link"
+
+            # Fetch the embed page (no cookies, no login)
+            PAGE=$(curl -sL -H 'User-Agent: Mozilla/5.0' "$link?embed=1&mode=compact")
+
+            # Try to extract a direct video / document URL
+            # Patterns:
+            #   1. <video src="https://cdn...">
+            #   2. <a class="tgme_widget_message_link_preview" href="...">
+            #   3. <meta property="og:video" content="...">
+            FILE_URL=$(echo "$PAGE" | grep -oP '(src|href|content)="(https?://[^"]+\.(mp4|mkv|webm|pdf|zip|rar|7z|doc|xls|ppt|jpg|png|gif)[^"]*)"' \
+                       | head -1 | grep -oP 'https?://[^"]+')
+
+            # If no direct URL found, try the <meta> refresh trick (often used for documents)
+            if [ -z "$FILE_URL" ]; then
+              FILE_URL=$(echo "$PAGE" | grep -oP 'content="0; url=(https?://[^"]+)"' | head -1 | cut -d= -f2-)
+            fi
+
+            if [ -z "$FILE_URL" ]; then
+              echo "  Could not extract download URL. The post may require login."
+              continue
+            fi
+
+            # Grab a filename from the URL, or use a fallback
+            FILE_NAME=$(basename "$FILE_URL" | cut -d'?' -f1)
+            [ -z "$FILE_NAME" ] && FILE_NAME="file_${index}"
+
+            echo "  Downloading: $FILE_NAME"
+            aria2c -x 16 -s 16 \
+              --console-log-level=warn \
+              --summary-interval=10 \
+              -d downloads_tmp \
+              -o "$FILE_NAME" \
+              "$FILE_URL" || {
+                echo "  Download failed for $FILE_NAME"
+                continue
+              }
+            echo "  Downloaded: $FILE_NAME"
+
+          done < telegram_links.txt
+
+          # Check if we got any files
+          if [ -z "$(ls -A downloads_tmp 2>/dev/null)" ]; then
+            echo "No files were downloaded." >&2
+            exit 1
+          fi
+          echo "DOWNLOAD_COUNT=$index" >> $GITHUB_OUTPUT
+
+      # ── Zip everything together ──────────────────
+      - name: Zip all downloads
+        id: zip
+        run: |
+          mkdir -p telegram/downloader
+          RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
+          ZIP_NAME="telegram_${RAND5}.zip"
+          TMPZIP="tmpzip_$RAND5"
+          mkdir -p "$TMPZIP"
+          cp downloads_tmp/* "$TMPZIP/" 2>/dev/null
+          (cd "$TMPZIP" && zip -s 99m "../telegram/downloader/${ZIP_NAME}" .)
+          rm -rf downloads_tmp "$TMPZIP"
+          echo "ZIP_PATH=telegram/downloader/$ZIP_NAME" >> $GITHUB_OUTPUT
+
+      # ── Push to repository ───────────────────────
+      - name: Upload to telegram/downloader folder
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git config http.postBuffer 524288000
+          if [ ! -f "${{ steps.zip.outputs.ZIP_PATH }}" ]; then
+            echo "No archive to upload."
+            exit 1
+          fi
+          git add telegram/downloader/
+          COMMIT_MSG="Add: ${{ steps.zip.outputs.ZIP_PATH }} [skip ci]"
+          git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
+          RETRIES=5
+          for i in $(seq 1 $RETRIES); do
+            echo "Push attempt $i..."
+            git pull --rebase --autostash origin "$BRANCH"
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded."
+              break
+            else
+              [ $i -lt $RETRIES ] && sleep 3 || exit 1
+            fi
+          done

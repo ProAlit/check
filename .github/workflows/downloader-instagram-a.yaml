@@ -1,0 +1,249 @@
+name: instagram-downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Instagram URLs – separate by comma, space, or newline'
+        required: true
+      upload_as_release:
+        description: 'Upload files as a GitHub Release (uncheck = split push to repo)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Parse input and extract URLs
+        id: parse
+        run: |
+          INPUT="${{ github.event.inputs.urls }}"
+          CLEANED=$(echo "$INPUT" | tr -d '"'\')
+          URLS=$(echo "$CLEANED" | grep -oP 'https?://(www\.)?instagram\.com/[^\s,;]+' | sort -u)
+          if [ -z "$URLS" ]; then
+            echo "ERROR: No Instagram URLs found in the input."
+            exit 1
+          fi
+          echo "$URLS" > urls.txt
+          echo "Found $(wc -l < urls.txt) URL(s) to download."
+
+      - name: Write cookies from secrets
+        run: |
+          if [ -n "$INSTAGRAM_COOKIES" ]; then
+            echo "$INSTAGRAM_COOKIES" > instagram-cookies.txt
+            echo "Instagram cookies written."
+          else
+            echo "No INSTAGRAM_COOKIES secret found – proceeding without login, may fail for private content."
+          fi
+        env:
+          INSTAGRAM_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
+
+      - name: Restore cached tools
+        uses: actions/cache@v4
+        id: tool-cache
+        with:
+          path: |
+            ~/.local/bin/yt-dlp
+            ~/.deno
+            ~/.cache/pip
+          key: fetch-tools-${{ runner.os }}-v3
+
+      - name: Add cached tools to PATH
+        run: |
+          mkdir -p ~/.local/bin
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Install tools
+        run: |
+          pip install yt-dlp gallery-dl
+          if ! command -v yt-dlp &> /dev/null; then
+            curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/.local/bin/yt-dlp
+            chmod a+rx ~/.local/bin/yt-dlp
+          fi
+          if ! command -v jq &> /dev/null || ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq jq ffmpeg
+          fi
+          if ! command -v deno &> /dev/null; then
+            curl -fsSL https://deno.land/install.sh | sh -s -- -y
+            echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Download Instagram content
+        run: |
+          mkdir -p instagram_downloads
+          GALLERY_DL_ARGS=""
+          if [ -f "instagram-cookies.txt" ]; then
+            GALLERY_DL_ARGS="$GALLERY_DL_ARGS --cookies instagram-cookies.txt"
+          fi
+
+          FAILED_FILE="failed_links.txt"
+          > "$FAILED_FILE"
+
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            echo "::group::Processing $url"
+            success=0
+            for attempt in 1 2 3 4 5; do
+              echo "Attempt $attempt for $url"
+              set +e
+              gallery-dl $GALLERY_DL_ARGS -d "instagram_downloads" "$url" --no-part
+              exit_code=$?
+              set -e
+              if [ $exit_code -eq 0 ]; then
+                success=1
+                echo "Download succeeded."
+                break
+              else
+                echo "Attempt $attempt failed with exit code $exit_code."
+                if [ $attempt -lt 5 ]; then
+                  echo "Waiting 60 seconds before retry..."
+                  sleep 60
+                fi
+              fi
+            done
+            if [ $success -eq 0 ]; then
+              echo "$url" >> "$FAILED_FILE"
+              echo "::warning::Failed to download $url after 5 attempts – logged to $FAILED_FILE"
+            fi
+            echo "::endgroup::"
+          done < urls.txt
+
+          echo "Downloads finished."
+          ls -lhR instagram_downloads/
+          if [ -s "$FAILED_FILE" ]; then
+            echo "Failed links:"
+            cat "$FAILED_FILE"
+          else
+            echo "All links downloaded successfully."
+          fi
+
+      - name: Archive Instagram downloads
+        id: archive
+        run: |
+          UPLOAD_AS_RELEASE="${{ inputs.upload_as_release }}"
+          OUTPUT_DIR="instagram"
+          rm -rf "$OUTPUT_DIR"
+          mkdir -p "$OUTPUT_DIR"
+
+          RANDSTR=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 5)
+          ZIP_NAME="instagram-contents-${RANDSTR}.zip"
+          echo "Archive base name: ${ZIP_NAME}"
+
+          ZIP_ARGS="instagram_downloads/"
+          if [ -f "failed_links.txt" ]; then
+            ZIP_ARGS="$ZIP_ARGS failed_links.txt"
+          fi
+
+          if [ "$UPLOAD_AS_RELEASE" = "true" ]; then
+            zip -j "${OUTPUT_DIR}/${ZIP_NAME}" $ZIP_ARGS
+            FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
+            SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 2044723200 ]; then
+              echo "ZIP larger than 1950 MiB, splitting into 1950M parts"
+              rm "$FULLZIP"
+              zip -j -s 1950m "${OUTPUT_DIR}/${ZIP_NAME}" $ZIP_ARGS
+            fi
+          else
+            zip -j -s 99m "${OUTPUT_DIR}/${ZIP_NAME}" $ZIP_ARGS
+          fi
+
+          echo "Archive contents:"
+          ls -lh "$OUTPUT_DIR"
+
+          ls -1 "$OUTPUT_DIR" > "${OUTPUT_DIR}_assets.txt"
+          cat "${OUTPUT_DIR}_assets.txt"
+
+      - name: Upload to repository (split_push method)
+        if: ${{ inputs.upload_as_release == 'false' }}
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git config http.postBuffer 524288000
+
+          if [ ! -d "instagram" ] || [ -z "$(ls -A instagram)" ]; then
+            echo "Nothing to upload."
+            exit 0
+          fi
+
+          git add instagram/
+          git commit -m "Add Instagram batch download [skip ci]" || echo "Nothing to commit"
+
+          RETRIES=5
+          for i in $(seq 1 $RETRIES); do
+            echo "Push attempt $i..."
+            git pull --rebase --autostash origin "$BRANCH"
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded."
+              break
+            else
+              if [ $i -lt $RETRIES ]; then
+                echo "Push rejected, retrying in 3 seconds..."
+                sleep 3
+              else
+                echo "Push failed after $RETRIES attempts."
+                exit 1
+              fi
+            fi
+          done
+          echo "All files uploaded to the 'instagram' folder."
+
+      - name: Create Release and upload assets
+        if: ${{ inputs.upload_as_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUTPUT_DIR="instagram"
+          ASSETS_FILE="${OUTPUT_DIR}_assets.txt"
+
+          if [ ! -s "$ASSETS_FILE" ]; then
+            echo "No assets to release."
+            exit 0
+          fi
+
+          RAND5=$(tr -dc 'a-z' < /dev/urandom | head -c 5)
+          TAG="instagram-downloader-${RAND5}"
+          echo "Creating release tag: $TAG"
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          git tag "$TAG" -m "Instagram download release"
+          git push origin "$TAG"
+
+          ASSET_ARGS=""
+          while IFS= read -r file; do
+            ASSET_ARGS="$ASSET_ARGS ${OUTPUT_DIR}/$file"
+          done < "$ASSETS_FILE"
+
+          gh release create "$TAG" $ASSET_ARGS \
+            --title "instagram-downloader-${RAND5}" \
+            --notes "Automated release from Instagram Download workflow." \
+            --target "${{ github.ref_name }}"
+
+          echo "Release '$TAG' created with assets."
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf instagram_downloads failed_links.txt urls.txt instagram-cookies.txt instagram_assets.txt 2>/dev/null || true

@@ -1,0 +1,414 @@
+name: "spotify-downloader"
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: >
+          Enter one or more Spotify / Tidal / Apple Music / SoundCloud / YouTube / Pandora URLs
+          (track, album, playlist, artist). Separate by commas, spaces, or newlines.
+        required: true
+        type: string
+      output_format:
+        description: "Output Format"
+        required: true
+        type: choice
+        options:
+          - flac
+          - mp3
+          - m4a
+          - ogg
+          - opus
+          - wav
+        default: flac
+      audio_quality:
+        description: >
+          Audio Quality / Bitrate.
+          For FLAC: LOSSLESS, HI_RES_LOSSLESS, DOLBY_ATMOS, HIGH, LOW.
+          For MP3/M4A/OGG/Opus: 320k, 256k, 192k, 128k.
+        required: true
+        type: choice
+        options:
+          - LOSSLESS
+          - HI_RES_LOSSLESS
+          - DOLBY_ATMOS
+          - HIGH
+          - LOW
+          - 320k
+          - 256k
+          - 192k
+          - 128k
+        default: LOSSLESS
+      upload_method:
+        description: 'Upload destination'
+        required: true
+        type: choice
+        options:
+          - repo
+          - release
+          - drive
+        default: repo
+
+permissions:
+  contents: write
+
+jobs:
+  music-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install System Dependencies
+        shell: bash
+        run: |
+          set -e
+          echo "::group::System packages"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg curl jq zip python3 python3-pip
+          echo "::endgroup::"
+
+          echo "::group::Python tools"
+          pip3 install --quiet --upgrade pip
+          pip3 install --quiet --upgrade SpotiFLAC
+          echo "::endgroup::"
+
+          echo "::group::Versions"
+          ffmpeg -version 2>&1 | head -n1
+          python3 --version
+          spotiflac --version 2>/dev/null || echo "SpotiFLAC version unknown (installed successfully)"
+          echo "::endgroup::"
+
+      - name: Create Music Folder
+        run: mkdir -p music
+
+      - name: Parse and Filter URLs
+        id: parse
+        shell: bash
+        run: |
+          RAW="${{ github.event.inputs.urls }}"
+          URLS=$(echo "$RAW" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+
+          if [ -z "$URLS" ]; then
+            echo "::error::No URLs provided."
+            exit 1
+          fi
+
+          rm -f spotify_urls.txt
+
+          for url in $URLS; do
+            if [[ "$url" =~ ^https?://(open\.spotify\.com|listen\.tidal\.com|music\.apple\.com|soundcloud\.com|youtube\.com|youtu\.be|music\.youtube\.com|pandora\.com|pandora\.app\.link) ]]; then
+              echo "$url" >> spotify_urls.txt
+            else
+              echo "::warning::Skipping unsupported URL: $url"
+            fi
+          done
+
+          echo "::group::URLs to download"
+          cat spotify_urls.txt 2>/dev/null || echo "(none)"
+          echo "::endgroup::"
+
+          if [ -s spotify_urls.txt ]; then
+            echo "HAS_URLS=true" >> $GITHUB_OUTPUT
+          else
+            echo "::error::No valid Spotify/Tidal/Apple Music/etc. URLs found."
+            echo "HAS_URLS=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Download with SpotiFLAC
+        if: steps.parse.outputs.HAS_URLS == 'true'
+        shell: bash
+        run: |
+          FORMAT="${{ github.event.inputs.output_format }}"
+          QUALITY="${{ github.event.inputs.audio_quality }}"
+          FAILED="failed_urls.txt"
+          rm -f "$FAILED"
+
+          echo "::group::SpotiFLAC download config"
+          echo "Format      : $FORMAT"
+          echo "Quality     : $QUALITY"
+          echo "Folder      : music/"
+          echo "Services    : tidal qobuz deezer amazon (fallback)"
+          echo "::endgroup::"
+
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            echo "::group::Downloading: $url"
+            if spotiflac "$url" music \
+              --service tidal qobuz deezer amazon \
+              --quality "$QUALITY" \
+              --use-album-subfolders \
+              --use-artist-subfolders \
+              --filename-format "{artist} - {title}"; then
+              echo "✓ Success"
+            else
+              echo "✗ Failed – recording URL"
+              echo "$url" >> "$FAILED"
+            fi
+            echo "::endgroup::"
+          done < spotify_urls.txt
+
+          echo "::group::SpotiFLAC summary"
+          ls -lhR music/ 2>/dev/null || echo "No files"
+          if [ -f "$FAILED" ]; then
+            echo "::warning::Some downloads failed (see below)"
+            cat "$FAILED"
+          else
+            echo "All downloads succeeded."
+          fi
+          echo "::endgroup::"
+
+      - name: Convert Audio Format (if needed)
+        if: steps.parse.outputs.HAS_URLS == 'true'
+        shell: bash
+        run: |
+          TARGET_FMT="${{ github.event.inputs.output_format }}"
+          BITRATE="${{ github.event.inputs.audio_quality }}"
+
+          if [ "$TARGET_FMT" = "flac" ]; then
+            echo "Output format is FLAC – skipping conversion."
+            exit 0
+          fi
+
+          echo "::group::Converting to $TARGET_FMT ($BITRATE)"
+          find music -type f \( -iname "*.flac" -o -iname "*.m4a" -o -iname "*.mp3" -o -iname "*.ogg" -o -iname "*.opus" -o -iname "*.wav" \) | while read -r f; do
+            base="${f%.*}"
+            out="${base}.${TARGET_FMT}"
+            echo "Converting: $f → $out"
+
+            case "$TARGET_FMT" in
+              mp3)
+                ffmpeg -i "$f" -c:a libmp3lame -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null
+                ;;
+              m4a)
+                ffmpeg -i "$f" -c:a aac -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null
+                ;;
+              ogg)
+                ffmpeg -i "$f" -c:a libvorbis -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null
+                ;;
+              opus)
+                ffmpeg -i "$f" -c:a libopus -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null
+                ;;
+              wav)
+                ffmpeg -i "$f" -c:a pcm_s16le -map_metadata 0 -y "$out" 2>/dev/null
+                ;;
+              *)
+                echo "::warning::Unknown format $TARGET_FMT – keeping original."
+                ;;
+            esac
+
+            if [ -f "$out" ] && [ "$f" != "$out" ]; then
+              rm "$f"
+            fi
+          done
+          echo "::endgroup::"
+
+      - name: Collect Failed URLs
+        if: always()
+        shell: bash
+        run: |
+          if [ -f failed_urls.txt ] && [ -s failed_urls.txt ]; then
+            echo "::warning::Some downloads failed. Adding failed_downloads.txt to the archive."
+            cp failed_urls.txt music/failed_downloads.txt
+          else
+            echo "No failed downloads – no fail log needed."
+          fi
+
+      - name: Validate Download
+        shell: bash
+        run: |
+          SONG_COUNT=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
+          if [ "$SONG_COUNT" -eq 0 ]; then
+            echo "::error::No audio files were downloaded. Exiting."
+            exit 1
+          fi
+          echo "Total songs downloaded: $SONG_COUNT"
+          ls -lhR music/
+
+      - name: Archive Music Folder
+        id: archive
+        shell: bash
+        run: |
+          UPLOAD_METHOD="${{ inputs.upload_method }}"
+
+          if [ "$UPLOAD_METHOD" = "repo" ]; then
+            METHOD="split_push"
+          else
+            METHOD="release"
+          fi
+
+          RANDOM_STR=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_lowercase + string.digits, k=5)))")
+          BASE_NAME="music-${RANDOM_STR}"
+          ZIP_NAME="${BASE_NAME}.zip"
+
+          echo "Upload method: $METHOD"
+
+          rm -rf music_archive
+          mkdir -p music_archive
+
+          cd music || exit 1
+
+          if [ "$METHOD" = "release" ]; then
+            echo "Creating unsplit ZIP (will split only if > 1950 MiB)"
+            zip -r "../music_archive/${ZIP_NAME}" .
+            FULLZIP="../music_archive/${ZIP_NAME}"
+            SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 2044723200 ]; then
+              echo "ZIP larger than 1950 MiB, splitting into 1950M parts"
+              rm "$FULLZIP"
+              zip -r -s 1950m "../music_archive/${ZIP_NAME}" .
+            fi
+          else
+            echo "Creating split ZIP (99 MB parts)"
+            zip -r -s 99m "../music_archive/${ZIP_NAME}" .
+          fi
+          cd ..
+
+          rm -rf music/*
+          mv music_archive/* music/
+          rmdir music_archive 2>/dev/null || true
+
+          ls -lh music/
+          ls -1 music > music_assets.txt
+          echo "Assets list:"
+          cat music_assets.txt
+
+      - name: "Upload to Google Drive"
+        if: inputs.upload_method == 'drive'
+        env:
+          CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: |
+          ACCESS_TOKEN=$(curl -s -X POST https://oauth2.googleapis.com/token \
+            -d client_id="$CLIENT_ID" \
+            -d client_secret="$CLIENT_SECRET" \
+            -d refresh_token="$REFRESH_TOKEN" \
+            -d grant_type=refresh_token | jq -r '.access_token')
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "❌ Failed to obtain access token"
+            exit 1
+          fi
+
+          FOLDER_NAME="github-actions"
+          QUERY="mimeType='application/vnd.google-apps.folder' and name='$FOLDER_NAME' and trashed=false"
+          FOLDER_ID=$(curl -s -G \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            --data-urlencode "q=$QUERY" \
+            --data-urlencode "fields=files(id)" \
+            "https://www.googleapis.com/drive/v3/files" | jq -r '.files[0].id // ""')
+          if [ -z "$FOLDER_ID" ]; then
+            echo "→ Creating folder '$FOLDER_NAME'"
+            FOLDER_ID=$(curl -s -X POST \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\":\"$FOLDER_NAME\", \"mimeType\":\"application/vnd.google-apps.folder\"}" \
+              "https://www.googleapis.com/drive/v3/files?fields=id" | jq -r '.id')
+            if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
+              echo "❌ Failed to create folder"
+              exit 1
+            fi
+          fi
+          echo "✅ Folder ID: $FOLDER_ID"
+
+          for file in music/*; do
+            [ -f "$file" ] || continue
+            fname=$(basename "$file")
+            size=$(stat -c%s "$file")
+            echo "→ Uploading $fname ($size bytes)..."
+            SESSION_URI=$(curl -s -X POST \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "Content-Type: application/json; charset=UTF-8" \
+              -H "X-Upload-Content-Type: application/zip" \
+              -d "{\"name\":\"$fname\", \"parents\":[\"$FOLDER_ID\"]}" \
+              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable" \
+              -D - | tr -d '\r' | grep -i '^location:' | sed 's/^location: //i' | tr -d ' ')
+            if [ -z "$SESSION_URI" ]; then
+              echo "❌ Failed to initiate upload session for $fname, skipping"
+              continue
+            fi
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "Content-Length: $size" \
+              -H "Content-Range: bytes 0-$((size-1))/$size" \
+              --data-binary "@$file" \
+              "$SESSION_URI")
+            if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
+              echo "✅ Uploaded $fname"
+            else
+              echo "❌ Upload failed with HTTP $HTTP_CODE"
+            fi
+          done
+
+      - name: Upload to repository (split_push method)
+        if: ${{ inputs.upload_method == 'repo' }}
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+
+          if [ -z "$(ls -A music/)" ]; then
+            echo "No zip to upload."
+            exit 0
+          fi
+
+          git add music/
+          COMMIT_MSG="Add: $(ls -1 music/ | tr '\n' ' ' | sed 's/ *$//') [skip ci]"
+          git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
+
+          RETRIES=5
+          for i in $(seq 1 $RETRIES); do
+            echo "Push attempt $i..."
+            git pull --rebase --autostash origin "$BRANCH"
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded."
+              break
+            else
+              [ $i -lt $RETRIES ] && sleep 3 || exit 1
+            fi
+          done
+
+      - name: Create Release and upload assets (release method)
+        if: ${{ inputs.upload_method == 'release' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -s music_assets.txt ]; then
+            echo "No assets to release."
+            exit 0
+          fi
+
+          RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
+          TAG="spotify-downloader-${RAND5}"
+          echo "Creating release tag: $TAG"
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          git tag "$TAG" -m "Spotify download release"
+          git push origin "$TAG"
+
+          ASSET_ARGS=""
+          while IFS= read -r file; do
+            ASSET_ARGS="$ASSET_ARGS music/$file"
+          done < music_assets.txt
+
+          gh release create "$TAG" $ASSET_ARGS \
+            --title "spotify-downloader-${RAND5}" \
+            --notes "Automated release from Spotify Download workflow." \
+            --target "${{ github.ref_name }}"
+
+          echo "Release '$TAG' created with assets."
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf music release_files spotify_urls.txt failed_urls.txt music_assets.txt *.zip 2>/dev/null || true

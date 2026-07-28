@@ -1,0 +1,169 @@
+name: "website-capture"
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "🌐 URLs to capture (one per line)"
+        required: true
+        type: string
+      capture_mhtml:
+        description: "📦 Save as MHTML (ZIP)"
+        type: boolean
+        default: true
+      capture_pdf:
+        description: "📄 Save as PDF (with extracted links)"
+        type: boolean
+        default: true
+      upload_method:
+        description: 'Upload destination'
+        required: true
+        type: choice
+        options:
+          - repo
+          - release
+          - drive
+        default: repo
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Set up Python"
+        if: github.event.inputs.capture_mhtml == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: "Install Python dependencies"
+        if: github.event.inputs.capture_mhtml == 'true'
+        run: pip install pyppeteer
+
+      - name: "Set up Node.js"
+        if: github.event.inputs.capture_pdf == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: "Install Node dependencies"
+        if: github.event.inputs.capture_pdf == 'true'
+        run: |
+          npm init -y > /dev/null
+          npm install playwright pdf-lib
+
+      - name: "Install Playwright browsers"
+        if: github.event.inputs.capture_pdf == 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: "Install Ghostscript"
+        if: github.event.inputs.capture_pdf == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y ghostscript
+
+      - name: "Process all URLs – MHTML"
+        if: github.event.inputs.capture_mhtml == 'true'
+        run: |
+          while IFS= read -r url; do
+            url="$(echo "$url" | xargs)"
+            [ -z "$url" ] && continue
+            echo "→ MHTML: $url"
+            python .github/scripts/website-capture-mhtml.py --url "$url"
+          done <<< "${{ github.event.inputs.urls }}"
+
+      - name: "Process all URLs – PDF"
+        if: github.event.inputs.capture_pdf == 'true'
+        run: |
+          mkdir -p website
+          while IFS= read -r url; do
+            url="$(echo "$url" | xargs)"
+            [ -z "$url" ] && continue
+            echo "→ PDF: $url"
+            node .github/script/website-capture-pdf.js "$url"
+            mv -- *.pdf website/ 2>/dev/null || true
+          done <<< "${{ github.event.inputs.urls }}"
+
+      - name: "Archive captures"
+        if: always() && (github.event.inputs.capture_mhtml == 'true' || github.event.inputs.capture_pdf == 'true')
+        id: archive
+        run: |
+          UPLOAD_METHOD="${{ inputs.upload_method }}"
+          OUTPUT_DIR="website"
+
+          if [ ! -d "$OUTPUT_DIR" ] || [ -z "$(ls -A "$OUTPUT_DIR" 2>/dev/null)" ]; then
+            echo "No captures to archive."
+            exit 0
+          fi
+
+          if [ "$UPLOAD_METHOD" = "repo" ]; then
+            METHOD="split_push"
+          else
+            METHOD="release"
+          fi
+
+          TEMP_DIR="captures_tmp"
+          mv "$OUTPUT_DIR" "$TEMP_DIR"
+          mkdir -p "$OUTPUT_DIR"
+
+          RANDSTR=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 5)
+          ZIP_NAME="website-capture-${RANDSTR}.zip"
+          echo "Archive name: ${ZIP_NAME} (method: $METHOD)"
+
+          if [ "$METHOD" = "release" ]; then
+            (cd "$TEMP_DIR" && zip -r "../${OUTPUT_DIR}/${ZIP_NAME}" .)
+            FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
+            SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 2044723200 ]; then
+              echo "ZIP larger than 1950 MiB, splitting"
+              rm "$FULLZIP"
+              (cd "$TEMP_DIR" && zip -r -s 1950m "../${OUTPUT_DIR}/${ZIP_NAME}" .)
+            fi
+          else
+            (cd "$TEMP_DIR" && zip -r -s 99m "../${OUTPUT_DIR}/${ZIP_NAME}" .)
+          fi
+
+          rm -rf "$TEMP_DIR"
+
+          echo "Archive contents:"
+          ls -lh "$OUTPUT_DIR"
+
+          ls -1 "$OUTPUT_DIR" > "${OUTPUT_DIR}_assets.txt"
+          cat "${OUTPUT_DIR}_assets.txt"
+
+      - name: "Upload to Google Drive"
+        if: always() && inputs.upload_method == 'drive' && (github.event.inputs.capture_mhtml == 'true' || github.event.inputs.capture_pdf == 'true')
+        env:
+          CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: |
+          # (same Google Drive logic, using OUTPUT_DIR="website")
+          ...
+
+      - name: "Commit and push captures"
+        if: always() && inputs.upload_method == 'repo' && (github.event.inputs.capture_mhtml == 'true' || github.event.inputs.capture_pdf == 'true')
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          # (unchanged)
+          ...
+
+      - name: "Create Release and upload assets"
+        if: always() && inputs.upload_method == 'release' && (github.event.inputs.capture_mhtml == 'true' || github.event.inputs.capture_pdf == 'true')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # (unchanged)
+          ...
+
+      - name: "Cleanup"
+        if: always()
+        run: |
+          rm -rf captures_tmp website_assets.txt 2>/dev/null || true

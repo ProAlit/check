@@ -1,0 +1,317 @@
+name: google-play-downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: >-
+          One or more Google Play URLs / package names.
+          Separate by commas, spaces, or newlines.
+          Examples:
+            URL:  https://play.google.com/store/apps/details?id=org.telegram.messenger&hl=en
+            Package name:  com.google.android.youtube
+        required: true
+        type: string
+      architecture:
+        description: Target device architecture
+        required: true
+        type: choice
+        default: 'arm64'
+        options:
+          - arm64
+          - armv7
+      merge_splits:
+        description: Bundle all split APKs into one installable APK
+        required: false
+        type: boolean
+        default: true
+      bundle_all:
+        description: 'Bundle all downloaded files into a single ZIP archive before splitting'
+        type: boolean
+        default: false
+      upload_as_release:
+        description: 'Upload files as a GitHub Release (uncheck = split push to repo)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Parse multiple inputs
+        id: parse
+        run: |
+          INPUT="${{ inputs.app }}"
+          MODIFIED=$(echo "$INPUT" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+          if [ -z "$MODIFIED" ]; then
+            echo "Error: No input provided." >&2
+            exit 1
+          fi
+
+          PACKAGES='[]'
+          for token in $MODIFIED; do
+            if echo "$token" | grep -qE '^https?://'; then
+              PACKAGE=$(echo "$token" | grep -oP '(?<=id=)[^&]*')
+              if [ -z "$PACKAGE" ]; then
+                echo "Warning: Could not extract package name from $token – skipping"
+                continue
+              fi
+            else
+              PACKAGE="$token"
+            fi
+            PACKAGES=$(echo "$PACKAGES" | jq -c ". + [\"$PACKAGE\"]")
+          done
+
+          COUNT=$(echo "$PACKAGES" | jq length)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Error: No valid package names found." >&2
+            exit 1
+          fi
+
+          echo "Parsed $COUNT package(s):"
+          echo "$PACKAGES" | jq -r '.[]'
+          echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq openjdk-17-jre-headless apksigner python3 python3-venv python3-pip curl git zip jq
+
+      - name: Clone gplay-apk-downloader
+        run: |
+          git clone https://github.com/alltechdev/gplay-apk-downloader.git
+          cd gplay-apk-downloader
+          ./setup.sh
+
+      - name: Authenticate with Google Play
+        run: |
+          cd gplay-apk-downloader
+          echo "y" | ./gplay auth
+          echo "Authentication completed."
+
+      - name: Download all APKs
+        id: download
+        run: |
+          PACKAGES='${{ steps.parse.outputs.packages }}'
+          ARCH="${{ inputs.architecture }}"
+          MERGE="${{ inputs.merge_splits }}"
+          MAIN_DOWNLOAD_DIR="$RUNNER_TEMP/apk_downloads"
+          rm -rf "$MAIN_DOWNLOAD_DIR"
+          mkdir -p "$MAIN_DOWNLOAD_DIR"
+
+          COUNT=$(echo "$PACKAGES" | jq length)
+          for ((i=0; i<COUNT; i++)); do
+            PKG=$(echo "$PACKAGES" | jq -r ".[$i]")
+            echo "==========================================="
+            echo "Downloading ($((i+1))/$COUNT): $PKG"
+
+            SUBDIR="$MAIN_DOWNLOAD_DIR/$PKG"
+            mkdir -p "$SUBDIR"
+
+            CMD="./gplay download $PKG -a $ARCH -o $SUBDIR"
+            if [ "$MERGE" = "true" ]; then
+              CMD="$CMD -m"
+            fi
+
+            (cd gplay-apk-downloader && $CMD)
+            if [ $? -ne 0 ] || [ -z "$(ls -A "$SUBDIR" 2>/dev/null)" ]; then
+              echo "Warning: No files downloaded for $PKG – skipping"
+              rm -rf "$SUBDIR"
+            else
+              echo "Done: $(ls -1 "$SUBDIR" | wc -l) file(s)"
+            fi
+          done
+
+          if [ -z "$(find "$MAIN_DOWNLOAD_DIR" -type f 2>/dev/null)" ]; then
+            echo "Error: No files downloaded for any package." >&2
+            exit 1
+          fi
+
+          echo "main_download_dir=$MAIN_DOWNLOAD_DIR" >> $GITHUB_OUTPUT
+
+      - name: Archive files
+        id: archive
+        run: |
+          MAIN_DIR="${{ steps.download.outputs.main_download_dir }}"
+          UPLOAD_DIR="${{ github.workspace }}/google-play"
+          rm -rf "$UPLOAD_DIR"
+          mkdir -p "$UPLOAD_DIR"
+
+          BUNDLE_ALL="${{ inputs.bundle_all }}"
+          UPLOAD_AS_RELEASE="${{ inputs.upload_as_release }}"
+
+          if [ "$UPLOAD_AS_RELEASE" = "true" ]; then
+            METHOD="release"
+          else
+            METHOD="split_push"
+          fi
+
+          if [ "$BUNDLE_ALL" = "true" ]; then
+            BUNDLE_TMP="$RUNNER_TEMP/bundle_tmp"
+            mkdir -p "$BUNDLE_TMP"
+
+            find "$MAIN_DIR" -type f | while read -r f; do
+              fname=$(basename "$f")
+              TARGET="$BUNDLE_TMP/$fname"
+              if [ -e "$TARGET" ]; then
+                base="${fname%.*}"
+                ext="${fname##*.}"
+                if [ "$base" = "$ext" ]; then
+                  base="$fname"
+                  ext=""
+                else
+                  ext=".$ext"
+                fi
+                counter=1
+                while [ -e "$BUNDLE_TMP/${base}_${counter}${ext}" ]; do
+                  counter=$((counter + 1))
+                done
+                TARGET="$BUNDLE_TMP/${base}_${counter}${ext}"
+              fi
+              cp "$f" "$TARGET"
+            done
+
+            if [ -z "$(ls -A "$BUNDLE_TMP" 2>/dev/null)" ]; then
+              echo "No files to bundle."
+              rm -rf "$BUNDLE_TMP" "$MAIN_DIR"
+              exit 1
+            fi
+
+            RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
+            BUNDLE_ZIP="google-play_bundle_${RAND5}.zip"
+            echo "📦 Creating bundle ZIP: $BUNDLE_ZIP"
+
+            if [ "$METHOD" = "release" ]; then
+              (cd "$BUNDLE_TMP" && zip -r "../${UPLOAD_DIR}/${BUNDLE_ZIP}" *)
+              FULLZIP="${UPLOAD_DIR}/${BUNDLE_ZIP}"
+              SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+              if [ "$SIZE" -gt 2044723200 ]; then
+                echo "Bundle ZIP larger than 1950 MiB, splitting"
+                rm "$FULLZIP"
+                (cd "$BUNDLE_TMP" && zip -r -s 1950m "../${UPLOAD_DIR}/${BUNDLE_ZIP}" *)
+              fi
+            else
+              (cd "$BUNDLE_TMP" && zip -r -s 99m "../${UPLOAD_DIR}/${BUNDLE_ZIP}" *)
+            fi
+            rm -rf "$BUNDLE_TMP"
+          else
+            RNDSTR=$(tr -dc 'a-z' </dev/urandom | head -c5)
+            find "$MAIN_DIR" -type f | while read -r f; do
+              base=$(basename "$f")
+              echo "→ Archiving $base"
+              if [ "$METHOD" = "release" ]; then
+                zip -j "$UPLOAD_DIR/${base}_${RNDSTR}.zip" "$f"
+                FULLZIP="${UPLOAD_DIR}/${base}_${RNDSTR}.zip"
+                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                if [ "$SIZE" -gt 2044723200 ]; then
+                  echo "ZIP larger than 1950 MiB, splitting"
+                  rm "$FULLZIP"
+                  zip -j -s 1950m "$UPLOAD_DIR/${base}_${RNDSTR}.zip" "$f"
+                fi
+              else
+                zip -j -s 99m "$UPLOAD_DIR/${base}_${RNDSTR}.zip" "$f"
+              fi
+            done
+          fi
+
+          rm -rf "$MAIN_DIR"
+
+          if [ -z "$(ls -A "$UPLOAD_DIR" 2>/dev/null)" ]; then
+            echo "Error: No files were archived."
+            exit 1
+          fi
+
+          ls -1 "$UPLOAD_DIR" > "${UPLOAD_DIR}_assets.txt"
+          echo "Assets to upload:"
+          cat "${UPLOAD_DIR}_assets.txt"
+
+      - name: Upload to repository (split_push method)
+        if: ${{ inputs.upload_as_release == 'false' }}
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git config http.postBuffer 524288000
+
+          if [ -z "$(ls -A google-play/ 2>/dev/null)" ]; then
+            echo "No files to upload."
+            exit 0
+          fi
+
+          git add google-play/
+          PACKAGES='${{ steps.parse.outputs.packages }}'
+          FIRST_NAMES=$(echo "$PACKAGES" | jq -r '.[0:2][]' | paste -sd ' ')
+          COMMIT_MSG="Download $FIRST_NAMES"
+          COUNT=$(echo "$PACKAGES" | jq length)
+          if [ "$COUNT" -gt 2 ]; then
+            COMMIT_MSG="$COMMIT_MSG and $((COUNT-2)) more"
+          fi
+          COMMIT_MSG="$COMMIT_MSG (${{ inputs.architecture }}) [skip ci]"
+          git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
+
+          RETRIES=5
+          for i in $(seq 1 $RETRIES); do
+            echo "Push attempt $i..."
+            git pull --rebase --autostash origin "$BRANCH"
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded."
+              break
+            else
+              if [ $i -lt $RETRIES ]; then
+                echo "Push rejected, retrying in 3 seconds..."
+                sleep 3
+              else
+                echo "Push failed after $RETRIES attempts."
+                exit 1
+              fi
+            fi
+          done
+
+          echo "All files uploaded to the 'google-play' folder."
+
+      - name: Create Release and upload assets (release method)
+        if: ${{ inputs.upload_as_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUTPUT_DIR="google-play"
+          ASSETS_FILE="${OUTPUT_DIR}_assets.txt"
+
+          if [ ! -s "$ASSETS_FILE" ]; then
+            echo "No assets to release."
+            exit 0
+          fi
+
+          RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
+          TAG="google-play-downloader-${RAND5}"
+          echo "Creating release tag: $TAG"
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          git tag "$TAG" -m "Google Play download release"
+          git push origin "$TAG"
+
+          ASSET_ARGS=""
+          while IFS= read -r file; do
+            ASSET_ARGS="$ASSET_ARGS ${OUTPUT_DIR}/$file"
+          done < "$ASSETS_FILE"
+
+          gh release create "$TAG" $ASSET_ARGS \
+            --title "google-play-downloader-${RAND5}" \
+            --notes "Automated release from Google Play Download workflow." \
+            --target "${{ github.ref_name }}"
+
+          echo "Release '$TAG' created with assets."

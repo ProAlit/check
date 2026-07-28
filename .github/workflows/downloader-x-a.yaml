@@ -1,0 +1,187 @@
+name: downloader-x
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Twitter/X URLs or "username l N" – separate by comma, space, or newline'
+        required: true
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: true
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Parse input – build final URL list
+        id: parse
+        run: |
+          INPUT="${{ github.event.inputs.urls }}"
+          CLEANED=$(echo "$INPUT" | tr -d '"'\')
+          URLS=$(echo "$CLEANED" | grep -oP 'https?://(www\.)?(twitter|x)\.com/[^/]+/status/[^\s,;]+' | sort -u)
+          echo "$URLS" > urls_raw.txt
+
+          USER_LIMITS=$(echo "$CLEANED" | grep -oP '[A-Za-z0-9_]+[[:space:]]+[Ll][[:space:]]+[0-9]+' || true)
+          COOKIE_ARG=""
+          [ -f "twitter-cookies.txt" ] && COOKIE_ARG="--cookies twitter-cookies.txt"
+
+          if [ -n "$USER_LIMITS" ]; then
+            echo "User limits found:"
+            echo "$USER_LIMITS"
+            while IFS= read -r line; do
+              USER=$(echo "$line" | awk '{print $1}')
+              COUNT=$(echo "$line" | awk '{print $3}')
+              echo "::group::Fetching latest $COUNT tweets from @$USER"
+              yt-dlp --flat-playlist --playlist-end "$COUNT" \
+                     --print "%(url)s" \
+                     $COOKIE_ARG \
+                     "https://x.com/$USER" 2>/dev/null \
+                     > "user_${USER}_urls.txt" || true
+              cat "user_${USER}_urls.txt" >> urls_raw.txt
+              echo "::endgroup::"
+            done <<< "$USER_LIMITS"
+          fi
+
+          sort -u urls_raw.txt -o urls.txt
+          TOTAL=$(wc -l < urls.txt)
+          echo "Total tweet URLs to process: $TOTAL"
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "ERROR: No Twitter URLs or valid usernames found."
+            exit 1
+          fi
+
+      - name: Write cookies from secrets
+        run: |
+          if [ -n "$TWITTER_COOKIES" ]; then
+            echo "$TWITTER_COOKIES" > twitter-cookies.txt
+            echo "Twitter cookies written."
+          else
+            echo "No TWITTER_COOKIES secret found – proceeding without login."
+          fi
+        env:
+          TWITTER_COOKIES: ${{ secrets.TWITTER_COOKIES }}
+
+      - name: Restore cached tools
+        uses: actions/cache@v4
+        id: tool-cache
+        with:
+          path: |
+            ~/.cache/pip
+          key: fetch-tools-${{ runner.os }}-v3
+
+      - name: Install tools
+        run: |
+          pip install gallery-dl yt-dlp
+          if ! command -v jq &> /dev/null || ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq jq ffmpeg
+          fi
+
+      - name: Download attached media + JSON
+        id: download
+        run: |
+          mkdir -p twitter_downloads
+          GALLERY_DL_ARGS="--write-info-json"
+          if [ -f "twitter-cookies.txt" ]; then
+            GALLERY_DL_ARGS="$GALLERY_DL_ARGS --cookies twitter-cookies.txt"
+          fi
+          # 👇 force folder name to be the @ screen name (not display name)
+          gallery-dl $GALLERY_DL_ARGS \
+                     --input-file urls.txt \
+                     -d "twitter_downloads" \
+                     -o "directory=twitter/{author[name]}" \
+                     --verbose
+
+      - name: Convert JSON to text (.txt) with date, device, content
+        run: |
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            USER=$(echo "$url" | grep -oP '(?:twitter|x)\.com/\K[^/]+')
+            TWEET_ID=$(echo "$url" | grep -oP 'status/(\d+)' | cut -d/ -f2)
+            [ -z "$USER" ] && USER="unknown"
+            [ -z "$TWEET_ID" ] && TWEET_ID="unknown"
+
+            # Now USER matches the folder name because gallery-dl uses author[name] (= screen name)
+            USER_DIR="twitter_downloads/twitter/$USER"
+            INFO_JSON="$USER_DIR/$TWEET_ID.json"
+            mkdir -p "$USER_DIR"
+
+            if [ -f "$INFO_JSON" ]; then
+              DATE=$(jq -r '.date // "unknown date"' "$INFO_JSON")
+              DEVICE=$(jq -r '.source // "web"' "$INFO_JSON")
+              CONTENT=$(jq -r '.full_text // .text // .content // empty' "$INFO_JSON")
+
+              if [ -n "$CONTENT" ]; then
+                printf "[%s] (%s)\n%s\n" "$DATE" "$DEVICE" "$CONTENT" > "$USER_DIR/$TWEET_ID.txt"
+              else
+                printf "[%s] (%s)\n(empty tweet body)\n" "$DATE" "$DEVICE" > "$USER_DIR/$TWEET_ID.txt"
+              fi
+              rm -f "$INFO_JSON"
+            else
+              echo "No media for tweet $TWEET_ID, fetching via oEmbed."
+              EMBED_URL="https://publish.twitter.com/oembed?url=$url"
+              EMBED_JSON=$(curl -s "$EMBED_URL")
+              TEXT=$(echo "$EMBED_JSON" | jq -r '.title // empty' | sed 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g')
+              if [ -n "$TEXT" ]; then
+                printf "(retrieved via oEmbed)\n%s\n" "$TEXT" > "$USER_DIR/$TWEET_ID.txt"
+              else
+                echo "(unavailable or private)" > "$USER_DIR/$TWEET_ID.txt"
+              fi
+            fi
+          done < urls.txt
+
+      - name: Create ZIP archive (username folders at root)
+        id: zip
+        run: |
+          mv twitter_downloads/twitter/* twitter_downloads/ 2>/dev/null || true
+          rmdir twitter_downloads/twitter 2>/dev/null || true
+          mkdir -p twitter
+          RANDSTR=$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | head -c 8)
+          ZIP_NAME="twitter-contents-${RANDSTR}.zip"
+          cd twitter_downloads
+          zip -s 99m -r "../twitter/${ZIP_NAME}" .
+          cd ..
+          echo "Created archive parts:"
+          ls -lh twitter/
+
+      - name: Upload to 'twitter' folder
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git config http.postBuffer 524288000
+          if [ ! -d "twitter" ] || [ -z "$(ls -A twitter)" ]; then
+            echo "Nothing to upload."
+            exit 0
+          fi
+          git add twitter/
+          git commit -m "Add Twitter batch download [skip ci]" || echo "Nothing to commit"
+          RETRIES=5
+          for i in $(seq 1 $RETRIES); do
+            echo "Push attempt $i..."
+            git pull --rebase --autostash origin "$BRANCH"
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded."
+              break
+            else
+              if [ $i -lt $RETRIES ]; then
+                echo "Push rejected, retrying in 3 seconds..."
+                sleep 3
+              else
+                echo "Push failed after $RETRIES attempts."
+                exit 1
+              fi
+            fi
+          done
+          echo "All files uploaded to the 'twitter' folder."

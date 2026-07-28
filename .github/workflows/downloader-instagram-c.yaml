@@ -1,0 +1,192 @@
+name: instagram-downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Instagram URLs – separate by comma, space, or newline'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      # ---------- setup Node.js 24 ----------
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # ---------- extract URLs from input ----------
+      - name: Parse input and extract URLs
+        id: parse
+        run: |
+          INPUT="${{ github.event.inputs.urls }}"
+          CLEANED=$(echo "$INPUT" | tr -d '"'\')
+          URLS=$(echo "$CLEANED" | grep -oP 'https?://(www\.)?instagram\.com/[^\s,;]+' | sort -u)
+          if [ -z "$URLS" ]; then
+            echo "ERROR: No Instagram URLs found in the input."
+            exit 1
+          fi
+          echo "$URLS" > urls.txt
+          echo "Found $(wc -l < urls.txt) URL(s) to download."
+
+      # ---------- write cookies from secrets ----------
+      - name: Write cookies from secrets
+        run: |
+          if [ -n "$INSTAGRAM_COOKIES" ]; then
+            echo "$INSTAGRAM_COOKIES" > instagram-cookies.txt
+            echo "Instagram cookies written."
+          else
+            echo "No INSTAGRAM_COOKIES secret found – proceeding without login, may fail for private content."
+          fi
+        env:
+          INSTAGRAM_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
+
+      # ---------- cache & install tools ----------
+      - name: Restore cached tools
+        uses: actions/cache@v4
+        id: tool-cache
+        with:
+          path: |
+            ~/.local/bin/yt-dlp
+            ~/.deno
+            ~/.cache/pip
+          key: fetch-tools-${{ runner.os }}-v3
+
+      - name: Add cached tools to PATH
+        run: |
+          mkdir -p ~/.local/bin
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Install tools
+        run: |
+          pip install yt-dlp gallery-dl
+          if ! command -v yt-dlp &> /dev/null; then
+            curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/.local/bin/yt-dlp
+            chmod a+rx ~/.local/bin/yt-dlp
+          fi
+          if ! command -v jq &> /dev/null || ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq jq ffmpeg
+          fi
+          if ! command -v deno &> /dev/null; then
+            curl -fsSL https://deno.land/install.sh | sh -s -- -y
+            echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          fi
+
+      # ---------- download all Instagram URLs ----------
+      - name: Download Instagram content
+        run: |
+          mkdir -p instagram_downloads
+          GALLERY_DL_ARGS=""
+          if [ -f "instagram-cookies.txt" ]; then
+            GALLERY_DL_ARGS="$GALLERY_DL_ARGS --cookies instagram-cookies.txt"
+          fi
+
+          # Prepare failed links file
+          FAILED_FILE="failed_links.txt"
+          > "$FAILED_FILE"   # create/empty the file
+
+          # Process each URL individually
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            echo "::group::Processing $url"
+            success=0
+            for attempt in 1 2 3 4 5; do
+              echo "Attempt $attempt for $url"
+              # Run gallery-dl for this single URL; allow the loop to continue on failure
+              set +e
+              gallery-dl $GALLERY_DL_ARGS -d "instagram_downloads" "$url" --no-part
+              exit_code=$?
+              set -e
+              if [ $exit_code -eq 0 ]; then
+                success=1
+                echo "Download succeeded."
+                break
+              else
+                echo "Attempt $attempt failed with exit code $exit_code."
+                if [ $attempt -lt 5 ]; then
+                  echo "Waiting 60 seconds before retry..."
+                  sleep 60
+                fi
+              fi
+            done
+            if [ $success -eq 0 ]; then
+              echo "$url" >> "$FAILED_FILE"
+              echo "::warning::Failed to download $url after 5 attempts – logged to $FAILED_FILE"
+            fi
+            echo "::endgroup::"
+          done < urls.txt
+
+          echo "Downloads finished."
+          ls -lhR instagram_downloads/
+          if [ -s "$FAILED_FILE" ]; then
+            echo "Failed links:"
+            cat "$FAILED_FILE"
+          else
+            echo "All links downloaded successfully."
+          fi
+
+      # ---------- create split ZIP archive with unique random suffix ----------
+      - name: Create ZIP archive (split into 99 MB parts, unique name)
+        id: zip
+        run: |
+          mkdir -p instagram
+          # Generate a unique 8-character suffix
+          RANDSTR=$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | head -c 8)
+          ZIP_NAME="instagram-contents-${RANDSTR}.zip"
+          echo "Using archive base name: ${ZIP_NAME}"
+          # Include downloads and, if present, the failed links file
+          if [ -f "failed_links.txt" ]; then
+            zip -j -s 99m -r "instagram/${ZIP_NAME}" instagram_downloads/ failed_links.txt
+          else
+            zip -j -s 99m -r "instagram/${ZIP_NAME}" instagram_downloads/
+          fi
+          echo "Created archive parts:"
+          ls -lh instagram/
+
+      # ---------- upload to repository ----------
+      - name: Upload to 'instagram' folder
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git config http.postBuffer 524288000
+          if [ ! -d "instagram" ] || [ -z "$(ls -A instagram)" ]; then
+            echo "Nothing to upload."
+            exit 0
+          fi
+          git add instagram/
+          git commit -m "Add Instagram batch download [skip ci]" || echo "Nothing to commit"
+          RETRIES=5
+          for i in $(seq 1 $RETRIES); do
+            echo "Push attempt $i..."
+            git pull --rebase --autostash origin "$BRANCH"
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded."
+              break
+            else
+              if [ $i -lt $RETRIES ]; then
+                echo "Push rejected, retrying in 3 seconds..."
+                sleep 3
+              else
+                echo "Push failed after $RETRIES attempts."
+                exit 1
+              fi
+            fi
+          done
+          echo "All files uploaded to the 'instagram' folder."

@@ -1,0 +1,129 @@
+name: "Website Capture – Multi-URL, MHTML & PDF"
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "🌐 URLs to capture (one per line)"
+        required: true
+        type: string
+      capture_mhtml:
+        description: "📦 Save as MHTML (ZIP)"
+        type: boolean
+        default: true
+      capture_pdf:
+        description: "📄 Save as PDF (with extracted links)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      # ── Python setup (MHTML) ────────────────────
+      - name: "Set up Python"
+        if: github.event.inputs.capture_mhtml == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: "Install Python dependencies"
+        if: github.event.inputs.capture_mhtml == 'true'
+        run: pip install pyppeteer
+
+      # ── Node.js setup (PDF) ─────────────────────
+      - name: "Set up Node.js"
+        if: github.event.inputs.capture_pdf == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: "Install Node dependencies"
+        if: github.event.inputs.capture_pdf == 'true'
+        run: |
+          npm init -y > /dev/null
+          npm install playwright pdf-lib
+
+      - name: "Install Playwright browsers"
+        if: github.event.inputs.capture_pdf == 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: "Install Ghostscript"
+        if: github.event.inputs.capture_pdf == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y ghostscript
+
+      # ── Process all URLs ────────────────────────
+      - name: "Process all URLs – MHTML"
+        if: github.event.inputs.capture_mhtml == 'true'
+        run: |
+          while IFS= read -r url; do
+            url="$(echo "$url" | xargs)"
+            [ -z "$url" ] && continue
+            echo "→ MHTML: $url"
+            python .github/scripts/save_as_mhtml.py --url "$url"
+          done <<< "${{ github.event.inputs.urls }}"
+
+      - name: "Process all URLs – PDF"
+        if: github.event.inputs.capture_pdf == 'true'
+        run: |
+          mkdir -p website
+          while IFS= read -r url; do
+            url="$(echo "$url" | xargs)"
+            [ -z "$url" ] && continue
+            echo "→ PDF: $url"
+            node .github/script/website-capture-pdf.js "$url"
+            # Move the generated PDF into website/
+            mv -- *.pdf website/ 2>/dev/null || true
+          done <<< "${{ github.event.inputs.urls }}"
+
+      # ── Commit & push only 'website/' folder ────
+      - name: "Commit and push captures"
+        if: always() && (github.event.inputs.capture_mhtml == 'true' || github.event.inputs.capture_pdf == 'true')
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+
+          # Add the website folder only if it has files
+          if [ -d "website" ] && [ "$(ls -A website 2>/dev/null)" ]; then
+            git add website/
+          else
+            echo "No files found in website/ – skipping commit."
+            exit 0
+          fi
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add captures for multiple URLs [skip ci]"
+
+          RETRIES=5
+          for i in $(seq 1 $RETRIES); do
+            echo "Push attempt $i..."
+            git pull --rebase --autostash origin "$BRANCH"
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded."
+              break
+            else
+              if [ $i -lt $RETRIES ]; then
+                echo "Push rejected, retrying in 3 seconds..."
+                sleep 3
+              else
+                echo "Push failed after $RETRIES attempts."
+                exit 1
+              fi
+            fi
+          done

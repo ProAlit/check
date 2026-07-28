@@ -1,0 +1,202 @@
+name: aio-cleaner
+on:
+  workflow_dispatch:
+    inputs:
+      clean_all:
+        description: 'Clean ALL platforms (telegram, youtube, x, instagram, website, leecher, google-play, direct)'
+        required: false
+        type: boolean
+        default: false
+      clean_telegram:
+        description: 'Clean Telegram'
+        required: false
+        type: boolean
+        default: false
+      clean_youtube:
+        description: 'Clean Youtube'
+        required: false
+        type: boolean
+        default: false
+      clean_x:
+        description: 'Clean X'
+        required: false
+        type: boolean
+        default: false
+      clean_instagram:
+        description: 'Clean Instagram'
+        required: false
+        type: boolean
+        default: false
+      clean_website:
+        description: 'Clean Website'
+        required: false
+        type: boolean
+        default: false
+      clean_leecher:
+        description: 'Clean Leecher folder'
+        required: false
+        type: boolean
+        default: false
+      clean_google_play:
+        description: 'Clean Google Play folder'
+        required: false
+        type: boolean
+        default: false
+      clean_direct:
+        description: 'Clean Direct folder'
+        required: false
+        type: boolean
+        default: false
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Clean selected platforms
+        env:
+          CLEAN_ALL: ${{ github.event.inputs.clean_all }}
+          CLEAN_TELEGRAM: ${{ github.event.inputs.clean_telegram }}
+          CLEAN_YOUTUBE: ${{ github.event.inputs.clean_youtube }}
+          CLEAN_X: ${{ github.event.inputs.clean_x }}
+          CLEAN_INSTAGRAM: ${{ github.event.inputs.clean_instagram }}
+          CLEAN_WEBSITE: ${{ github.event.inputs.clean_website }}
+          CLEAN_LEECHER: ${{ github.event.inputs.clean_leecher }}
+          CLEAN_GOOGLE_PLAY: ${{ github.event.inputs.clean_google_play }}
+          CLEAN_DIRECT: ${{ github.event.inputs.clean_direct }}
+        run: |
+          python << 'EOF'
+          import shutil, os
+          from pathlib import Path
+
+          # Determine what to clean
+          clean_all = os.environ.get("CLEAN_ALL") == "true"
+          platforms = []
+          if clean_all:
+              platforms = ["telegram", "youtube", "x", "instagram", "website", "leecher", "google-play", "direct"]
+          else:
+              if os.environ.get("CLEAN_TELEGRAM") == "true":
+                  platforms.append("telegram")
+              if os.environ.get("CLEAN_YOUTUBE") == "true":
+                  platforms.append("youtube")
+              if os.environ.get("CLEAN_X") == "true":
+                  platforms.append("x")
+              if os.environ.get("CLEAN_INSTAGRAM") == "true":
+                  platforms.append("instagram")
+              if os.environ.get("CLEAN_WEBSITE") == "true":
+                  platforms.append("website")
+              if os.environ.get("CLEAN_LEECHER") == "true":
+                  platforms.append("leecher")
+              if os.environ.get("CLEAN_GOOGLE_PLAY") == "true":
+                  platforms.append("google-play")
+              if os.environ.get("CLEAN_DIRECT") == "true":
+                  platforms.append("direct")
+
+          if not platforms:
+              print("ℹ️ No platforms selected, nothing to clean.")
+              exit(0)
+
+          cleaned = []
+          for platform in platforms:
+              if platform == "telegram":
+                  content_dir = Path("telegram") / "content"
+                  md_file = Path("telegram.md")
+                  deleted = False
+                  if content_dir.exists():
+                      shutil.rmtree(content_dir)
+                      print(" Deleted telegram/content/")
+                      deleted = True
+                  if md_file.exists():
+                      md_file.unlink()
+                      print(" Deleted telegram.md")
+                      deleted = True
+                  if deleted:
+                      cleaned.append("telegram")
+                  else:
+                      print("ℹ️ telegram: nothing to delete")
+              elif platform == "leecher":
+                  folder = Path("leecher")
+                  if folder.exists() and folder.is_dir():
+                      shutil.rmtree(folder)
+                      print(" Deleted leecher/ folder")
+                      cleaned.append("leecher")
+                  else:
+                      print("ℹ️ leecher: folder not found, nothing to delete")
+              elif platform == "google-play":
+                  folder = Path("google-play")
+                  if folder.exists() and folder.is_dir():
+                      shutil.rmtree(folder)
+                      print(" Deleted google-play/ folder")
+                      cleaned.append("google-play")
+                  else:
+                      print("ℹ️ google-play: folder not found, nothing to delete")
+              elif platform == "direct":
+                  folder = Path("direct")
+                  if folder.exists() and folder.is_dir():
+                      shutil.rmtree(folder)
+                      print(" Deleted direct/ folder")
+                      cleaned.append("direct")
+                  else:
+                      print("ℹ️ direct: folder not found, nothing to delete")
+              else:
+                  # youtube, x, instagram, website: delete the whole folder
+                  folder = Path(platform)
+                  if folder.exists() and folder.is_dir():
+                      shutil.rmtree(folder)
+                      print(f" Deleted {platform}/ folder")
+                      cleaned.append(platform)
+                  else:
+                      print(f"ℹ️ {platform}: folder not found, nothing to delete")
+
+          # Write cleaned list for the commit step
+          with open("/tmp/cleaned_platforms.txt", "w") as f:
+              f.write(",".join(cleaned))
+          EOF
+      - name: Commit and push deletions
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          PLATFORMS=$(cat /tmp/cleaned_platforms.txt)
+          if [ -z "$PLATFORMS" ]; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          # Stage deletions for each platform
+          IFS=',' read -ra PLATFORM_ARRAY <<< "$PLATFORMS"
+          for p in "${PLATFORM_ARRAY[@]}"; do
+            if [ "$p" = "telegram" ]; then
+              git add -A telegram/content/ telegram.md 2>/dev/null || true
+            elif [ "$p" = "leecher" ]; then
+              git add -A leecher/ 2>/dev/null || true
+            elif [ "$p" = "google-play" ]; then
+              git add -A google-play/ 2>/dev/null || true
+            elif [ "$p" = "direct" ]; then
+              git add -A direct/ 2>/dev/null || true
+            else
+              git add -A "$p/" 2>/dev/null || true
+            fi
+          done
+          if git diff --staged --quiet; then
+            echo "No deletions to commit."
+            exit 0
+          fi
+          git commit -m "🧹 Clean media: $PLATFORMS (manual trigger) [skip ci]"
+          RETRIES=5
+          for i in $(seq 1 $RETRIES); do
+            echo "Push attempt $i..."
+            git pull --rebase --autostash origin "$BRANCH"
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded."
+              break
+            else
+              echo "Push failed."
+              [ $i -lt $RETRIES ] && sleep 3 || exit 1
+            fi
+          done
