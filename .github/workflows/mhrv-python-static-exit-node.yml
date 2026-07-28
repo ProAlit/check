@@ -1,4 +1,4 @@
-name: "python-mhrv-dynamic-exit-node"
+name: "mhrv-python-static-exit-node"
 
 on:
   workflow_dispatch:
@@ -40,18 +40,18 @@ jobs:
           cat <<'EOF' > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
-                    sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
-                    sudo chmod 600 /etc/wireguard/wg0.conf
-          
-                    echo "→ Bringing up wg0..."
-                    if sudo wg-quick up wg0; then
-                      echo "✅ WireGuard VPN connected."
-                      echo "vpn_available=true" >> $GITHUB_OUTPUT
-                    else
-                      echo "⚠️ Failed to bring up WireGuard – VPN disabled."
-                      sudo wg-quick down wg0 2>/dev/null || true
-                      echo "vpn_available=false" >> $GITHUB_OUTPUT
-                    fi
+          sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          echo "→ Bringing up wg0..."
+          if sudo wg-quick up wg0; then
+            echo "✅ WireGuard VPN connected."
+            echo "vpn_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Failed to bring up WireGuard – VPN disabled."
+            sudo wg-quick down wg0 2>/dev/null || true
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Download cloudflared
         run: |
@@ -62,27 +62,22 @@ jobs:
         env:
           TUNNEL_AUTH_KEY: ${{ secrets.TUNNEL_AUTH_KEY }}
         run: |
-          python3 .github/script/python-exit-node.py --host 127.0.0.1 --port 8181 &
+          python3 .github/scripts/python-exit-node.py --host 127.0.0.1 --port 8181 &
           sleep 2
 
-      - name: Expose
+      - name: Connect to Cloudflare
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          ./cloudflared tunnel --url http://127.0.0.1:8181 > /tmp/tunnel.log 2>&1 &
+          ./cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" > /tmp/tunnel.log 2>&1 &
           sleep 10
-          PUBLIC_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/tunnel.log | head -1)
-          echo "$PUBLIC_URL" > /tmp/public_url.txt
-          echo "--------------------------------------------------"
-          echo "🌐 $PUBLIC_URL"
-          echo "--------------------------------------------------"
+          echo "🌐 Tunnel established – exit.yourdomain.com is now live."
 
       - name: Run
         run: |
-          PUBLIC_URL=$(cat /tmp/public_url.txt)
-          echo "=================================================="
-          echo "  running perfectly!"
-          echo "  $PUBLIC_URL"
+          echo "running perfectly!"
           echo "=================================================="
           while true; do
             sleep 3600
-            echo "[$(date)] → $PUBLIC_URL"
+            echo "[$(date)] Still alive!"
           done

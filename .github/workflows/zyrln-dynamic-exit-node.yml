@@ -1,4 +1,4 @@
-name: "mhrv-python-static-exit-node"
+name: zyrln-dynamic-exit-node
 
 on:
   workflow_dispatch:
@@ -14,7 +14,8 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: "Set up WireGuard VPN (if enabled)"
         id: vpn
@@ -40,9 +41,6 @@ jobs:
           cat <<'EOF' > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
-          # Fix Windows line endings that break WireGuard key parsing
-          sed -i 's/\r$//' /tmp/wg0.conf
-
           sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
           sudo chmod 600 /etc/wireguard/wg0.conf
 
@@ -56,31 +54,43 @@ jobs:
             echo "vpn_available=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Download cloudflared
-        run: |
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
 
-      - name: Start Node
+      - name: Build relay binary
+        run: go build -o zyrln-relay .github/scripts/zyrln-vps-exit-node.go
+
+      - name: Start relay in background
         env:
-          TUNNEL_AUTH_KEY: ${{ secrets.TUNNEL_AUTH_KEY }}
+          ZYRLN_RELAY_LISTEN: 127.0.0.1:8787
+          ZYRLN_RELAY_KEY: ${{ secrets.TUNNEL_AUTH_KEY }}
         run: |
-          python3 .github/script/python-exit-node.py --host 127.0.0.1 --port 8181 &
-          sleep 2
-
-      - name: Connect to Cloudflare
-        env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
-        run: |
-          ./cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" > /tmp/tunnel.log 2>&1 &
-          sleep 10
-          echo "🌐 Tunnel established – exit.yourdomain.com is now live."
-
-      - name: Run
-        run: |
-          echo "running perfectly!"
-          echo "=================================================="
-          while true; do
-            sleep 3600
-            echo "[$(date)] Still alive!"
+          chmod +x zyrln-relay
+          ./zyrln-relay &
+          for i in $(seq 1 20); do
+            if curl -s http://127.0.0.1:8787/healthz >/dev/null 2>&1; then
+              echo "Relay is up"
+              break
+            fi
+            sleep 0.5
           done
+
+      - name: Install cloudflared
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          ./cloudflared --version
+
+      - name: Create public URL
+        run: |
+          ./cloudflared tunnel --url http://127.0.0.1:8787 2>&1 | tee tunnel.log &
+          sleep 5
+          grep -oP 'https://.*?\.trycloudflare\.com' tunnel.log | head -1 > tunnel-url.txt
+          echo "================================================================="
+          echo "PUBLIC RELAY URL: $(cat tunnel-url.txt)"
+          echo "================================================================="
+
+      - name: Keep alive
+        run: sleep 21600

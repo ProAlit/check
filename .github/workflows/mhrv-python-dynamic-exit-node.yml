@@ -1,4 +1,4 @@
-name: "mhrv-rust-static-exit-node"
+name: "mhrv-python-dynamic-exit-node"
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # maximum 6 hours
+    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v4
@@ -40,18 +40,18 @@ jobs:
           cat <<'EOF' > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
-                    sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
-                    sudo chmod 600 /etc/wireguard/wg0.conf
-          
-                    echo "→ Bringing up wg0..."
-                    if sudo wg-quick up wg0; then
-                      echo "✅ WireGuard VPN connected."
-                      echo "vpn_available=true" >> $GITHUB_OUTPUT
-                    else
-                      echo "⚠️ Failed to bring up WireGuard – VPN disabled."
-                      sudo wg-quick down wg0 2>/dev/null || true
-                      echo "vpn_available=false" >> $GITHUB_OUTPUT
-                    fi
+          sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          echo "→ Bringing up wg0..."
+          if sudo wg-quick up wg0; then
+            echo "✅ WireGuard VPN connected."
+            echo "vpn_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Failed to bring up WireGuard – VPN disabled."
+            sudo wg-quick down wg0 2>/dev/null || true
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Download cloudflared
         run: |
@@ -60,23 +60,29 @@ jobs:
 
       - name: Start Node
         env:
-          EXIT_NODE_PSK: ${{ secrets.EXIT_NODE_PSK }}
+          TUNNEL_AUTH_KEY: ${{ secrets.TUNNEL_AUTH_KEY }}
         run: |
-          pip install brotli
-          python3 .github/script/rust-exit-node.py --host 127.0.0.1 --port 8181 &
-          sleep 2   # give it a moment to bind
+          python3 .github/scripts/python-exit-node.py --host 127.0.0.1 --port 8181 &
+          sleep 2
 
-      - name: Connect to Cloudflare
-        env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      - name: Expose
         run: |
-          ./cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" > /tmp/tunnel.log 2>&1 &
+          ./cloudflared tunnel --url http://127.0.0.1:8181 > /tmp/tunnel.log 2>&1 &
           sleep 10
-          echo "🌐 Tunnel established – exit node is now live."
+          PUBLIC_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+          echo "$PUBLIC_URL" > /tmp/public_url.txt
+          echo "--------------------------------------------------"
+          echo "🌐 $PUBLIC_URL"
+          echo "--------------------------------------------------"
 
       - name: Run
         run: |
+          PUBLIC_URL=$(cat /tmp/public_url.txt)
+          echo "=================================================="
+          echo "  running perfectly!"
+          echo "  $PUBLIC_URL"
+          echo "=================================================="
           while true; do
             sleep 3600
-            echo "[$(date)] running!"
+            echo "[$(date)] → $PUBLIC_URL"
           done

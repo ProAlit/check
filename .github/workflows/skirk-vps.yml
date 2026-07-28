@@ -7,9 +7,6 @@ on:
         description: 'Route all traffic through WireGuard VPN (requires WG_CONFIG secret)'
         type: boolean
         default: false
-  schedule:
-    # Run every 6 hours to keep the exit service alive nearly continuously
-    - cron: '0 */6 * * *'
 
 jobs:
   run-exit:

@@ -1,4 +1,4 @@
-name: zyrln-dynamic-exit-node
+name: zyrln-static-exit-node
 
 on:
   workflow_dispatch:
@@ -41,18 +41,18 @@ jobs:
           cat <<'EOF' > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
-                    sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
-                    sudo chmod 600 /etc/wireguard/wg0.conf
-          
-                    echo "→ Bringing up wg0..."
-                    if sudo wg-quick up wg0; then
-                      echo "✅ WireGuard VPN connected."
-                      echo "vpn_available=true" >> $GITHUB_OUTPUT
-                    else
-                      echo "⚠️ Failed to bring up WireGuard – VPN disabled."
-                      sudo wg-quick down wg0 2>/dev/null || true
-                      echo "vpn_available=false" >> $GITHUB_OUTPUT
-                    fi
+          sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          echo "→ Bringing up wg0..."
+          if sudo wg-quick up wg0; then
+            echo "✅ WireGuard VPN connected."
+            echo "vpn_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Failed to bring up WireGuard – VPN disabled."
+            sudo wg-quick down wg0 2>/dev/null || true
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -60,9 +60,9 @@ jobs:
           go-version: '1.22'
 
       - name: Build relay binary
-        run: go build -o zyrln-relay .github/script/zyrln-vps-exit-node.go
+        run: go build -o zyrln-relay .github/scripts/zyrln-vps-exit-node.go
 
-      - name: Start relay in background
+      - name: Start relay
         env:
           ZYRLN_RELAY_LISTEN: 127.0.0.1:8787
           ZYRLN_RELAY_KEY: ${{ secrets.TUNNEL_AUTH_KEY }}
@@ -81,16 +81,9 @@ jobs:
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
-          ./cloudflared --version
 
-      - name: Create public URL
+      - name: Run static tunnel
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          ./cloudflared tunnel --url http://127.0.0.1:8787 2>&1 | tee tunnel.log &
-          sleep 5
-          grep -oP 'https://.*?\.trycloudflare\.com' tunnel.log | head -1 > tunnel-url.txt
-          echo "================================================================="
-          echo "PUBLIC RELAY URL: $(cat tunnel-url.txt)"
-          echo "================================================================="
-
-      - name: Keep alive
-        run: sleep 21600
+          cloudflared tunnel run --token "$TUNNEL_TOKEN"
