@@ -17,7 +17,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install playwright requests
+        run: pip install playwright requests jdatetime
 
       - name: Install Chromium for Playwright
         run: |
@@ -25,7 +25,7 @@ jobs:
           python -m playwright install-deps chromium
 
       - name: Run archiver
-        run: python scripts/fetch-telegram.py
+        run: python .github/scripts/fetch-telegram.py
 
       - name: Commit and push changes
         run: |
