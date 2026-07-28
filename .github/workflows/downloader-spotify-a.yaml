@@ -87,13 +87,19 @@ jobs:
           set -e
           echo "::group::System packages"
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg curl jq zip python3 python3-pip
+          sudo apt-get install -y -qq ffmpeg curl jq zip python3 python3-pip python3-venv
           echo "::endgroup::"
 
-          echo "::group::Python tools"
-          pip3 install --quiet --upgrade pip
-          pip3 install --quiet --upgrade spotdl
-          pip3 install --quiet --upgrade SpotiFLAC
+          echo "::group::Python virtual environment & tools"
+          python3 -m venv /opt/venv
+          # make venv's binaries available for the rest of the workflow
+          echo "/opt/venv/bin" >> $GITHUB_PATH
+          echo "VIRTUAL_ENV=/opt/venv" >> $GITHUB_ENV
+          source /opt/venv/bin/activate
+          pip install --quiet --upgrade pip
+          pip install --quiet --upgrade spotdl SpotiFLAC
+          # explicit upgrade to avoid any residual version conflicts
+          pip install --quiet --upgrade pyOpenSSL cryptography
           echo "::endgroup::"
 
           echo "📥 Installing Deno..."
