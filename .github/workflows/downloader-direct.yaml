@@ -1,30 +1,27 @@
-name: downloader-mega-nz-a
+name: downloader-direct
 
 on:
   workflow_dispatch:
     inputs:
       url:
         description: >
-          Enter one or more MEGA.nz links (file or folder).
+          Enter one or more Direct Download URLs.
           Separate by commas, spaces, or newlines.
         required: true
       bundle_all:
-        description: 'Bundle all downloaded files into a single ZIP archive'
+        description: 'Bundle all downloaded files into a single split ZIP archive'
         type: boolean
         default: false
       upload_method:
-        description: >
-          Upload method (ignored if "Upload to Google Drive" is checked):
-          - "split_push": split ZIPs into 99MB parts & push to repo (default)
-          - "release": create a GitHub Release & upload ZIPs. ZIPs larger than 1950 MB are automatically split.
-            **Note:** GitHub Release assets are limited to 2 GB per file.
+        description: 'Upload destination'
         required: true
         type: choice
         options:
-          - repo          # split_push (99MB parts) + push to repo
-          - release       # GitHub Release (unsplit, split if >1950MB)
-          - drive         # Google Drive (folder: github-actions)
+          - repo
+          - release
+          - drive
         default: repo
+      # ── NEW INPUTS ───────────────────────────
       vpn_enabled:
         description: 'Route downloads through WireGuard VPN (requires secret WG_CONFIG)'
         type: boolean
@@ -34,12 +31,13 @@ on:
         type: number
         default: 4
         required: false
+      # ─────────────────────────────────────────
 
 permissions:
   contents: write
 
 jobs:
-  mega-nz-download:
+  actions:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -49,11 +47,12 @@ jobs:
         with:
           persist-credentials: true
 
-      - name: Install megatools
+      - name: Install aria2
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq megatools
+          sudo apt-get install -y -qq aria2
 
+      # ── Parse URLs into a file (unchanged) ──
       - name: Parse URLs
         id: parse
         run: |
@@ -69,6 +68,7 @@ jobs:
           NUM=$(wc -l < urls.txt)
           echo "NUM_URLS=$NUM" >> $GITHUB_OUTPUT
 
+      # ── VPN SETUP (identical to Spotify/YouTube) ──
       - name: '🔒 Set up WireGuard VPN (if enabled)'
         id: vpn
         shell: bash
@@ -107,143 +107,75 @@ jobs:
             echo "vpn_available=false" >> $GITHUB_OUTPUT
           fi
 
+      # ── Download in parallel (restructured) ──
       - name: Download all files concurrently
         run: |
           set -e
           VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
           CONCURRENT="${{ inputs.concurrent_downloads }}"
-          DOWNLOAD_BASE="mega_downloads"
+          OUTPUT_DIR="direct"
+          DOWNLOAD_DIR="downloads_tmp"
           FAILED_FILE="failed_urls.txt"
-          FAILED_LOCK="/tmp/mega_failed.lock"
 
-          mkdir -p "$DOWNLOAD_BASE"
+          mkdir -p "$OUTPUT_DIR" "$DOWNLOAD_DIR"
           > "$FAILED_FILE"
 
+          # Helper: download ONE URL
           download_one() {
             local url="$1"
-            local idx="$2"
-            local dl_dir="${DOWNLOAD_BASE}/dl_${idx}"
-            mkdir -p "$dl_dir"
+            local dl_dir="dl_$$_$(echo "$url" | md5sum | cut -c1-8)"
+            mkdir -p "$DOWNLOAD_DIR/$dl_dir"
 
-            echo "→ Downloading [$idx]: $url"
-            if (cd "$dl_dir" && megatools dl "$url" 2>&1); then
-              echo "✅ Success [$idx]: $url"
+            echo "→ Downloading: $url"
+            if aria2c -x 16 -s 16 -d "$DOWNLOAD_DIR/$dl_dir" \
+              --console-log-level=warn --summary-interval=10 "$url"; then
+              # Move the downloaded file to the main downloads directory
+              local dl_file=$(ls -1 "$DOWNLOAD_DIR/$dl_dir" | head -n1)
+              if [ -n "$dl_file" ]; then
+                mv "$DOWNLOAD_DIR/$dl_dir/$dl_file" "$DOWNLOAD_DIR/"
+                echo "✅ Success: $url -> $dl_file"
+              else
+                echo "❌ No file produced for: $url"
+                echo "$url" >> "$FAILED_FILE"
+              fi
             else
-              echo "❌ Failed [$idx]: $url"
-              flock "$FAILED_LOCK" bash -c "echo \"$url\" >> \"$FAILED_FILE\""
-              return 1
+              echo "❌ Download failed: $url"
+              echo "$url" >> "$FAILED_FILE"
             fi
+            rm -rf "$DOWNLOAD_DIR/$dl_dir"
           }
 
           export -f download_one
-          export DOWNLOAD_BASE FAILED_FILE FAILED_LOCK VPN_AVAILABLE
+          export DOWNLOAD_DIR FAILED_FILE VPN_AVAILABLE
 
+          # Run downloads in parallel (no VPN fallback per download to avoid conflicts)
           echo "→ Starting parallel downloads (concurrency: $CONCURRENT, VPN: $VPN_AVAILABLE)"
-          while IFS= read -r url; do
-            echo "$url"
-          done < urls.txt | cat -n | xargs -P "$CONCURRENT" -I '{}' bash -c '
-            set -e
-            read -r idx url <<<"$@"
-            download_one "$url" "$idx"
-          ' _
+          cat urls.txt | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"'
 
-          if [ -s "$FAILED_FILE" ]; then
-            echo "::warning::Some downloads failed, see $FAILED_FILE"
-            cat "$FAILED_FILE"
-          else
-            echo "All downloads succeeded."
-          fi
+          echo "📊 Downloads finished."
+          echo "Files downloaded:"
+          ls -la "$DOWNLOAD_DIR/"
         shell: bash
 
-      - name: Process downloaded files (flatten, zip, bundle)
-        id: process
+      # ── Process and zip (now safe because downloads are complete) ──
+      - name: Zip and bundle files
         run: |
           BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
           UPLOAD_METHOD_INPUT="${{ inputs.upload_method }}"
 
           if [ "$UPLOAD_METHOD_INPUT" = "repo" ]; then
-            METHOD="split_push"
+            UPLOAD_METHOD="split_push"
           else
-            METHOD="release"
+            UPLOAD_METHOD="release"
           fi
 
-          OUTPUT_DIR="mega-nz"
-          DOWNLOAD_BASE="mega_downloads"
+          OUTPUT_DIR="direct"
+          DOWNLOAD_DIR="downloads_tmp"
           FAILED_FILE="failed_urls.txt"
 
-          rm -rf "$OUTPUT_DIR"
-          mkdir -p "$OUTPUT_DIR"
-
-          if [ "$BUNDLE_ALL" = "true" ]; then
-            BUNDLE_DIR="bundle_contents"
-            mkdir -p "$BUNDLE_DIR"
-          fi
-
-          PROCESS_DIR="flattened_downloads"
-          mkdir -p "$PROCESS_DIR"
-
-          for dl_dir in "$DOWNLOAD_BASE"/dl_*; do
-            [ -d "$dl_dir" ] || continue
-            find "$dl_dir" -type f -exec mv {} "$PROCESS_DIR/" \; 2>/dev/null || true
-            rm -rf "$dl_dir"
-          done
-
-          if [ "$BUNDLE_ALL" = "true" ]; then
-            mv "$PROCESS_DIR"/* "$BUNDLE_DIR/" 2>/dev/null || true
-            if [ -n "$(ls -A "$BUNDLE_DIR" 2>/dev/null)" ]; then
-              RAND_BUNDLE=$(tr -dc 'a-z' </dev/urandom | head -c5)
-              BUNDLE_ZIP="bundle_${RAND_BUNDLE}.zip"
-              echo "Creating bundle: $BUNDLE_ZIP"
-              if [ "$METHOD" = "release" ]; then
-                (cd "$BUNDLE_DIR" && zip "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
-                FULLBUNDLE="${OUTPUT_DIR}/${BUNDLE_ZIP}"
-                SIZE=$(stat -c%s "$FULLBUNDLE" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "Bundle ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLBUNDLE"
-                  (cd "$BUNDLE_DIR" && zip -s 1950m "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
-                fi
-              else
-                (cd "$BUNDLE_DIR" && zip -s 99m "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
-              fi
-              rm -rf "$BUNDLE_DIR"
-            else
-              echo "No files to bundle."
-              rm -rf "$BUNDLE_DIR"
-            fi
-          else
-            for f in "$PROCESS_DIR"/*; do
-              [ -f "$f" ] || continue
-              fname=$(basename "$f")
-              RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
-              ZIP_BASE="${fname}_${RAND5}"
-              ZIP_NAME="${ZIP_BASE}.zip"
-              echo "Zipping: $fname → $ZIP_NAME"
-
-              TMPZIP="tmpzip_$(tr -dc 'a-z0-9' </dev/urandom | head -c6)"
-              mkdir -p "$TMPZIP"
-              cp "$f" "$TMPZIP/"
-
-              if [ "$METHOD" = "release" ]; then
-                (cd "$TMPZIP" && zip "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
-                FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
-                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLZIP"
-                  (cd "$TMPZIP" && zip -s 1950m "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
-                fi
-              else
-                (cd "$TMPZIP" && zip -s 99m "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
-              fi
-              rm -rf "$TMPZIP"
-            done
-          fi
-
-          rm -rf "$PROCESS_DIR" "$DOWNLOAD_BASE"
-
+          # Move failed log if any
           if [ -s "$FAILED_FILE" ]; then
-            RAND_FAIL=$(tr -dc 'a-z' </dev/urandom | head -c5)
+            RAND_FAIL=$(mktemp -u XXXXX)
             FAIL_NAME="links-failed-${RAND_FAIL}.txt"
             mv "$FAILED_FILE" "${OUTPUT_DIR}/$FAIL_NAME"
             echo "Created failure report: ${OUTPUT_DIR}/$FAIL_NAME"
@@ -251,17 +183,80 @@ jobs:
             rm -f "$FAILED_FILE"
           fi
 
+          if [ "$BUNDLE_ALL" = "true" ]; then
+            # Bundle all downloaded files
+            BUNDLE_DIR="bundle_contents"
+            mkdir -p "$BUNDLE_DIR"
+            cp "$DOWNLOAD_DIR"/* "$BUNDLE_DIR/" 2>/dev/null || true
+            if [ -n "$(ls -A "$BUNDLE_DIR" 2>/dev/null)" ]; then
+              RAND_BUNDLE=$(mktemp -u XXXXX)
+              BUNDLE_ZIP="bundle_${RAND_BUNDLE}.zip"
+              echo "Creating bundle: $BUNDLE_ZIP"
+              if [ "$UPLOAD_METHOD" = "release" ]; then
+                (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
+                FULLBUNDLE="${OUTPUT_DIR}/${BUNDLE_ZIP}"
+                SIZE=$(stat -c%s "$FULLBUNDLE" 2>/dev/null || echo 0)
+                if [ "$SIZE" -gt 2044723200 ]; then
+                  echo "Bundle ZIP larger than 1950 MiB, splitting"
+                  rm "$FULLBUNDLE"
+                  (cd "$BUNDLE_DIR" && zip -0 -s 1950m "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
+                fi
+              else
+                (cd "$BUNDLE_DIR" && zip -0 -s 99m "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
+              fi
+              rm -rf "$BUNDLE_DIR"
+            else
+              echo "No files to bundle."
+              rm -rf "$BUNDLE_DIR"
+            fi
+          else
+            # One ZIP per file
+            for f in "$DOWNLOAD_DIR"/*; do
+              [ -f "$f" ] || continue
+              fname=$(basename "$f")
+              RAND5=$(mktemp -u XXXXX)
+              ZIP_BASE="${fname}_${RAND5}"
+              ZIP_NAME="${ZIP_BASE}.zip"
+              echo "Zipping: $fname → $ZIP_NAME"
+
+              TMPZIP="tmpzip_$$"
+              mkdir -p "$TMPZIP"
+              cp "$f" "$TMPZIP/"
+
+              if [ "$UPLOAD_METHOD" = "release" ]; then
+                (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
+                FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
+                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                if [ "$SIZE" -gt 2044723200 ]; then
+                  echo "ZIP larger than 1950 MiB, splitting"
+                  rm "$FULLZIP"
+                  (cd "$TMPZIP" && zip -0 -s 1950m "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
+                fi
+              else
+                (cd "$TMPZIP" && zip -0 -s 99m "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
+              fi
+              rm -rf "$TMPZIP"
+            done
+          fi
+
+          # Cleanup download dir
+          rm -rf "$DOWNLOAD_DIR"
+
           ls -1 "$OUTPUT_DIR" > "${OUTPUT_DIR}_assets.txt"
           echo "Assets to upload:"
           cat "${OUTPUT_DIR}_assets.txt"
         shell: bash
 
-      - name: '🔌 Disconnect VPN for uploads'
+      # ── Tear down VPN before any upload (identical to previous) ──
+      - name: ' Disconnect VPN for uploads'
         if: steps.vpn.outputs.vpn_available == 'true'
         run: |
           echo "→ Bringing down WireGuard to use runner's native internet for uploads"
           sudo wg-quick down wg0
 
+      # ──────────────────────────────────────────────────────────
+      # NEW: Google Drive upload
+      # ──────────────────────────────────────────────────────────
       - name: "Upload to Google Drive"
         if: inputs.upload_method == 'drive'
         env:
@@ -269,6 +264,7 @@ jobs:
           CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
+          # 1. Obtain access token
           ACCESS_TOKEN=$(curl -s -X POST https://oauth2.googleapis.com/token \
             -d client_id="$CLIENT_ID" \
             -d client_secret="$CLIENT_SECRET" \
@@ -279,6 +275,7 @@ jobs:
             exit 1
           fi
 
+          # 2. Find or create 'github-actions' folder
           FOLDER_NAME="github-actions"
           QUERY="mimeType='application/vnd.google-apps.folder' and name='$FOLDER_NAME' and trashed=false"
           FOLDER_ID=$(curl -s -G \
@@ -300,12 +297,14 @@ jobs:
           fi
           echo "✅ Folder ID: $FOLDER_ID"
 
-          for file in mega-nz/*; do
+          OUTPUT_DIR="direct"
+          for file in "$OUTPUT_DIR"/*; do
             [ -f "$file" ] || continue
             fname=$(basename "$file")
             size=$(stat -c%s "$file")
             echo "→ Uploading $fname ($size bytes)..."
 
+            # Initiate resumable upload session
             SESSION_URI=$(curl -s -X POST \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Type: application/json; charset=UTF-8" \
@@ -318,6 +317,7 @@ jobs:
               continue
             fi
 
+            # Upload the entire file in one chunk
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Length: $size" \
@@ -331,6 +331,9 @@ jobs:
             fi
           done
 
+      # ──────────────────────────────────────────────────────────
+      # Original repo / release upload steps (now skipped if Drive)
+      # ──────────────────────────────────────────────────────────
       - name: Upload to repository (split_push method)
         if: ${{ inputs.upload_method == 'repo' }}
         env:
@@ -340,7 +343,7 @@ jobs:
           git config user.email "actions@github.com"
           git config http.postBuffer 524288000
 
-          OUTPUT_DIR="mega-nz"
+          OUTPUT_DIR="direct"
           if [ -z "$(ls -A "$OUTPUT_DIR/")" ]; then
             echo "No files to upload."
             exit 0
@@ -367,20 +370,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          OUTPUT_DIR="mega-nz"
+          OUTPUT_DIR="direct"
           if [ ! -s "${OUTPUT_DIR}_assets.txt" ]; then
             echo "No assets to release."
             exit 0
           fi
 
-          RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
-          TAG="mega-nz-downloader-${RAND5}"
+          RAND5=$(mktemp -u XXXXX)
+          TAG="direct-downloader-${RAND5}"
           echo "Creating release tag: $TAG"
 
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
 
-          git tag "$TAG" -m "MEGA-NZ download release"
+          git tag "$TAG" -m "Direct download release"
           git push origin "$TAG"
 
           ASSET_ARGS=""
@@ -389,12 +392,12 @@ jobs:
           done < "${OUTPUT_DIR}_assets.txt"
 
           gh release create "$TAG" $ASSET_ARGS \
-            --title "mega-nz-downloader-${RAND5}" \
-            --notes "Automated release from MEGA.nz download workflow." \
+            --title "direct-downloader-${RAND5}" \
+            --notes "Automated release from Direct Download workflow." \
             --target "${{ github.ref_name }}"
-
-          echo "Release '$TAG' created with assets."
 
       - name: Cleanup
         if: always()
-        run: rm -rf mega-nz mega_downloads urls.txt failed_urls.txt 2>/dev/null || true
+        run: |
+          rm -rf direct downloads_tmp urls.txt failed_urls.txt 2>/dev/null || true
+          sudo wg-quick down wg0 2>/dev/null || true

@@ -1,4 +1,4 @@
-name: downloader-youtube-b
+name: downloader-youtube
 
 on:
   workflow_dispatch:
@@ -73,12 +73,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      # ── Checkout (includes .github/script/*.py) ─────────
       - uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      # ── Create temporary working directory ─────────────
       - name: '📁 Create temp working directory'
         id: tempdir
         run: |
@@ -86,7 +84,6 @@ jobs:
           echo "TEMP_DIR=$TEMP_DIR" >> $GITHUB_OUTPUT
           echo "✅ Created temp dir: $TEMP_DIR"
 
-      # ── Cookies (secret only) ─────────────────────────────
       - name: '🔐 Prepare cookies'
         run: |
           if [ -n "$YOUTUBE_COOKIES" ]; then
@@ -98,27 +95,31 @@ jobs:
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
-      # ── VPN SETUP ─────────────────────────────────────
       - name: '🔒 Set up WireGuard VPN (if enabled)'
         id: vpn
         shell: bash
         run: |
           VPN_ENABLED="${{ inputs.vpn_enabled }}"
+          echo "VPN_ENABLED=$VPN_ENABLED"
+
           if [ "$VPN_ENABLED" = "true" ]; then
             if [ -z "${{ secrets.WG_CONFIG }}" ]; then
               echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
               echo "vpn_available=false" >> $GITHUB_OUTPUT
               exit 0
             fi
+
             echo "→ Installing WireGuard tools..."
             sudo apt-get update -qq
             sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get install -y -qq wireguard-tools
+
             echo "→ Writing WireGuard config..."
             cat <<'EOF' > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
             sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
             sudo chmod 600 /etc/wireguard/wg0.conf
+
             echo "→ Bringing up wg0..."
             if sudo wg-quick up wg0; then
               echo "✅ WireGuard VPN connected."
@@ -132,7 +133,6 @@ jobs:
             echo "vpn_available=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── Parse URLs & per‑URL arguments ────────────────────
       - name: '📝 Parse all URLs and per‑URL arguments'
         id: parse
         run: |
@@ -171,7 +171,6 @@ jobs:
           echo "IS_ANY_YT=$IS_ANY_YT" >> $GITHUB_OUTPUT
           echo "✅ Parsed $(echo "$ENTRIES" | jq length) entries, any YouTube? $IS_ANY_YT"
 
-      # ── Prepare PATH ──────────────────────────────────────
       - name: '📁 Prepare tool paths'
         if: steps.parse.outputs.IS_ANY_YT == 'true'
         run: |
@@ -180,7 +179,6 @@ jobs:
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
           echo "✅ Tool paths prepared."
 
-      # ── Install tools ─────────────────────────────────────
       - name: '🛠️ Install download tools'
         if: steps.parse.outputs.IS_ANY_YT == 'true'
         run: |
@@ -210,11 +208,11 @@ jobs:
           pip3 install --quiet requests
           echo "✅ Fallback dependencies installed."
 
-      # ══════════ PRIMARY DOWNLOAD (parallel + VPN fallback + quiet logging) ══════════
       - name: '⬇️ Primary download (parallel, with VPN fallback)'
         id: primary_download
         shell: bash
         run: |
+          set -x
           ENTRIES_JSON='${{ steps.parse.outputs.ENTRIES_JSON }}'
           OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
           mkdir -p "$OUTPUT_FOLDER"
@@ -277,6 +275,7 @@ jobs:
           download_one() {
             local idx="$1"
             local link type val
+
             link=$(echo "$ENTRIES_JSON" | jq -r ".[$idx].link")
             args=$(echo "$ENTRIES_JSON" | jq -r ".[$idx].args[]?" 2>/dev/null || true)
 
@@ -294,30 +293,25 @@ jobs:
               val="$GLOBAL_VAL"
             fi
 
-            echo "📹 Processing: $link (type=$type quality=$val)"
+            echo "========================================"
+            echo "📹 Processing entry $((idx+1)): $link (type=$type quality=$val)"
 
             YT_DLP_ARGS="$COOKIE_ARGS --js-runtimes deno --remote-components ejs:npm --no-progress"
-            log_file="/tmp/ytdlp_${idx}.log"
+            VIDEO_JSON=""
 
-            # Fetch video info
             if ! run_with_fallback "Fetch info for $link" \
-              sh -c "yt-dlp $YT_DLP_ARGS -j \"$link\" > /tmp/videoinfo_$idx.json 2>$log_file"; then
-              echo "❌ Failed to fetch video info – last 30 lines:"
-              tail -n 30 "$log_file"
+              sh -c "yt-dlp $YT_DLP_ARGS -j \"$link\" > /tmp/videoinfo_$idx.json 2>/dev/null"; then
+              echo "❌ Failed to fetch video info – queued for fallback"
               flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
-              rm -f "$log_file" /tmp/videoinfo_$idx.json
               return 1
             fi
-            rm -f "$log_file"
-
             VIDEO_JSON=$(cat "/tmp/videoinfo_$idx.json" 2>/dev/null)
 
             if [ "$type" = "a" ]; then
               AUDIO_FORMATS=$(echo "$VIDEO_JSON" | jq '[.formats[] | select(.vcodec == "none" and .acodec != "none")]')
               if [ "$(echo "$AUDIO_FORMATS" | jq 'length')" -eq 0 ]; then
-                echo "❌ No audio-only formats found – queueing for fallback"
+                echo "❌ No audio-only formats found – queued for fallback"
                 flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
-                rm -f /tmp/videoinfo_$idx.json
                 return 1
               fi
               case "$val" in
@@ -332,24 +326,19 @@ jobs:
                     'map(select((.abr // .tbr) == $br)) | first.format_id')
                   ;;
               esac
-              echo "🎵 Selected audio format: $FORMAT_ID"
-              log_file="/tmp/ytdlp_audio_${idx}.log"
+              echo "🎵 Selected audio format: $FORMAT_ID (bitrate: ~${CHOSEN_BITRATE:-$val}kbps)"
               if run_with_fallback "Download audio $link" \
-                yt-dlp $YT_DLP_ARGS -f "$FORMAT_ID" -o "$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s" "$link" > "$log_file" 2>&1; then
+                yt-dlp $YT_DLP_ARGS -f "$FORMAT_ID" -o "$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s" "$link"; then
                 echo "✅ Audio download success"
-                rm -f "$log_file"
               else
-                echo "❌ Primary download failed – last 30 lines:"
-                tail -n 30 "$log_file"
-                rm -f "$log_file"
+                echo "❌ Primary download failed – queued for fallback"
                 flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
               fi
             else
               COMBINED=$(echo "$VIDEO_JSON" | jq '[.formats[] | select(.vcodec != "none" and .acodec != "none")]')
               if [ "$(echo "$COMBINED" | jq 'length')" -eq 0 ]; then
-                echo "❌ No combined formats found – queueing for fallback"
+                echo "❌ No combined formats found – queued for fallback"
                 flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
-                rm -f /tmp/videoinfo_$idx.json
                 return 1
               fi
               case "$val" in
@@ -364,20 +353,16 @@ jobs:
                   FORMAT_ID=$(echo "$MATCHING" | jq -r 'max_by(.fps) | .format_id')
                   ;;
               esac
-              echo "🎬 Selected video format: $FORMAT_ID"
-              log_file="/tmp/ytdlp_video_${idx}.log"
+              echo "🎬 Selected video format: $FORMAT_ID (height: ${CHOSEN_HEIGHT:-$val}p)"
               if run_with_fallback "Download video $link" \
-                yt-dlp $YT_DLP_ARGS -f "$FORMAT_ID" -o "$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s" "$link" > "$log_file" 2>&1; then
+                yt-dlp $YT_DLP_ARGS -f "$FORMAT_ID" -o "$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s" "$link"; then
                 echo "✅ Video download success"
-                rm -f "$log_file"
               else
-                echo "❌ Primary download failed – last 30 lines:"
-                tail -n 30 "$log_file"
-                rm -f "$log_file"
+                echo "❌ Primary download failed – queued for fallback"
                 flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
               fi
             fi
-            rm -f /tmp/videoinfo_$idx.json
+            rm -f "/tmp/videoinfo_$idx.json"
           }
 
           export -f download_one
@@ -389,45 +374,56 @@ jobs:
 
           echo "FAILED_ENTRIES_JSON=$FAILED_ENTRIES_JSON" >> $GITHUB_OUTPUT
           echo "📊 Primary phase done. Failures: $(echo "$FAILED_ENTRIES_JSON" | jq length)"
+          set +x
 
-      # ══════════ FALLBACK PIPELINES (parallel + VPN fallback) ══════════
       - name: '🔄 Fallback pipelines'
         if: steps.primary_download.outputs.FAILED_ENTRIES_JSON != '[]'
         shell: bash
         run: |
+          set -x
           FAILED_ENTRIES='${{ steps.primary_download.outputs.FAILED_ENTRIES_JSON }}'
           count=$(echo "$FAILED_ENTRIES" | jq length)
           echo "🔄 Attempting fallback for $count failed entries..."
           OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
           VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
           CONCURRENT="${{ inputs.concurrent_downloads }}"
+
           COOKIE_ARGS=""
           [ -f youtube-cookies.txt ] && COOKIE_ARGS="--cookies youtube-cookies.txt"
 
           build_suffix() {
             local type="$1" val="$2"
-            if [ "$type" = "a" ]; then echo "${val}kbps"; else echo "${val}p"; fi
+            if [ "$type" = "a" ]; then
+              echo "${val}kbps"
+            else
+              echo "${val}p"
+            fi
           }
 
           run_with_fallback() {
             desc="$1"; shift
             if [ "$VPN_AVAILABLE" = "true" ]; then
               echo "→ [VPN] $desc"
-              if "$@"; then echo "✅ [VPN] succeeded."; return 0
+              if "$@"; then
+                echo "✅ [VPN] succeeded."; return 0
               else
-                echo "⚠️ [VPN] failed – falling back to direct..."
+                echo "⚠️ [VPN] failed – falling back to direct connection..."
                 sudo wg-quick down wg0 2>/dev/null || true
                 echo "→ [Direct] $desc"
-                if "$@"; then echo "✅ [Direct] succeeded."; sudo wg-quick up wg0 2>/dev/null || true; return 0
-                else echo "❌ [Direct] also failed."; sudo wg-quick up wg0 2>/dev/null || true; return 1
+                if "$@"; then
+                  echo "✅ [Direct] succeeded (VPN failed)."
+                  sudo wg-quick up wg0 2>/dev/null || true; return 0
+                else
+                  echo "❌ [Direct] also failed."
+                  sudo wg-quick up wg0 2>/dev/null || true; return 1
                 fi
               fi
             else
-              echo "→ $desc"; "$@"; return $?
+              echo "→ $desc"
+              "$@"; return $?
             fi
           }
 
-          # ── Fallback 1: Piped API ──
           fallback_piped() {
             echo "[fallback] Piped API"
             local url="$1" type="$2" val="$3"
@@ -499,7 +495,7 @@ jobs:
               local filename="${safe_title}-${suffix}.m4a"
               echo "⬇️ Downloading audio: $filename"
               curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
-                -o "${OUTPUT_FOLDER}/${filename}" "$audio_url" 2>/dev/null
+                -o "${OUTPUT_FOLDER}/${filename}" "$audio_url"
               if [ ! -s "${OUTPUT_FOLDER}/${filename}" ]; then
                 echo "❌ Piped: audio download empty"
                 return 1
@@ -535,10 +531,10 @@ jobs:
               local tmp_audio="${OUTPUT_FOLDER}/.tmp_${vid}_audio"
               echo "⬇️ Downloading video stream..."
               curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
-                -o "$tmp_video" "$video_url" 2>/dev/null || { echo "❌ Video download failed"; return 1; }
+                -o "$tmp_video" "$video_url" || { echo "❌ Video download failed"; return 1; }
               echo "⬇️ Downloading audio stream..."
               curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
-                -o "$tmp_audio" "$audio_url" 2>/dev/null || { echo "❌ Audio download failed"; rm -f "$tmp_video"; return 1; }
+                -o "$tmp_audio" "$audio_url" || { echo "❌ Audio download failed"; rm -f "$tmp_video"; return 1; }
               echo "🔧 Muxing with ffmpeg..."
               ffmpeg -y -v quiet -i "$tmp_video" -i "$tmp_audio" -c copy "${OUTPUT_FOLDER}/${filename}" 2>/dev/null
               local mux_ok=$?
@@ -551,7 +547,6 @@ jobs:
             fi
           }
 
-          # ── Fallback 2: yt-dlp forced IPv4 ──
           fallback_force_ipv4() {
             echo "[fallback] yt-dlp forced IPv4 + retries"
             local suf=$(build_suffix "$2" "$3")
@@ -566,10 +561,9 @@ jobs:
               --extractor-args "youtube:player_client=default,web_embedded" \
               -f "$fmt" \
               --js-runtimes deno --remote-components ejs:npm --no-progress \
-              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1" &>/dev/null
+              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
 
-          # ── Fallback 3: ytmp3.gg API (external script) ──
           fallback_ytmp3_api() {
             echo "[fallback] ytmp3.gg API"
             local type="$2" val="$3"
@@ -587,8 +581,7 @@ jobs:
             export FB_URL="$1"
             export FB_FMT="$FORMAT"
             export FB_QUAL="$QUALITY"
-
-            python3 .github/script/youtube-downloader-ytmp3gg.py &>/dev/null
+            python3 .github/script/youtube-downloader-ytmp3gg.py
             local py_exit=$?
             if [ $py_exit -ne 0 ]; then
               echo "❌ Python script failed with exit code $py_exit"
@@ -604,7 +597,7 @@ jobs:
             FILENAME=$(python3 -c "import json; print(json.load(open('$tmp_info'))['filename'])")
             echo "⬇️ Downloading via ytmp3.gg: $FILENAME"
             curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
-              -o "$OUTPUT_FOLDER/$FILENAME" "$DL_URL" 2>/dev/null
+              -o "$OUTPUT_FOLDER/$FILENAME" "$DL_URL"
             rm -f "$tmp_info"
             if [ ! -s "$OUTPUT_FOLDER/$FILENAME" ]; then
               echo "❌ ytmp3.gg download empty"
@@ -613,7 +606,6 @@ jobs:
             echo "✅ ytmp3.gg success"
           }
 
-          # ── Fallback 4: Advanced yt-dlp (multi-client) ──
           fallback_ytdlp_advanced() {
             echo "[fallback] yt-dlp advanced (web_music+tv+web)"
             local suf=$(build_suffix "$2" "$3")
@@ -628,24 +620,21 @@ jobs:
               -f "$fmt" \
               --js-runtimes deno --newline --concurrent-fragments 4 \
               $COOKIE_ARGS \
-              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1" &>/dev/null
+              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
 
           FALLBACKS=( fallback_piped fallback_force_ipv4 fallback_ytmp3_api fallback_ytdlp_advanced )
 
-          process_fallback_entry() {
-            local idx="$1"
-            local link type val
+          for ((idx=0; idx<count; idx++)); do
             link=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].link")
             type=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].type")
             val=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].val")
-
             echo "========================================"
             echo "🔄 Fallback for: $link (type=$type quality=$val)"
             success=false
             for fb in "${FALLBACKS[@]}"; do
               echo "🔹 Trying: $fb"
-              if run_with_fallback "$fb $link" $fb "$link" "$type" "$val"; then
+              if $fb "$link" "$type" "$val"; then
                 success=true
                 echo "✅ $fb succeeded"
                 break
@@ -656,17 +645,10 @@ jobs:
             if [ "$success" = false ]; then
               echo "❌ ALL FALLBACKS FAILED for $link"
             fi
-          }
-
-          export -f process_fallback_entry run_with_fallback build_suffix
-          export FAILED_ENTRIES OUTPUT_FOLDER COOKIE_ARGS VPN_AVAILABLE
-          export -f fallback_piped fallback_force_ipv4 fallback_ytmp3_api fallback_ytdlp_advanced
-
-          echo "→ Starting parallel fallback (concurrent=$CONCURRENT)"
-          seq 0 $((count-1)) | xargs -P "$CONCURRENT" -I '{}' bash -c 'process_fallback_entry "{}"'
+          done
           echo "✅ Fallback phase complete."
+          set +x
 
-      # ── Remux all videos to MP4 ───────────────────────
       - name: '🔧 Remux videos to MP4'
         run: |
           OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
@@ -697,7 +679,12 @@ jobs:
           echo "📁 Contents of temp dir:"
           ls -lah "$OUTPUT_FOLDER"
 
-      # ── Move finished files to persistent youtube folder ──
+      - name: '🔌 Disconnect VPN for uploads'
+        if: steps.vpn.outputs.vpn_available == 'true'
+        run: |
+          echo "→ Bringing down WireGuard to use runner's native internet for uploads"
+          sudo wg-quick down wg0
+
       - name: '📂 Move finished files to youtube folder'
         run: |
           TEMP_DIR="${{ steps.tempdir.outputs.TEMP_DIR }}"
@@ -710,7 +697,6 @@ jobs:
           echo "📁 Final contents of $FINAL_DIR:"
           ls -lah "$FINAL_DIR"
 
-      # ── Zip all files (supports per‑file and bundled mode) ─
       - name: '📦 Zip all files'
         run: |
           OUTPUT_FOLDER="youtube"
@@ -724,23 +710,19 @@ jobs:
           fi
 
           if [ "$BUNDLE_ALL" = "true" ]; then
-            # ── Bundle mode: one ZIP containing all files ──
             BUNDLE_TMP="bundle_tmp"
             mkdir -p "$BUNDLE_TMP"
             shopt -s dotglob nullglob
             mv "$OUTPUT_FOLDER"/* "$BUNDLE_TMP"/ 2>/dev/null || true
             shopt -u dotglob nullglob
-
             if [ -z "$(ls -A "$BUNDLE_TMP" 2>/dev/null)" ]; then
               echo "No files to bundle."
               rm -rf "$BUNDLE_TMP"
               exit 0
             fi
-
             RAND_BUNDLE=$(tr -dc 'a-z' </dev/urandom | head -c5)
             BUNDLE_ZIP="youtube_bundle_${RAND_BUNDLE}.zip"
             echo "📦 Creating bundle ZIP: $BUNDLE_ZIP"
-
             if [ "$METHOD" = "release" ]; then
               (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
               FULLZIP="${OUTPUT_FOLDER}/${BUNDLE_ZIP}"
@@ -755,7 +737,6 @@ jobs:
             fi
             rm -rf "$BUNDLE_TMP"
           else
-            # ── Per‑file mode: one ZIP per file ──
             for f in "$OUTPUT_FOLDER"/*; do
               [ -f "$f" ] || continue
               fname=$(basename "$f")
@@ -779,16 +760,12 @@ jobs:
           echo "📁 Final contents of $OUTPUT_FOLDER:"
           ls -lah "$OUTPUT_FOLDER"
 
-      # ── Prepare asset list ───────────────────────────
       - name: '📋 Prepare asset list'
         run: |
           ls -1 youtube > youtube_assets.txt
           echo "Assets to upload:"
           cat youtube_assets.txt
 
-      # ────────────────────────────────────────────────────────
-      # GOOGLE DRIVE UPLOAD
-      # ────────────────────────────────────────────────────────
       - name: "Upload to Google Drive"
         if: inputs.upload_method == 'drive'
         env:
@@ -796,7 +773,6 @@ jobs:
           CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          # 1. Obtain access token
           ACCESS_TOKEN=$(curl -s -X POST https://oauth2.googleapis.com/token \
             -d client_id="$CLIENT_ID" \
             -d client_secret="$CLIENT_SECRET" \
@@ -807,7 +783,6 @@ jobs:
             exit 1
           fi
 
-          # 2. Find or create 'github-actions' folder
           FOLDER_NAME="github-actions"
           QUERY="mimeType='application/vnd.google-apps.folder' and name='$FOLDER_NAME' and trashed=false"
           FOLDER_ID=$(curl -s -G \
@@ -829,14 +804,12 @@ jobs:
           fi
           echo "✅ Folder ID: $FOLDER_ID"
 
-          OUTPUT_DIR="youtube"
-          for file in "$OUTPUT_DIR"/*; do
+          for file in youtube/*; do
             [ -f "$file" ] || continue
             fname=$(basename "$file")
             size=$(stat -c%s "$file")
             echo "→ Uploading $fname ($size bytes)..."
 
-            # Initiate resumable upload session
             SESSION_URI=$(curl -s -X POST \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Type: application/json; charset=UTF-8" \
@@ -849,7 +822,6 @@ jobs:
               continue
             fi
 
-            # Upload the entire file in one chunk (streamed from disk)
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Range: bytes 0-$((size-1))/$size" \
@@ -862,7 +834,6 @@ jobs:
             fi
           done
 
-      # ── Upload to repository (split_push) ────────────────
       - name: '📤 Commit & Push Changes'
         if: ${{ inputs.upload_method == 'repo' }}
         run: |
@@ -903,7 +874,6 @@ jobs:
           done
           echo "✅ All files uploaded to the 'youtube' folder."
 
-      # ── Create GitHub Release (release method) ────────────
       - name: '🚀 Create Release and upload assets'
         if: ${{ inputs.upload_method == 'release' }}
         env:
@@ -931,7 +901,6 @@ jobs:
             --target "${{ github.ref_name }}"
           echo "Release '$TAG' created with assets."
 
-      # ── Cleanup temporary directory ───────────────────────
       - name: '🧹 Cleanup temp directory'
         if: always()
         run: |
