@@ -114,7 +114,8 @@ jobs:
             sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get install -y -qq wireguard-tools
 
             echo "→ Writing WireGuard config..."
-            cat <<'EOF' > /tmp/wg0.conf
+            # FIXED: unquoted heredoc so the secret expands correctly
+            cat <<EOF > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
             sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
@@ -210,6 +211,7 @@ jobs:
 
       - name: '⬇️ Primary download (parallel, with VPN fallback)'
         id: primary_download
+        continue-on-error: true          # allow fallback step to run even if this step fails
         shell: bash
         run: |
           set -x
@@ -240,8 +242,10 @@ jobs:
           COOKIE_ARGS=""
           [ -f youtube-cookies.txt ] && COOKIE_ARGS="--cookies youtube-cookies.txt"
 
-          FAILED_ENTRIES_JSON='[]'
+          # File to collect failed entries (one JSON object per line)
+          FAILED_FILE="/tmp/failed.json"
           FAILED_LOCK="/tmp/failed.lock"
+          rm -f "$FAILED_FILE"
 
           run_with_fallback() {
             desc="$1"; shift
@@ -299,10 +303,13 @@ jobs:
             YT_DLP_ARGS="$COOKIE_ARGS --js-runtimes deno --remote-components ejs:npm --no-progress"
             VIDEO_JSON=""
 
+            # Fetch info – keep stderr for debugging
             if ! run_with_fallback "Fetch info for $link" \
-              sh -c "yt-dlp $YT_DLP_ARGS -j \"$link\" > /tmp/videoinfo_$idx.json 2>/dev/null"; then
+              sh -c "yt-dlp $YT_DLP_ARGS -j \"$link\" > /tmp/videoinfo_$idx.json 2>/tmp/videoinfo_$idx.err"; then
               echo "❌ Failed to fetch video info – queued for fallback"
-              flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
+              echo "   stderr:"; cat "/tmp/videoinfo_$idx.err" 2>/dev/null || true
+              # Append to shared failed file (concurrency-safe)
+              flock "$FAILED_LOCK" bash -c "jq -n --arg link \"$link\" --arg type \"$type\" --arg val \"$val\" '{link:\$link, type:\$type, val:\$val}' >> \"$FAILED_FILE\""
               return 1
             fi
             VIDEO_JSON=$(cat "/tmp/videoinfo_$idx.json" 2>/dev/null)
@@ -311,7 +318,7 @@ jobs:
               AUDIO_FORMATS=$(echo "$VIDEO_JSON" | jq '[.formats[] | select(.vcodec == "none" and .acodec != "none")]')
               if [ "$(echo "$AUDIO_FORMATS" | jq 'length')" -eq 0 ]; then
                 echo "❌ No audio-only formats found – queued for fallback"
-                flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
+                flock "$FAILED_LOCK" bash -c "jq -n --arg link \"$link\" --arg type \"$type\" --arg val \"$val\" '{link:\$link, type:\$type, val:\$val}' >> \"$FAILED_FILE\""
                 return 1
               fi
               case "$val" in
@@ -332,13 +339,13 @@ jobs:
                 echo "✅ Audio download success"
               else
                 echo "❌ Primary download failed – queued for fallback"
-                flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
+                flock "$FAILED_LOCK" bash -c "jq -n --arg link \"$link\" --arg type \"$type\" --arg val \"$val\" '{link:\$link, type:\$type, val:\$val}' >> \"$FAILED_FILE\""
               fi
             else
               COMBINED=$(echo "$VIDEO_JSON" | jq '[.formats[] | select(.vcodec != "none" and .acodec != "none")]')
               if [ "$(echo "$COMBINED" | jq 'length')" -eq 0 ]; then
                 echo "❌ No combined formats found – queued for fallback"
-                flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
+                flock "$FAILED_LOCK" bash -c "jq -n --arg link \"$link\" --arg type \"$type\" --arg val \"$val\" '{link:\$link, type:\$type, val:\$val}' >> \"$FAILED_FILE\""
                 return 1
               fi
               case "$val" in
@@ -359,19 +366,21 @@ jobs:
                 echo "✅ Video download success"
               else
                 echo "❌ Primary download failed – queued for fallback"
-                flock "$FAILED_LOCK" bash -c "FAILED_ENTRIES_JSON=\$(echo \"\$FAILED_ENTRIES_JSON\" | jq \". + [{link: \\\"$link\\\", type: \\\"$type\\\", val: \\\"$val\\\"}]\")"
+                flock "$FAILED_LOCK" bash -c "jq -n --arg link \"$link\" --arg type \"$type\" --arg val \"$val\" '{link:\$link, type:\$type, val:\$val}' >> \"$FAILED_FILE\""
               fi
             fi
-            rm -f "/tmp/videoinfo_$idx.json"
+            rm -f "/tmp/videoinfo_$idx.json" "/tmp/videoinfo_$idx.err"
           }
 
           export -f download_one
-          export ENTRIES_JSON GLOBAL_TYPE GLOBAL_VAL VPN_AVAILABLE OUTPUT_FOLDER COOKIE_ARGS FAILED_ENTRIES_JSON FAILED_LOCK
+          export ENTRIES_JSON GLOBAL_TYPE GLOBAL_VAL VPN_AVAILABLE OUTPUT_FOLDER COOKIE_ARGS FAILED_FILE FAILED_LOCK
 
           count=$(echo "$ENTRIES_JSON" | jq length)
           echo "→ Starting parallel downloads (concurrent=$CONCURRENT)"
-          seq 0 $((count-1)) | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"'
+          seq 0 $((count-1)) | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"' || true
 
+          # Build final failed list from the shared file
+          FAILED_ENTRIES_JSON=$(jq -s '.' "$FAILED_FILE" 2>/dev/null || echo '[]')
           echo "FAILED_ENTRIES_JSON=$FAILED_ENTRIES_JSON" >> $GITHUB_OUTPUT
           echo "📊 Primary phase done. Failures: $(echo "$FAILED_ENTRIES_JSON" | jq length)"
           set +x
@@ -649,6 +658,7 @@ jobs:
           echo "✅ Fallback phase complete."
           set +x
 
+      # ---------- Remaining steps (remux, zip, upload, cleanup) unchanged ----------
       - name: '🔧 Remux videos to MP4'
         run: |
           OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
