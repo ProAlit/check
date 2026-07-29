@@ -114,7 +114,6 @@ jobs:
             sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get install -y -qq wireguard-tools
 
             echo "→ Writing WireGuard config..."
-            # Safe way: echo with double quotes expands the secret
             echo "${{ secrets.WG_CONFIG }}" | sudo tee /etc/wireguard/wg0.conf > /dev/null
             sudo chmod 600 /etc/wireguard/wg0.conf
 
@@ -239,11 +238,10 @@ jobs:
           COOKIE_ARGS=""
           [ -f youtube-cookies.txt ] && COOKIE_ARGS="--cookies youtube-cookies.txt"
 
-          # Shared file for failed entries – cleaned at start
           FAILED_FILE="/tmp/failed.json"
           FAILED_LOCK="/tmp/failed.lock"
           rm -f "$FAILED_FILE"
-          touch "$FAILED_FILE"   # ensure it exists even if empty
+          touch "$FAILED_FILE"
 
           run_with_fallback() {
             desc="$1"; shift
@@ -305,7 +303,6 @@ jobs:
               sh -c "yt-dlp $YT_DLP_ARGS -j \"$link\" > /tmp/videoinfo_$idx.json 2>/tmp/videoinfo_$idx.err"; then
               echo "❌ Failed to fetch video info – queued for fallback"
               echo "   stderr:"; cat "/tmp/videoinfo_$idx.err" 2>/dev/null || true
-              # Append a compact JSON line to the shared failed file
               flock "$FAILED_LOCK" bash -c "jq -n --arg link \"$link\" --arg type \"$type\" --arg val \"$val\" '{link:\$link, type:\$type, val:\$val}' >> \"$FAILED_FILE\""
               return 1
             fi
@@ -376,7 +373,6 @@ jobs:
           echo "→ Starting parallel downloads (concurrent=$CONCURRENT)"
           seq 0 $((count-1)) | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"' || true
 
-          # Report failures (just for logging)
           if [ -s "$FAILED_FILE" ]; then
             fail_count=$(jq -s length "$FAILED_FILE" 2>/dev/null || echo 0)
             echo "📊 Primary phase done. Failures: $fail_count"
@@ -390,11 +386,9 @@ jobs:
         shell: bash
         run: |
           FAILED_FILE="/tmp/failed.json"
-          # If no failed file or it's empty, nothing to do
           [ -s "$FAILED_FILE" ] || { echo "✅ No failed entries to retry."; exit 0; }
 
           set -x
-          # Build a proper JSON array from the line-delimited file
           FAILED_ENTRIES=$(jq -sc '.' "$FAILED_FILE" 2>/dev/null || echo '[]')
           count=$(echo "$FAILED_ENTRIES" | jq length)
           echo "🔄 Attempting fallback for $count failed entries..."
@@ -594,7 +588,6 @@ jobs:
             export FB_URL="$1"
             export FB_FMT="$FORMAT"
             export FB_QUAL="$QUALITY"
-            # Corrected path to scripts folder
             python3 .github/scripts/youtube-downloader-ytmp3gg.py
             local py_exit=$?
             if [ $py_exit -ne 0 ]; then
@@ -663,7 +656,6 @@ jobs:
           echo "✅ Fallback phase complete."
           set +x
 
-      # ---------- Remaining steps unchanged ----------
       - name: '🔧 Remux videos to MP4'
         run: |
           OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
@@ -718,10 +710,13 @@ jobs:
           BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
           UPLOAD_METHOD="${{ inputs.upload_method }}"
 
+          # Determine ZIP strategy
           if [ "$UPLOAD_METHOD" = "repo" ]; then
-            METHOD="split_push"
+            METHOD="split_push"      # 99 MiB splits for GitHub repo
+          elif [ "$UPLOAD_METHOD" = "drive" ]; then
+            METHOD="drive"           # no splits, Google Drive has no size limit
           else
-            METHOD="release"
+            METHOD="release"         # release mode splits at 1950 MiB
           fi
 
           if [ "$BUNDLE_ALL" = "true" ]; then
@@ -738,36 +733,50 @@ jobs:
             RAND_BUNDLE=$(tr -dc 'a-z' </dev/urandom | head -c5)
             BUNDLE_ZIP="youtube_bundle_${RAND_BUNDLE}.zip"
             echo "📦 Creating bundle ZIP: $BUNDLE_ZIP"
-            if [ "$METHOD" = "release" ]; then
-              (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
-              FULLZIP="${OUTPUT_FOLDER}/${BUNDLE_ZIP}"
-              SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-              if [ "$SIZE" -gt 2044723200 ]; then
-                echo "Bundle ZIP larger than 1950 MiB, splitting"
-                rm "$FULLZIP"
-                (cd "$BUNDLE_TMP" && zip -0 -r -s 1950m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
-              fi
-            else
-              (cd "$BUNDLE_TMP" && zip -0 -r -s 99m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
-            fi
+            case "$METHOD" in
+              drive)
+                # No size restriction – single ZIP
+                (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
+                ;;
+              release)
+                (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
+                FULLZIP="${OUTPUT_FOLDER}/${BUNDLE_ZIP}"
+                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                if [ "$SIZE" -gt 2044723200 ]; then
+                  echo "Bundle ZIP larger than 1950 MiB, splitting"
+                  rm "$FULLZIP"
+                  (cd "$BUNDLE_TMP" && zip -0 -r -s 1950m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
+                fi
+                ;;
+              split_push)
+                (cd "$BUNDLE_TMP" && zip -0 -r -s 99m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
+                ;;
+            esac
             rm -rf "$BUNDLE_TMP"
           else
+            # Individual file zipping
             for f in "$OUTPUT_FOLDER"/*; do
               [ -f "$f" ] || continue
               fname=$(basename "$f")
               echo "🗜️ Zipping: $fname"
-              if [ "$METHOD" = "release" ]; then
-                zip -0 -j "$OUTPUT_FOLDER/${fname}.zip" "$f"
-                FULLZIP="${OUTPUT_FOLDER}/${fname}.zip"
-                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLZIP"
-                  zip -0 -j -s 1950m "$OUTPUT_FOLDER/${fname}.zip" "$f"
-                fi
-              else
-                zip -0 -j -s 99m "$OUTPUT_FOLDER/${fname}.zip" "$f"
-              fi
+              case "$METHOD" in
+                drive)
+                  zip -0 -j "$OUTPUT_FOLDER/${fname}.zip" "$f"
+                  ;;
+                release)
+                  zip -0 -j "$OUTPUT_FOLDER/${fname}.zip" "$f"
+                  FULLZIP="${OUTPUT_FOLDER}/${fname}.zip"
+                  SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                  if [ "$SIZE" -gt 2044723200 ]; then
+                    echo "ZIP larger than 1950 MiB, splitting"
+                    rm "$FULLZIP"
+                    zip -0 -j -s 1950m "$OUTPUT_FOLDER/${fname}.zip" "$f"
+                  fi
+                  ;;
+                split_push)
+                  zip -0 -j -s 99m "$OUTPUT_FOLDER/${fname}.zip" "$f"
+                  ;;
+              esac
               rm "$f"
             done
           fi
