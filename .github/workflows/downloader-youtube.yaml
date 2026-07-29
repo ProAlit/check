@@ -598,7 +598,7 @@ jobs:
             export FB_FMT="$FORMAT"
             export FB_QUAL="$QUALITY"
             # Ensure correct path to script (matches original repository)
-            python3 .github/script/youtube-downloader-ytmp3gg.py
+            python3 .github/scripts/youtube-downloader-ytmp3gg.py
             local py_exit=$?
             if [ $py_exit -ne 0 ]; then
               echo "❌ Python script failed with exit code $py_exit"
