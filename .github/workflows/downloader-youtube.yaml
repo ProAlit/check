@@ -379,9 +379,10 @@ jobs:
           echo "→ Starting parallel downloads (concurrent=$CONCURRENT)"
           seq 0 $((count-1)) | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"' || true
 
-          # Build final failed list from the shared file
-          FAILED_ENTRIES_JSON=$(jq -s '.' "$FAILED_FILE" 2>/dev/null || echo '[]')
-          echo "FAILED_ENTRIES_JSON=$FAILED_ENTRIES_JSON" >> $GITHUB_OUTPUT
+          # Build final failed list from the shared file – MUST be compact (single line) JSON
+          FAILED_ENTRIES_JSON=$(jq -sc '.' "$FAILED_FILE" 2>/dev/null || echo '[]')
+          # Write to GITHUB_OUTPUT as compact JSON
+          echo "FAILED_ENTRIES_JSON=$(echo "$FAILED_ENTRIES_JSON" | jq -c .)" >> $GITHUB_OUTPUT
           echo "📊 Primary phase done. Failures: $(echo "$FAILED_ENTRIES_JSON" | jq length)"
           set +x
 
@@ -390,8 +391,14 @@ jobs:
         shell: bash
         run: |
           set -x
+          # Read the output variable safely; fallback to [] if missing or invalid
           FAILED_ENTRIES='${{ steps.primary_download.outputs.FAILED_ENTRIES_JSON }}'
-          count=$(echo "$FAILED_ENTRIES" | jq length)
+          # Ensure we have a valid array, else default to empty
+          count=$(echo "$FAILED_ENTRIES" | jq -e 'length' 2>/dev/null) || count=0
+          if [ "$count" -eq 0 ]; then
+            echo "✅ No failed entries to retry."
+            exit 0
+          fi
           echo "🔄 Attempting fallback for $count failed entries..."
           OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
           VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
@@ -590,7 +597,8 @@ jobs:
             export FB_URL="$1"
             export FB_FMT="$FORMAT"
             export FB_QUAL="$QUALITY"
-            python3 .github/scripts/youtube-downloader-ytmp3gg.py
+            # Ensure correct path to script (matches original repository)
+            python3 .github/script/youtube-downloader-ytmp3gg.py
             local py_exit=$?
             if [ $py_exit -ne 0 ]; then
               echo "❌ Python script failed with exit code $py_exit"
@@ -658,7 +666,7 @@ jobs:
           echo "✅ Fallback phase complete."
           set +x
 
-      # ---------- Remaining steps (remux, zip, upload, cleanup) unchanged ----------
+      # ---------- Remaining steps (unchanged but using compact JSON) ----------
       - name: '🔧 Remux videos to MP4'
         run: |
           OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
