@@ -194,6 +194,7 @@ jobs:
       - name: Download with spotdl (primary, parallel)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
+        continue-on-error: true          # ← ALLOW FAILURE SO FALLBACK CAN RUN
         shell: bash
         run: |
           set -x
@@ -295,6 +296,7 @@ jobs:
 
       - name: Download with SpotiFLAC (fallback, parallel)
         if: steps.parse.outputs.HAS_URLS == 'true'
+        continue-on-error: true          # ← ALLOW FAILURE – we still collect final log
         shell: bash
         run: |
           set -x
@@ -458,11 +460,12 @@ jobs:
         run: |
           SONG_COUNT=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
           if [ "$SONG_COUNT" -eq 0 ]; then
-            echo "::error::No audio files were downloaded. Exiting."
-            exit 1
+            echo "::warning::No audio files were downloaded. The run will continue."
+          else
+            echo "Total songs downloaded: $SONG_COUNT"
+            ls -lhR music/
           fi
-          echo "Total songs downloaded: $SONG_COUNT"
-          ls -lhR music/
+        # No exit 1 here – workflow continues to upload even if empty
 
       - name: Disconnect VPN for uploads
         if: steps.vpn.outputs.vpn_available == 'true'
@@ -488,6 +491,13 @@ jobs:
 
           rm -rf music_archive
           mkdir -p music_archive
+
+          # Prevent empty archive if nothing downloaded
+          FILE_COUNT=$(find music -type f | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "⚠️ No files to archive – creating a placeholder."
+            touch music/NO_DOWNLOADS.txt
+          fi
 
           if [ "$BUNDLE_ALL" = "true" ]; then
             RANDOM_STR=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_lowercase + string.digits, k=5)))")
