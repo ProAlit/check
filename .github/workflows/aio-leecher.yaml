@@ -689,6 +689,7 @@ jobs:
       - name: "Archive files (bundle & upload method aware)"
         id: archive
         run: |
+          set -e
           if ! ls downloads/* 1>/dev/null 2>&1; then
             echo "⚠️ No files to archive."
             exit 0
@@ -700,12 +701,26 @@ jobs:
           rm -rf "$OUTPUT_DIR"
           mkdir -p "$OUTPUT_DIR"
 
+          # Determine split strategy
           if [ "$UPLOAD_METHOD" = "repo" ]; then
-            METHOD="split_push"
+            SPLIT_SIZE="99m"
+          elif [ "$UPLOAD_METHOD" = "release" ]; then
+            SPLIT_SIZE="1950m"
           else
-            METHOD="release"
+            SPLIT_SIZE="none"   # drive: no size limit
           fi
 
+          DRIVE_DIRECT=false
+
+          # Helper to detect disk-full errors
+          is_disk_full() {
+            local msg="$1"
+            [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
+          }
+
+          # ------------------------------------------------------------
+          #   BUNDLE ALL
+          # ------------------------------------------------------------
           if [ "$BUNDLE_ALL" = "true" ]; then
             BUNDLE_TMP="bundle_tmp"
             mkdir -p "$BUNDLE_TMP"
@@ -740,39 +755,125 @@ jobs:
             BUNDLE_ZIP="leech_bundle_${RAND5}.zip"
             echo "📦 Creating bundle ZIP: $BUNDLE_ZIP"
 
-            if [ "$METHOD" = "release" ]; then
-              (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
-              FULLZIP="${OUTPUT_DIR}/${BUNDLE_ZIP}"
-              SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-              if [ "$SIZE" -gt 2044723200 ]; then
-                echo "Bundle ZIP larger than 1950 MiB, splitting"
-                rm "$FULLZIP"
-                (cd "$BUNDLE_TMP" && zip -0 -r -s 1950m "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
+            set +e
+            if [ "$SPLIT_SIZE" = "none" ]; then
+              zip_output=$( (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
+              zip_exit=$?
+            else
+              zip_output=$( (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
+              zip_exit=$?
+              if [ $zip_exit -eq 0 ]; then
+                FULLZIP="${OUTPUT_DIR}/${BUNDLE_ZIP}"
+                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                SPLIT_LIMIT=$(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 ))
+                if [ "$SIZE" -gt "$SPLIT_LIMIT" ]; then
+                  echo "Bundle ZIP larger than limit, splitting"
+                  rm "$FULLZIP"
+                  zip_output=$( (cd "$BUNDLE_TMP" && zip -0 -r -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
+                  zip_exit=$?
+                fi
+              fi
+            fi
+            set -e
+
+            if [ $zip_exit -ne 0 ]; then
+              echo "Zip command failed with exit code $zip_exit"
+              if [ "$UPLOAD_METHOD" = "drive" ] && is_disk_full "$zip_output"; then
+                echo "⚠️  Disk full – switching to direct raw upload (Google Drive)."
+                DRIVE_DIRECT=true
+                # Move files from bundle_tmp directly to OUTPUT_DIR (raw)
+                mkdir -p "$OUTPUT_DIR"
+                mv "$BUNDLE_TMP"/* "$OUTPUT_DIR"/ 2>/dev/null || true
+                rm -rf "$BUNDLE_TMP"
+                rm -f "${OUTPUT_DIR}/${BUNDLE_ZIP}" 2>/dev/null || true
+              else
+                echo "❌ Zipping failed due to insufficient disk space."
+                if [ "$UPLOAD_METHOD" != "drive" ]; then
+                  echo "→ Consider using the 'drive' upload method to upload large files directly without zipping."
+                fi
+                rm -rf "$BUNDLE_TMP"
+                exit 1
               fi
             else
-              (cd "$BUNDLE_TMP" && zip -0 -r -s 99m "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
+              echo "✅ Bundle created successfully"
+              if [ "$DRIVE_DIRECT" = false ]; then
+                rm -rf "$BUNDLE_TMP"
+              fi
             fi
-            rm -rf "$BUNDLE_TMP"
+            # if DRIVE_DIRECT we already moved files and cleaned bundle_tmp
           else
+            # ------------------------------------------------------------
+            #   INDIVIDUAL ZIPPING
+            # ------------------------------------------------------------
             cd downloads
             for f in *; do
               [ -f "$f" ] || continue
+
+              if [ "$DRIVE_DIRECT" = true ]; then
+                echo "DRIVE_DIRECT flag set – skipping further zipping, will upload raw files."
+                break
+              fi
+
               RND=$(cat /dev/urandom | tr -dc 'a-z' | head -c 5)
               echo "→ Zipping: $f"
-              if [ "$METHOD" = "release" ]; then
-                zip -0 -j "../${OUTPUT_DIR}/${f}_${RND}.zip" "$f"
-                FULLZIP="${OUTPUT_DIR}/${f}_${RND}.zip"
-                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLZIP"
-                  zip -0 -j -s 1950m "../${OUTPUT_DIR}/${f}_${RND}.zip" "$f"
+              ZIP_NAME="${f}_${RND}.zip"
+
+              TMPZIP="tmpzip_$$"
+              mkdir -p "$TMPZIP"
+              cp "$f" "$TMPZIP/"
+
+              set +e
+              if [ "$SPLIT_SIZE" = "none" ]; then
+                zip_output=$( (cd "$TMPZIP" && zip -0 -j "../${OUTPUT_DIR}/${ZIP_NAME}" "$f") 2>&1 )
+                zip_exit=$?
+              else
+                zip_output=$( (cd "$TMPZIP" && zip -0 -j "../${OUTPUT_DIR}/${ZIP_NAME}" "$f") 2>&1 )
+                zip_exit=$?
+                if [ $zip_exit -eq 0 ]; then
+                  FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
+                  SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                  SPLIT_LIMIT=$(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 ))
+                  if [ "$SIZE" -gt "$SPLIT_LIMIT" ]; then
+                    echo "ZIP larger than limit, splitting"
+                    rm "$FULLZIP"
+                    zip_output=$( (cd "$TMPZIP" && zip -0 -j -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${ZIP_NAME}" "$f") 2>&1 )
+                    zip_exit=$?
+                  fi
+                fi
+              fi
+              set -e
+              rm -rf "$TMPZIP"
+
+              if [ $zip_exit -ne 0 ]; then
+                echo "Zip command failed with exit code $zip_exit"
+                if [ "$UPLOAD_METHOD" = "drive" ] && is_disk_full "$zip_output"; then
+                  echo "⚠️  Disk full – switching to direct raw upload (Google Drive)."
+                  DRIVE_DIRECT=true
+                  rm -f "${OUTPUT_DIR}/${ZIP_NAME}" 2>/dev/null || true
+                  break   # stop zipping further files
+                else
+                  echo "❌ Zipping failed due to insufficient disk space."
+                  if [ "$UPLOAD_METHOD" != "drive" ]; then
+                    echo "→ Consider using the 'drive' upload method to upload large files directly without zipping."
+                  fi
+                  exit 1
                 fi
               else
-                zip -0 -j -s 99m "../${OUTPUT_DIR}/${f}_${RND}.zip" "$f"
+                echo "✅ Zipped $f"
+                # only remove original if zip succeeded and we aren't in drive direct mode
+                if [ "$DRIVE_DIRECT" = false ]; then
+                  rm "$f"
+                fi
               fi
             done
             cd ..
+
+            # If we switched to drive direct, move all remaining raw files from downloads to leecher
+            if [ "$DRIVE_DIRECT" = true ]; then
+              echo "→ Moving raw files to output directory for direct upload..."
+              mkdir -p "$OUTPUT_DIR"
+              mv downloads/* "$OUTPUT_DIR"/ 2>/dev/null || true
+            fi
           fi
 
           ls -1 "$OUTPUT_DIR" > "${OUTPUT_DIR}_assets.txt"
