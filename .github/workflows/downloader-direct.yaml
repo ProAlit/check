@@ -21,7 +21,6 @@ on:
           - release
           - drive
         default: repo
-      # ── NEW INPUTS ───────────────────────────
       vpn_enabled:
         description: 'Route downloads through WireGuard VPN (requires secret WG_CONFIG)'
         type: boolean
@@ -31,7 +30,6 @@ on:
         type: number
         default: 4
         required: false
-      # ─────────────────────────────────────────
 
 permissions:
   contents: write
@@ -52,7 +50,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2
 
-      # ── Parse URLs into a file (unchanged) ──
       - name: Parse URLs
         id: parse
         run: |
@@ -68,7 +65,6 @@ jobs:
           NUM=$(wc -l < urls.txt)
           echo "NUM_URLS=$NUM" >> $GITHUB_OUTPUT
 
-      # ── VPN SETUP (identical to Spotify/YouTube) ──
       - name: '🔒 Set up WireGuard VPN (if enabled)'
         id: vpn
         shell: bash
@@ -107,7 +103,6 @@ jobs:
             echo "vpn_available=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── Download in parallel (restructured) ──
       - name: Download all files concurrently
         run: |
           set -e
@@ -120,7 +115,6 @@ jobs:
           mkdir -p "$OUTPUT_DIR" "$DOWNLOAD_DIR"
           > "$FAILED_FILE"
 
-          # Helper: download ONE URL
           download_one() {
             local url="$1"
             local dl_dir="dl_$$_$(echo "$url" | md5sum | cut -c1-8)"
@@ -129,7 +123,6 @@ jobs:
             echo "→ Downloading: $url"
             if aria2c -x 16 -s 16 -d "$DOWNLOAD_DIR/$dl_dir" \
               --console-log-level=warn --summary-interval=10 "$url"; then
-              # Move the downloaded file to the main downloads directory
               local dl_file=$(ls -1 "$DOWNLOAD_DIR/$dl_dir" | head -n1)
               if [ -n "$dl_file" ]; then
                 mv "$DOWNLOAD_DIR/$dl_dir/$dl_file" "$DOWNLOAD_DIR/"
@@ -148,7 +141,6 @@ jobs:
           export -f download_one
           export DOWNLOAD_DIR FAILED_FILE VPN_AVAILABLE
 
-          # Run downloads in parallel (no VPN fallback per download to avoid conflicts)
           echo "→ Starting parallel downloads (concurrency: $CONCURRENT, VPN: $VPN_AVAILABLE)"
           cat urls.txt | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"'
 
@@ -157,23 +149,26 @@ jobs:
           ls -la "$DOWNLOAD_DIR/"
         shell: bash
 
-      # ── Process and zip (now safe because downloads are complete) ──
       - name: Zip and bundle files
         run: |
+          set -e
           BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
           UPLOAD_METHOD_INPUT="${{ inputs.upload_method }}"
 
           if [ "$UPLOAD_METHOD_INPUT" = "repo" ]; then
-            UPLOAD_METHOD="split_push"
+            SPLIT_SIZE="99m"
+          elif [ "$UPLOAD_METHOD_INPUT" = "release" ]; then
+            SPLIT_SIZE="1950m"
           else
-            UPLOAD_METHOD="release"
+            SPLIT_SIZE="none"
           fi
 
           OUTPUT_DIR="direct"
           DOWNLOAD_DIR="downloads_tmp"
           FAILED_FILE="failed_urls.txt"
+          DRIVE_DIRECT=false
 
-          # Move failed log if any
+          # move failed log if any
           if [ -s "$FAILED_FILE" ]; then
             RAND_FAIL=$(mktemp -u XXXXX)
             FAIL_NAME="links-failed-${RAND_FAIL}.txt"
@@ -183,8 +178,13 @@ jobs:
             rm -f "$FAILED_FILE"
           fi
 
+          is_disk_full() {
+            local msg="$1"
+            [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
+          }
+
+          # ----- Bundle all files -----
           if [ "$BUNDLE_ALL" = "true" ]; then
-            # Bundle all downloaded files
             BUNDLE_DIR="bundle_contents"
             mkdir -p "$BUNDLE_DIR"
             cp "$DOWNLOAD_DIR"/* "$BUNDLE_DIR/" 2>/dev/null || true
@@ -192,27 +192,66 @@ jobs:
               RAND_BUNDLE=$(mktemp -u XXXXX)
               BUNDLE_ZIP="bundle_${RAND_BUNDLE}.zip"
               echo "Creating bundle: $BUNDLE_ZIP"
-              if [ "$UPLOAD_METHOD" = "release" ]; then
-                (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
-                FULLBUNDLE="${OUTPUT_DIR}/${BUNDLE_ZIP}"
-                SIZE=$(stat -c%s "$FULLBUNDLE" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "Bundle ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLBUNDLE"
-                  (cd "$BUNDLE_DIR" && zip -0 -s 1950m "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
+
+              set +e
+              if [ "$SPLIT_SIZE" = "none" ]; then
+                zip_output=$( (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
+                zip_exit=$?
+              else
+                zip_output=$( (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
+                zip_exit=$?
+                if [ $zip_exit -eq 0 ]; then
+                  FULLBUNDLE="${OUTPUT_DIR}/${BUNDLE_ZIP}"
+                  SIZE=$(stat -c%s "$FULLBUNDLE" 2>/dev/null || echo 0)
+                  SPLIT_LIMIT=$(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 ))
+                  if [ "$SIZE" -gt "$SPLIT_LIMIT" ]; then
+                    echo "Bundle ZIP larger than limit, splitting"
+                    rm "$FULLBUNDLE"
+                    zip_output=$( (cd "$BUNDLE_DIR" && zip -0 -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
+                    zip_exit=$?
+                  fi
+                fi
+              fi
+              set -e
+
+              if [ $zip_exit -ne 0 ]; then
+                echo "Zip command failed with exit code $zip_exit"
+                if [ "$UPLOAD_METHOD_INPUT" = "drive" ] && is_disk_full "$zip_output"; then
+                  echo "⚠️  Disk full – switching to direct raw upload (Google Drive)."
+                  DRIVE_DIRECT=true
+                  mkdir -p "$OUTPUT_DIR"
+                  mv "$BUNDLE_DIR"/* "$OUTPUT_DIR/" 2>/dev/null || true
+                  rm -rf "$BUNDLE_DIR"
+                  rm -f "${OUTPUT_DIR}/${BUNDLE_ZIP}" 2>/dev/null || true
+                else
+                  echo "❌ Zipping failed due to insufficient disk space."
+                  if [ "$UPLOAD_METHOD_INPUT" != "drive" ]; then
+                    echo "→ Consider using the 'drive' upload method to upload large files directly without zipping."
+                  fi
+                  rm -rf "$BUNDLE_DIR"
+                  exit 1
                 fi
               else
-                (cd "$BUNDLE_DIR" && zip -0 -s 99m "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
+                echo "✅ Bundle created successfully"
+                if [ "$DRIVE_DIRECT" = false ]; then
+                  rm -rf "$BUNDLE_DIR"
+                fi
               fi
-              rm -rf "$BUNDLE_DIR"
             else
               echo "No files to bundle."
               rm -rf "$BUNDLE_DIR"
             fi
+
           else
-            # One ZIP per file
+            # ----- Zip each file individually -----
             for f in "$DOWNLOAD_DIR"/*; do
               [ -f "$f" ] || continue
+
+              if [ "$DRIVE_DIRECT" = true ]; then
+                echo "DRIVE_DIRECT flag set – skipping further zipping, will upload raw files."
+                break
+              fi
+
               fname=$(basename "$f")
               RAND5=$(mktemp -u XXXXX)
               ZIP_BASE="${fname}_${RAND5}"
@@ -223,20 +262,56 @@ jobs:
               mkdir -p "$TMPZIP"
               cp "$f" "$TMPZIP/"
 
-              if [ "$UPLOAD_METHOD" = "release" ]; then
-                (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
-                FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
-                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLZIP"
-                  (cd "$TMPZIP" && zip -0 -s 1950m "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
+              set +e
+              if [ "$SPLIT_SIZE" = "none" ]; then
+                zip_output=$( (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname") 2>&1 )
+                zip_exit=$?
+              else
+                zip_output=$( (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname") 2>&1 )
+                zip_exit=$?
+                if [ $zip_exit -eq 0 ]; then
+                  FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
+                  SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                  SPLIT_LIMIT=$(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 ))
+                  if [ "$SIZE" -gt "$SPLIT_LIMIT" ]; then
+                    echo "ZIP larger than limit, splitting"
+                    rm "$FULLZIP"
+                    zip_output=$( (cd "$TMPZIP" && zip -0 -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname") 2>&1 )
+                    zip_exit=$?
+                  fi
+                fi
+              fi
+              set -e
+              rm -rf "$TMPZIP"
+
+              if [ $zip_exit -ne 0 ]; then
+                echo "Zip command failed with exit code $zip_exit"
+                if [ "$UPLOAD_METHOD_INPUT" = "drive" ] && is_disk_full "$zip_output"; then
+                  echo "⚠️  Disk full – switching to direct raw upload (Google Drive)."
+                  DRIVE_DIRECT=true
+                  rm -f "${OUTPUT_DIR}/${ZIP_NAME}" 2>/dev/null || true
+                  break   # stop zipping further files
+                else
+                  echo "❌ Zipping failed due to insufficient disk space."
+                  if [ "$UPLOAD_METHOD_INPUT" != "drive" ]; then
+                    echo "→ Consider using the 'drive' upload method to upload large files directly without zipping."
+                  fi
+                  exit 1
                 fi
               else
-                (cd "$TMPZIP" && zip -0 -s 99m "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
+                echo "✅ Zipped $fname"
+                if [ "$DRIVE_DIRECT" = false ]; then
+                  rm "$f"
+                fi
               fi
-              rm -rf "$TMPZIP"
             done
+          fi
+
+          # If DRIVE_DIRECT is true, move all remaining raw files from DOWNLOAD_DIR to OUTPUT_DIR
+          if [ "$DRIVE_DIRECT" = true ]; then
+            echo "→ Moving raw files to output directory for direct upload..."
+            mkdir -p "$OUTPUT_DIR"
+            mv "$DOWNLOAD_DIR"/* "$OUTPUT_DIR/" 2>/dev/null || true
           fi
 
           # Cleanup download dir
@@ -247,16 +322,12 @@ jobs:
           cat "${OUTPUT_DIR}_assets.txt"
         shell: bash
 
-      # ── Tear down VPN before any upload (identical to previous) ──
-      - name: ' Disconnect VPN for uploads'
+      - name: 'Disconnect VPN for uploads'
         if: steps.vpn.outputs.vpn_available == 'true'
         run: |
           echo "→ Bringing down WireGuard to use runner's native internet for uploads"
           sudo wg-quick down wg0
 
-      # ──────────────────────────────────────────────────────────
-      # NEW: Google Drive upload
-      # ──────────────────────────────────────────────────────────
       - name: "Upload to Google Drive"
         if: inputs.upload_method == 'drive'
         env:
@@ -264,7 +335,6 @@ jobs:
           CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          # 1. Obtain access token
           ACCESS_TOKEN=$(curl -s -X POST https://oauth2.googleapis.com/token \
             -d client_id="$CLIENT_ID" \
             -d client_secret="$CLIENT_SECRET" \
@@ -275,7 +345,6 @@ jobs:
             exit 1
           fi
 
-          # 2. Find or create 'github-actions' folder
           FOLDER_NAME="github-actions"
           QUERY="mimeType='application/vnd.google-apps.folder' and name='$FOLDER_NAME' and trashed=false"
           FOLDER_ID=$(curl -s -G \
@@ -304,7 +373,6 @@ jobs:
             size=$(stat -c%s "$file")
             echo "→ Uploading $fname ($size bytes)..."
 
-            # Initiate resumable upload session
             SESSION_URI=$(curl -s -X POST \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Type: application/json; charset=UTF-8" \
@@ -317,12 +385,10 @@ jobs:
               continue
             fi
 
-            # Upload the entire file in one chunk
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Length: $size" \
               -H "Content-Range: bytes 0-$((size-1))/$size" \
-              --data-binary "@$file" \
+              --upload-file "$file" \
               "$SESSION_URI")
             if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
               echo "✅ Uploaded $fname"
@@ -331,9 +397,6 @@ jobs:
             fi
           done
 
-      # ──────────────────────────────────────────────────────────
-      # Original repo / release upload steps (now skipped if Drive)
-      # ──────────────────────────────────────────────────────────
       - name: Upload to repository (split_push method)
         if: ${{ inputs.upload_method == 'repo' }}
         env:
