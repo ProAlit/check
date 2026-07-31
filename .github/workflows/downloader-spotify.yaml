@@ -98,7 +98,6 @@ jobs:
           pip install --quiet --upgrade pip
           pip install --quiet --upgrade spotdl SpotiFLAC
           pip install --quiet --upgrade pyOpenSSL cryptography
-          pip install --quiet --upgrade pydoll          # ← REQUIRED by SpotiFLAC
           echo "::endgroup::"
 
           echo "📥 Installing Deno..."
@@ -347,7 +346,7 @@ jobs:
               if [ "$VPN_AVAILABLE" = "true" ]; then
                 echo "→ [VPN] Downloading with SpotiFLAC..."
                 spotiflac "$url" music \
-                  --service tidal qobuz deezer amazon \
+                  --service tidal qobuz deezer \
                   --quality "$QUALITY" \
                   --use-album-subfolders \
                   --use-artist-subfolders \
@@ -356,7 +355,7 @@ jobs:
                   echo "⚠️ VPN SpotiFLAC failed – trying direct..."
                   sudo wg-quick down wg0 2>/dev/null || true
                   spotiflac "$url" music \
-                    --service tidal qobuz deezer amazon \
+                    --service tidal qobuz deezer \
                     --quality "$QUALITY" \
                     --use-album-subfolders \
                     --use-artist-subfolders \
@@ -365,7 +364,7 @@ jobs:
                 fi
               else
                 spotiflac "$url" music \
-                  --service tidal qobuz deezer amazon \
+                  --service tidal qobuz deezer \
                   --quality "$QUALITY" \
                   --use-album-subfolders \
                   --use-artist-subfolders \
