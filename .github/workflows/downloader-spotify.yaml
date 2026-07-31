@@ -92,14 +92,13 @@ jobs:
 
           echo "::group::Python virtual environment & tools"
           python3 -m venv /opt/venv
-          # make venv's binaries available for the rest of the workflow
           echo "/opt/venv/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=/opt/venv" >> $GITHUB_ENV
           source /opt/venv/bin/activate
           pip install --quiet --upgrade pip
           pip install --quiet --upgrade spotdl SpotiFLAC
-          # explicit upgrade to avoid any residual version conflicts
           pip install --quiet --upgrade pyOpenSSL cryptography
+          pip install --quiet --upgrade pydoll          # ← REQUIRED by SpotiFLAC
           echo "::endgroup::"
 
           echo "📥 Installing Deno..."
@@ -194,7 +193,7 @@ jobs:
       - name: Download with spotdl (primary, parallel)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
-        continue-on-error: true          # ← ALLOW FAILURE SO FALLBACK CAN RUN
+        continue-on-error: true          # allow fallback to run even if this step fails
         shell: bash
         run: |
           set -x
@@ -228,7 +227,8 @@ jobs:
           download_with_retry() {
             local url="$1"
             local attempt=1
-            local success=0
+            local output
+            local down_exit=0
 
             while [ $attempt -le $MAX_RETRIES ]; do
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -239,37 +239,47 @@ jobs:
 
               if [ "$VPN_AVAILABLE" = "true" ]; then
                 echo "→ [VPN] Downloading..."
-                spotdl download "$url" \
+                output=$(spotdl download "$url" \
                   --format "$FORMAT" \
                   --bitrate "$BITRATE_ARG" \
                   --output "$OUTPUT_TEMPLATE" \
-                  --threads 4 && DOWNLOAD_EXIT=0 || DOWNLOAD_EXIT=1
-                if [ $DOWNLOAD_EXIT -ne 0 ]; then
+                  --threads 4 2>&1) && down_exit=0 || down_exit=1
+                if [ $down_exit -ne 0 ]; then
                   echo "⚠️ VPN download failed – trying direct connection..."
                   sudo wg-quick down wg0 2>/dev/null || true
-                  spotdl download "$url" \
+                  output=$(spotdl download "$url" \
                     --format "$FORMAT" \
                     --bitrate "$BITRATE_ARG" \
                     --output "$OUTPUT_TEMPLATE" \
-                    --threads 4 && DOWNLOAD_EXIT=0 || DOWNLOAD_EXIT=1
+                    --threads 4 2>&1) && down_exit=0 || down_exit=1
                   sudo wg-quick up wg0 2>/dev/null || true
                 fi
               else
-                spotdl download "$url" \
+                output=$(spotdl download "$url" \
                   --format "$FORMAT" \
                   --bitrate "$BITRATE_ARG" \
                   --output "$OUTPUT_TEMPLATE" \
-                  --threads 4 && DOWNLOAD_EXIT=0 || DOWNLOAD_EXIT=1
+                  --threads 4 2>&1) && down_exit=0 || down_exit=1
               fi
 
+              echo "$output"
+
               AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
-              if [ $DOWNLOAD_EXIT -eq 0 ] && [ $AFTER -gt $BEFORE ]; then
-                echo "✅ spotdl succeeded on attempt $attempt (new files: $((AFTER - BEFORE)))"
-                return 0
-              else
-                echo "❌ Attempt $attempt failed (exit code: $DOWNLOAD_EXIT, files before=$BEFORE after=$AFTER)"
-                attempt=$((attempt + 1))
+
+              # --- HANDLE DUPLICATES AS SUCCESS ---
+              if [ $down_exit -eq 0 ]; then
+                if echo "$output" | grep -qiE '(file already exists|duplicate)'; then
+                  echo "✅ spotdl skipped duplicate (file already exists) – treating as success."
+                  return 0
+                elif [ $AFTER -gt $BEFORE ]; then
+                  echo "✅ spotdl succeeded on attempt $attempt (new files: $((AFTER - BEFORE)))"
+                  return 0
+                fi
               fi
+              # ------------------------------------
+
+              echo "❌ Attempt $attempt failed (exit code: $down_exit, files before=$BEFORE after=$AFTER)"
+              attempt=$((attempt + 1))
             done
 
             echo "::warning::spotdl failed after $MAX_RETRIES attempts for: $url"
@@ -296,7 +306,7 @@ jobs:
 
       - name: Download with SpotiFLAC (fallback, parallel)
         if: steps.parse.outputs.HAS_URLS == 'true'
-        continue-on-error: true          # ← ALLOW FAILURE – we still collect final log
+        continue-on-error: true
         shell: bash
         run: |
           set -x
@@ -465,7 +475,6 @@ jobs:
             echo "Total songs downloaded: $SONG_COUNT"
             ls -lhR music/
           fi
-        # No exit 1 here – workflow continues to upload even if empty
 
       - name: Disconnect VPN for uploads
         if: steps.vpn.outputs.vpn_available == 'true'
@@ -492,7 +501,7 @@ jobs:
           rm -rf music_archive
           mkdir -p music_archive
 
-          # Prevent empty archive if nothing downloaded
+          # Prevent empty archive
           FILE_COUNT=$(find music -type f | wc -l)
           if [ "$FILE_COUNT" -eq 0 ]; then
             echo "⚠️ No files to archive – creating a placeholder."
