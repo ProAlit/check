@@ -706,6 +706,7 @@ jobs:
 
       - name: '📦 Zip all files'
         run: |
+          set -e
           OUTPUT_FOLDER="youtube"
           BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
           UPLOAD_METHOD="${{ inputs.upload_method }}"
@@ -719,6 +720,15 @@ jobs:
             METHOD="release"         # release mode splits at 1950 MiB
           fi
 
+          DRIVE_DIRECT=false  # flag to indicate direct raw upload for Drive
+
+          # Helper function to detect disk-space errors
+          is_disk_full() {
+            local msg="$1"
+            [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
+          }
+
+          # ----- Bundle all files -----
           if [ "$BUNDLE_ALL" = "true" ]; then
             BUNDLE_TMP="bundle_tmp"
             mkdir -p "$BUNDLE_TMP"
@@ -733,53 +743,131 @@ jobs:
             RAND_BUNDLE=$(tr -dc 'a-z' </dev/urandom | head -c5)
             BUNDLE_ZIP="youtube_bundle_${RAND_BUNDLE}.zip"
             echo "📦 Creating bundle ZIP: $BUNDLE_ZIP"
+
+            ZIP_FAILED=false
+            set +e
             case "$METHOD" in
               drive)
-                # No size restriction – single ZIP
-                (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
+                zip_output=$( (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *) 2>&1 )
+                zip_exit=$?
                 ;;
               release)
-                (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
-                FULLZIP="${OUTPUT_FOLDER}/${BUNDLE_ZIP}"
-                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "Bundle ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLZIP"
-                  (cd "$BUNDLE_TMP" && zip -0 -r -s 1950m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
+                zip_output=$( (cd "$BUNDLE_TMP" && zip -0 -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *) 2>&1 )
+                zip_exit=$?
+                if [ $zip_exit -eq 0 ]; then
+                  FULLZIP="${OUTPUT_FOLDER}/${BUNDLE_ZIP}"
+                  SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                  if [ "$SIZE" -gt 2044723200 ]; then
+                    echo "Bundle ZIP larger than 1950 MiB, splitting"
+                    rm "$FULLZIP"
+                    zip_output=$( (cd "$BUNDLE_TMP" && zip -0 -r -s 1950m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *) 2>&1 )
+                    zip_exit=$?
+                  fi
                 fi
                 ;;
               split_push)
-                (cd "$BUNDLE_TMP" && zip -0 -r -s 99m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
+                zip_output=$( (cd "$BUNDLE_TMP" && zip -0 -r -s 99m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *) 2>&1 )
+                zip_exit=$?
                 ;;
             esac
-            rm -rf "$BUNDLE_TMP"
+            set -e
+
+            if [ $zip_exit -ne 0 ]; then
+              echo "Zip command failed with exit code $zip_exit"
+              if [ "$UPLOAD_METHOD" = "drive" ] && is_disk_full "$zip_output"; then
+                echo "⚠️  Disk full – switching to direct raw upload (Google Drive)."
+                DRIVE_DIRECT=true
+                # Move files back from bundle_tmp to output folder
+                shopt -s dotglob nullglob
+                mv "$BUNDLE_TMP"/* "$OUTPUT_FOLDER"/ 2>/dev/null || true
+                shopt -u dotglob nullglob
+                rm -f "${OUTPUT_FOLDER}/${BUNDLE_ZIP}" 2>/dev/null || true
+              else
+                echo "❌ Zipping failed due to insufficient disk space."
+                if [ "$UPLOAD_METHOD" != "drive" ]; then
+                  echo "→ Consider using the 'drive' upload method to upload large files directly without zipping."
+                fi
+                rm -rf "$BUNDLE_TMP"
+                exit 1
+              fi
+            else
+              echo "✅ Bundle created successfully"
+              if [ "$DRIVE_DIRECT" = false ]; then
+                rm -rf "$BUNDLE_TMP"
+              fi
+            fi
+            # Clean up temporary bundle directory if not already done
+            if [ "$DRIVE_DIRECT" = true ]; then
+              rm -rf "$BUNDLE_TMP"
+            fi
+
           else
-            # Individual file zipping
+            # ----- Zip each file individually -----
             for f in "$OUTPUT_FOLDER"/*; do
               [ -f "$f" ] || continue
+
+              # If we already switched to direct drive upload, stop zipping
+              if [ "$DRIVE_DIRECT" = true ]; then
+                echo "DRIVE_DIRECT flag set – skipping further zipping, will upload raw files."
+                break
+              fi
+
               fname=$(basename "$f")
               echo "🗜️ Zipping: $fname"
+
+              set +e
               case "$METHOD" in
                 drive)
-                  zip -0 -j "$OUTPUT_FOLDER/${fname}.zip" "$f"
+                  zip_output=$( zip -0 -j "$OUTPUT_FOLDER/${fname}.zip" "$f" 2>&1 )
+                  zip_exit=$?
                   ;;
                 release)
-                  zip -0 -j "$OUTPUT_FOLDER/${fname}.zip" "$f"
-                  FULLZIP="${OUTPUT_FOLDER}/${fname}.zip"
-                  SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                  if [ "$SIZE" -gt 2044723200 ]; then
-                    echo "ZIP larger than 1950 MiB, splitting"
-                    rm "$FULLZIP"
-                    zip -0 -j -s 1950m "$OUTPUT_FOLDER/${fname}.zip" "$f"
+                  zip_output=$( zip -0 -j "$OUTPUT_FOLDER/${fname}.zip" "$f" 2>&1 )
+                  zip_exit=$?
+                  if [ $zip_exit -eq 0 ]; then
+                    FULLZIP="${OUTPUT_FOLDER}/${fname}.zip"
+                    SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                    if [ "$SIZE" -gt 2044723200 ]; then
+                      echo "ZIP larger than 1950 MiB, splitting"
+                      rm "$FULLZIP"
+                      zip_output=$( zip -0 -j -s 1950m "$OUTPUT_FOLDER/${fname}.zip" "$f" 2>&1 )
+                      zip_exit=$?
+                    fi
                   fi
                   ;;
                 split_push)
-                  zip -0 -j -s 99m "$OUTPUT_FOLDER/${fname}.zip" "$f"
+                  zip_output=$( zip -0 -j -s 99m "$OUTPUT_FOLDER/${fname}.zip" "$f" 2>&1 )
+                  zip_exit=$?
                   ;;
               esac
-              rm "$f"
+              set -e
+
+              if [ $zip_exit -ne 0 ]; then
+                echo "Zip command failed with exit code $zip_exit"
+                if [ "$UPLOAD_METHOD" = "drive" ] && is_disk_full "$zip_output"; then
+                  echo "⚠️  Disk full – switching to direct raw upload (Google Drive)."
+                  DRIVE_DIRECT=true
+                  rm -f "$OUTPUT_FOLDER/${fname}.zip" 2>/dev/null || true
+                  # Keep the original file, do not remove it
+                  # Break out of the loop to keep remaining files raw
+                  break
+                else
+                  echo "❌ Zipping failed due to insufficient disk space."
+                  if [ "$UPLOAD_METHOD" != "drive" ]; then
+                    echo "→ Consider using the 'drive' upload method to upload large files directly without zipping."
+                  fi
+                  exit 1
+                fi
+              else
+                echo "✅ Zipped $fname"
+                # Only remove original if zip succeeded and we're not doing direct drive upload
+                if [ "$DRIVE_DIRECT" = false ]; then
+                  rm "$f"
+                fi
+              fi
             done
           fi
+
           echo "✅ Zip phase complete."
           echo "📁 Final contents of $OUTPUT_FOLDER:"
           ls -lah "$OUTPUT_FOLDER"
