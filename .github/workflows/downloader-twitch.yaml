@@ -64,6 +64,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg jq curl
 
+      - name: Cleanup Twitch temp files
+        run: rm -rf /tmp/TwitchDownloader
+
       - name: Get TwitchDownloader CLI
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
