@@ -62,6 +62,43 @@ on:
         type: number
         default: 4
         required: false
+      impersonate:
+        description: 'Impersonate a browser/client (uses curl_cffi) – leave “None” to disable'
+        type: choice
+        options:
+          - None
+          - Chrome-133:Macos-15
+          - Chrome-136:Macos-15
+          - Safari-17.2:Ios-17.2
+          - Safari-18.0:Ios-18.0
+          - Safari-18.4:Ios-18.4
+          - Safari-26.0:Ios-26.0
+          - Chrome-99:Android-12
+          - Chrome-131:Android-14
+          - Tor-14.5:Macos-14
+          - Edge-99:Windows-10
+          - Edge-101:Windows-10
+          - Firefox-133:Macos-14
+          - Firefox-135:Macos-14
+          - Safari-15.3:Macos-14
+          - Safari-15.5:Macos-14
+          - Safari-17.0:Macos-14
+          - Safari-18.0:Macos-15
+          - Safari-18.4:Macos-15
+          - Safari-26.0:Macos-26
+          - Chrome-99:Windows-10
+          - Chrome-100:Windows-10
+          - Chrome-101:Windows-10
+          - Chrome-104:Windows-10
+          - Chrome-107:Windows-10
+          - Chrome-110:Windows-10
+          - Chrome-116:Windows-10
+          - Chrome-119:Macos-14
+          - Chrome-120:Macos-14
+          - Chrome-123:Macos-14
+          - Chrome-124:Macos-14
+          - Chrome-131:Macos-14
+        default: None
 
 permissions:
   contents: write
@@ -179,9 +216,9 @@ jobs:
       - name: '🛠️ Install download tools'
         if: steps.parse.outputs.IS_ANY_YT == 'true'
         run: |
-          echo "📥 Installing / updating yt-dlp..."
+          echo "📥 Installing / updating yt-dlp (with curl_cffi for impersonation)..."
           if ! command -v yt-dlp &> /dev/null; then
-            curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
               -o ~/.local/bin/yt-dlp
             chmod a+rx ~/.local/bin/yt-dlp
           fi
@@ -220,6 +257,16 @@ jobs:
           GLOBAL_AQ="${{ github.event.inputs.audio_quality }}"
           VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
           CONCURRENT="${{ inputs.concurrent_downloads }}"
+
+          # ── Impersonate arguments ──
+          IMPERSONATE_TARGET="${{ inputs.impersonate }}"
+          IMPERSONATE_ARGS=""
+          if [ "$IMPERSONATE_TARGET" != "None" ]; then
+            IMPERSONATE_ARGS="--impersonate $IMPERSONATE_TARGET"
+            echo "🎭 Using impersonation: $IMPERSONATE_TARGET"
+          else
+            echo "🎭 No impersonation (None selected)"
+          fi
 
           GLOBAL_VQ_NUM=$(echo "$GLOBAL_VQ" | grep -o '[0-9]*' | head -1)
           GLOBAL_AQ_NUM=$(echo "$GLOBAL_AQ" | grep -o '[0-9]*' | head -1)
@@ -296,7 +343,7 @@ jobs:
             echo "========================================"
             echo "📹 Processing entry $((idx+1)): $link (type=$type quality=$val)"
 
-            YT_DLP_ARGS="$COOKIE_ARGS --js-runtimes deno --remote-components ejs:npm --no-progress"
+            YT_DLP_ARGS="$COOKIE_ARGS --js-runtimes deno --remote-components ejs:npm --no-progress $IMPERSONATE_ARGS"
             VIDEO_JSON=""
 
             if ! run_with_fallback "Fetch info for $link" \
@@ -367,7 +414,7 @@ jobs:
           }
 
           export -f download_one
-          export ENTRIES_JSON GLOBAL_TYPE GLOBAL_VAL VPN_AVAILABLE OUTPUT_FOLDER COOKIE_ARGS FAILED_FILE FAILED_LOCK
+          export ENTRIES_JSON GLOBAL_TYPE GLOBAL_VAL VPN_AVAILABLE OUTPUT_FOLDER COOKIE_ARGS FAILED_FILE FAILED_LOCK IMPERSONATE_ARGS
 
           count=$(echo "$ENTRIES_JSON" | jq length)
           echo "→ Starting parallel downloads (concurrent=$CONCURRENT)"
@@ -394,6 +441,13 @@ jobs:
           echo "🔄 Attempting fallback for $count failed entries..."
           OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
           VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
+
+          # ── Impersonate arguments (same as primary) ──
+          IMPERSONATE_TARGET="${{ inputs.impersonate }}"
+          IMPERSONATE_ARGS=""
+          if [ "$IMPERSONATE_TARGET" != "None" ]; then
+            IMPERSONATE_ARGS="--impersonate $IMPERSONATE_TARGET"
+          fi
 
           COOKIE_ARGS=""
           [ -f youtube-cookies.txt ] && COOKIE_ARGS="--cookies youtube-cookies.txt"
@@ -568,6 +622,7 @@ jobs:
               --extractor-args "youtube:player_client=default,web_embedded" \
               -f "$fmt" \
               --js-runtimes deno --remote-components ejs:npm --no-progress \
+              $IMPERSONATE_ARGS \
               -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
 
@@ -627,6 +682,7 @@ jobs:
               -f "$fmt" \
               --js-runtimes deno --newline --concurrent-fragments 4 \
               $COOKIE_ARGS \
+              $IMPERSONATE_ARGS \
               -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
 
