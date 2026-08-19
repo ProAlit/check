@@ -55,11 +55,11 @@ on:
       vpn_enabled:
         description: 'Route downloads through WireGuard VPN (requires secret WG_CONFIG)'
         type: boolean
-        default: false
+        default: true
       concurrent_downloads:
-        description: 'Number of URLs to download at the same time'
+        description: 'Number of URLs to download at the same time (Keep low: 2-4 recommended)'
         type: number
-        default: 4
+        default: 3
         required: false
       retry_count:
         description: 'How many times to retry a failed URL before falling back to SpotiFLAC'
@@ -96,7 +96,9 @@ jobs:
           echo "VIRTUAL_ENV=/opt/venv" >> $GITHUB_ENV
           source /opt/venv/bin/activate
           pip install --quiet --upgrade pip
-          pip install --quiet --upgrade spotdl SpotiFLAC
+          
+          # PINNED VERSION: 4.2.10 is highly stable and avoids the recent 'spotapi' NoneType crashes
+          pip install --quiet "spotdl==4.2.10" "SpotiFLAC"
           pip install --quiet --upgrade pyOpenSSL cryptography
           echo "::endgroup::"
 
@@ -123,7 +125,7 @@ jobs:
 
           if [ "$VPN_ENABLED" = "true" ]; then
             if [ -z "${{ secrets.WG_CONFIG }}" ]; then
-              echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
+              echo "::warning::VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
               echo "vpn_available=false" >> $GITHUB_OUTPUT
               exit 0
             fi
@@ -144,7 +146,7 @@ jobs:
               echo "✅ WireGuard VPN connected."
               echo "vpn_available=true" >> $GITHUB_OUTPUT
             else
-              echo "⚠️ Failed to bring up WireGuard – VPN disabled."
+              echo "::warning::Failed to bring up WireGuard – VPN disabled."
               sudo wg-quick down wg0 2>/dev/null || true
               echo "vpn_available=false" >> $GITHUB_OUTPUT
             fi
@@ -192,7 +194,11 @@ jobs:
       - name: Download with spotdl (primary, parallel)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
-        continue-on-error: true          # allow fallback to run even if this step fails
+        continue-on-error: true
+        env:
+          # Inject your custom Spotify Developer credentials here
+          SPOTIPY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIPY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
         shell: bash
         run: |
           set -x
@@ -243,17 +249,14 @@ jobs:
                   --bitrate "$BITRATE_ARG" \
                   --output "$OUTPUT_TEMPLATE" \
                   --threads 4 2>&1) && down_exit=0 || down_exit=1
+                
                 if [ $down_exit -ne 0 ]; then
-                  echo "⚠️ VPN download failed – trying direct connection..."
-                  sudo wg-quick down wg0 2>/dev/null || true
-                  output=$(spotdl download "$url" \
-                    --format "$FORMAT" \
-                    --bitrate "$BITRATE_ARG" \
-                    --output "$OUTPUT_TEMPLATE" \
-                    --threads 4 2>&1) && down_exit=0 || down_exit=1
-                  sudo wg-quick up wg0 2>/dev/null || true
+                  echo "::warning::VPN download failed. Skipping direct connection to prevent GitHub IP rate-limiting."
+                  # We intentionally DO NOT fall back to direct connection here. 
+                  # Falling back to direct connection on a GH runner guarantees an IP ban for the rest of the batch.
                 fi
               else
+                echo "⚠️ VPN not available. Using direct connection (high risk of rate limiting)."
                 output=$(spotdl download "$url" \
                   --format "$FORMAT" \
                   --bitrate "$BITRATE_ARG" \
@@ -265,20 +268,24 @@ jobs:
 
               AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
-              # --- HANDLE DUPLICATES AS SUCCESS ---
               if [ $down_exit -eq 0 ]; then
                 if echo "$output" | grep -qiE '(file already exists|duplicate)'; then
-                  echo "✅ spotdl skipped duplicate (file already exists) – treating as success."
+                  echo "✅ spotdl skipped duplicate – treating as success."
                   return 0
                 elif [ $AFTER -gt $BEFORE ]; then
                   echo "✅ spotdl succeeded on attempt $attempt (new files: $((AFTER - BEFORE)))"
                   return 0
                 fi
               fi
-              # ------------------------------------
 
-              echo "❌ Attempt $attempt failed (exit code: $down_exit, files before=$BEFORE after=$AFTER)"
+              echo "❌ Attempt $attempt failed (exit code: $down_exit)"
               attempt=$((attempt + 1))
+              
+              # Add a delay before retrying to be kind to the API and avoid immediate 429 rate limits
+              if [ $attempt -le $MAX_RETRIES ]; then
+                echo "⏳ Waiting 3 seconds before retry..."
+                sleep 3
+              fi
             done
 
             echo "::warning::spotdl failed after $MAX_RETRIES attempts for: $url"
@@ -351,18 +358,12 @@ jobs:
                   --use-album-subfolders \
                   --use-artist-subfolders \
                   --filename-format "{artist} - {title}" && FLAC_EXIT=0 || FLAC_EXIT=1
+                
                 if [ $FLAC_EXIT -ne 0 ]; then
-                  echo "⚠️ VPN SpotiFLAC failed – trying direct..."
-                  sudo wg-quick down wg0 2>/dev/null || true
-                  spotiflac "$url" music \
-                    --service tidal qobuz deezer \
-                    --quality "$QUALITY" \
-                    --use-album-subfolders \
-                    --use-artist-subfolders \
-                    --filename-format "{artist} - {title}" && FLAC_EXIT=0 || FLAC_EXIT=1
-                  sudo wg-quick up wg0 2>/dev/null || true
+                  echo "::warning::VPN SpotiFLAC failed. Skipping direct connection to prevent IP ban."
                 fi
               else
+                echo "⚠️ VPN not available. Using direct connection."
                 spotiflac "$url" music \
                   --service tidal qobuz deezer \
                   --quality "$QUALITY" \
@@ -378,6 +379,9 @@ jobs:
               else
                 echo "❌ Attempt $attempt failed (exit: $FLAC_EXIT, files before=$BEFORE after=$AFTER)"
                 attempt=$((attempt + 1))
+                if [ $attempt -le $MAX_RETRIES ]; then
+                  sleep 3
+                fi
               fi
             done
 
@@ -458,7 +462,7 @@ jobs:
             echo "::warning::Some downloads failed even after fallback. Adding failed_downloads.txt to the archive."
             cp failed_urls_spotiflac.txt music/failed_downloads.txt
           elif [ -f failed_urls_spotdl.txt ] && [ -s failed_urls_spotdl.txt ]; then
-            echo "::warning::Some spotdl downloads failed (SpotiFLAC fallback may not have been triggered). Adding to archive."
+            echo "::warning::Some spotdl downloads failed. Adding to archive."
             cp failed_urls_spotdl.txt music/failed_downloads.txt
           else
             echo "No failed downloads – no fail log needed."
@@ -500,7 +504,6 @@ jobs:
           rm -rf music_archive
           mkdir -p music_archive
 
-          # Prevent empty archive
           FILE_COUNT=$(find music -type f | wc -l)
           if [ "$FILE_COUNT" -eq 0 ]; then
             echo "⚠️ No files to archive – creating a placeholder."
