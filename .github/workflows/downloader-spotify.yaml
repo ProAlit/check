@@ -87,14 +87,9 @@ jobs:
           PYTHONUNBUFFERED: 1
         run: |
           set -e
-          echo "::group::System packages"
-          echo "→ Updating apt repositories..."
-          sudo apt-get update
+          # GitHub runners already have ffmpeg, curl, jq, zip, python3, pip pre-installed.
+          # Skipping 'apt-get update' saves 2-3 minutes and prevents Azure mirror hangs.
           
-          echo "→ Installing system dependencies (ffmpeg, python, etc.)..."
-          sudo apt-get install -y ffmpeg curl jq zip python3 python3-pip python3-venv
-          echo "::endgroup::"
-
           echo "::group::Python virtual environment & tools"
           echo "→ Setting up Python virtual environment..."
           python3 -m venv /opt/venv
@@ -115,7 +110,6 @@ jobs:
           echo "::group::Deno runtime"
           echo "📥 Installing Deno..."
           if ! command -v deno &> /dev/null; then
-            # Removed -s (silent) from curl to show the download progress bar
             curl -fSL https://deno.land/install.sh | sh -s -- -y
             echo "$HOME/.deno/bin" >> $GITHUB_PATH
           fi
@@ -143,8 +137,9 @@ jobs:
             fi
 
             echo "→ Installing WireGuard tools..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get install -y -qq wireguard-tools
+            # 🧠 FIX: Force IPv4 to prevent Azure mirror IPv6 hangs
+            sudo apt-get -o Acquire::ForceIPv4=true update -qq
+            sudo apt-get -o Acquire::ForceIPv4=true install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get -o Acquire::ForceIPv4=true install -y -qq wireguard-tools
 
             echo "→ Writing WireGuard config..."
             cat <<'EOF' > /tmp/wg0.conf
