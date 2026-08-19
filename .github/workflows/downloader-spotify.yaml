@@ -82,30 +82,45 @@ jobs:
 
       - name: Install System Dependencies
         shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          PYTHONUNBUFFERED: 1
         run: |
           set -e
           echo "::group::System packages"
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg curl jq zip python3 python3-pip python3-venv
+          echo "→ Updating apt repositories..."
+          sudo apt-get update
+          
+          echo "→ Installing system dependencies (ffmpeg, python, etc.)..."
+          sudo apt-get install -y ffmpeg curl jq zip python3 python3-pip python3-venv
           echo "::endgroup::"
 
           echo "::group::Python virtual environment & tools"
+          echo "→ Setting up Python virtual environment..."
           python3 -m venv /opt/venv
           echo "/opt/venv/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=/opt/venv" >> $GITHUB_ENV
           source /opt/venv/bin/activate
-          pip install --quiet --upgrade pip
           
-          pip install --quiet "spotdl==4.2.10"
-          pip install --quiet --upgrade pyOpenSSL cryptography
+          echo "→ Upgrading pip..."
+          pip install --upgrade pip
+          
+          echo "→ Installing spotdl v4.2.10 (this may take a minute)..."
+          pip install "spotdl==4.2.10"
+          
+          echo "→ Installing pyOpenSSL and cryptography..."
+          pip install --upgrade pyOpenSSL cryptography
           echo "::endgroup::"
 
+          echo "::group::Deno runtime"
           echo "📥 Installing Deno..."
           if ! command -v deno &> /dev/null; then
-            curl -fsSL https://deno.land/install.sh | sh -s -- -y
+            # Removed -s (silent) from curl to show the download progress bar
+            curl -fSL https://deno.land/install.sh | sh -s -- -y
             echo "$HOME/.deno/bin" >> $GITHUB_PATH
           fi
           echo "✅ Deno ready."
+          echo "::endgroup::"
 
           echo "::group::Versions"
           ffmpeg -version 2>&1 | head -n1
