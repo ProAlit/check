@@ -65,6 +65,10 @@ on:
         type: number
         default: 5
         required: false
+      use_custom_credentials:
+        description: 'Use custom Spotify App (Requires Premium). Turn OFF to use spotdl defaults.'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -219,8 +223,9 @@ jobs:
         id: spotdl_download
         continue-on-error: true
         env:
-          SPOTIPY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
-          SPOTIPY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          # Pass secrets into environment, the bash script will decide what to do.
+          RAW_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          RAW_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
         shell: bash
         run: |
           set -x
@@ -229,8 +234,22 @@ jobs:
           PARALLEL="${{ inputs.concurrent_downloads }}"
           MAX_RETRIES="${{ inputs.retry_count }}"
           VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
+          USE_CUSTOM="${{ inputs.use_custom_credentials }}"
           FAILED="failed_urls_spotdl.txt"
           rm -f "$FAILED"
+
+          # 🧠 CREDENTIAL TOGGLE LOGIC
+          if [ "$USE_CUSTOM" = "true" ] && [ -n "$RAW_CLIENT_ID" ] && [ -n "$RAW_CLIENT_SECRET" ]; then
+            echo "✅ Using your custom Spotify Developer credentials."
+            export SPOTIPY_CLIENT_ID="$RAW_CLIENT_ID"
+            export SPOTIPY_CLIENT_SECRET="$RAW_CLIENT_SECRET"
+          else
+            echo "⚠️ Using spotdl's built-in default credentials."
+            echo "   (Make sure your VPN is enabled to prevent IP bans!)"
+            # Unsetting these forces spotdl to use its own internal default app
+            unset SPOTIPY_CLIENT_ID
+            unset SPOTIPY_CLIENT_SECRET
+          fi
 
           case "$BITRATE" in
             LOSSLESS|HI_RES_LOSSLESS|HIGH|LOW) BITRATE_ARG="disable" ;;
@@ -242,6 +261,7 @@ jobs:
 
           echo "::group::Download configuration"
           echo "Format: $FORMAT | Bitrate: $BITRATE_ARG | Parallel Albums: $PARALLEL | Retries: $MAX_RETRIES"
+          echo "Custom Credentials: $USE_CUSTOM"
           echo "::endgroup::"
 
           download_with_retry() {
@@ -256,15 +276,14 @@ jobs:
               
               BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
-              # 🧠 CRITICAL FIX: Spotdl expects a FILE for --cache-path, not a directory!
-              # Using a file allows it to cache the Spotify token and stops API spam.
+              # 🧠 CACHE FIX: Use a file, not a directory, to prevent API spam
               CACHE_FILE="/tmp/spotdl-cache-$$-${RANDOM}.json"
               touch "$CACHE_FILE"
 
               if [ "$VPN_AVAILABLE" = "true" ]; then
                 echo "→ [VPN] Downloading..."
               else
-                echo "⚠️ [Direct] Downloading (High risk of rate limits)..."
+                echo "⚠️ [Direct] Downloading..."
               fi
 
               export PYTHONUNBUFFERED=1
