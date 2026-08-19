@@ -251,19 +251,21 @@ jobs:
 
               if [ "$VPN_AVAILABLE" = "true" ]; then
                 echo "→ [VPN] Downloading..."
+                # FIXED: Changed --cache-dir to --cache-path for spotdl v4.x compatibility
                 output=$(spotdl download "$url" \
                   --format "$FORMAT" \
                   --bitrate "$BITRATE_ARG" \
                   --output "$OUTPUT_TEMPLATE" \
-                  --cache-dir "$CACHE_DIR" \
+                  --cache-path "$CACHE_DIR" \
                   --threads 4 2>&1) && down_exit=0 || down_exit=1
               else
                 echo "⚠️ [Direct] Downloading..."
+                # FIXED: Changed --cache-dir to --cache-path for spotdl v4.x compatibility
                 output=$(spotdl download "$url" \
                   --format "$FORMAT" \
                   --bitrate "$BITRATE_ARG" \
                   --output "$OUTPUT_TEMPLATE" \
-                  --cache-dir "$CACHE_DIR" \
+                  --cache-path "$CACHE_DIR" \
                   --threads 4 2>&1) && down_exit=0 || down_exit=1
               fi
 
