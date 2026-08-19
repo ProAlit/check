@@ -256,23 +256,23 @@ jobs:
               
               BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
-              CACHE_DIR="/tmp/spotdl-cache-$$-${RANDOM}"
-              mkdir -p "$CACHE_DIR"
+              # 🧠 CRITICAL FIX: Spotdl expects a FILE for --cache-path, not a directory!
+              # Using a file allows it to cache the Spotify token and stops API spam.
+              CACHE_FILE="/tmp/spotdl-cache-$$-${RANDOM}.json"
+              touch "$CACHE_FILE"
 
               if [ "$VPN_AVAILABLE" = "true" ]; then
                 echo "→ [VPN] Downloading..."
               else
-                echo "⚠️ [Direct] Downloading..."
+                echo "⚠️ [Direct] Downloading (High risk of rate limits)..."
               fi
 
-              # 🧠 FIX 1 & 2: Stream output in real-time and force Python to flush logs instantly.
-              # 🧠 FIX 3: 'timeout 900' prevents infinite hangs if YouTube throttles/drops the connection.
               export PYTHONUNBUFFERED=1
               timeout 900 spotdl download "$url" \
                 --format "$FORMAT" \
                 --bitrate "$BITRATE_ARG" \
                 --output "$OUTPUT_TEMPLATE" \
-                --cache-path "$CACHE_DIR" \
+                --cache-path "$CACHE_FILE" \
                 --threads 4 2>&1 | tee "$log_file"
               
               down_exit=${PIPESTATUS[0]}
@@ -280,7 +280,7 @@ jobs:
                 echo "⏱️ Process timed out after 15 minutes (Network hang detected)."
               fi
 
-              rm -rf "$CACHE_DIR"
+              rm -f "$CACHE_FILE"
               
               local output=$(cat "$log_file")
               rm -f "$log_file"
