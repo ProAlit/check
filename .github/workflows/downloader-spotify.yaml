@@ -87,9 +87,15 @@ jobs:
           PYTHONUNBUFFERED: 1
         run: |
           set -e
-          # GitHub runners already have ffmpeg, curl, jq, zip, python3, pip pre-installed.
-          # Skipping 'apt-get update' saves 2-3 minutes and prevents Azure mirror hangs.
+          echo "::group::System packages (Forced IPv4 to prevent Azure hangs)"
+          echo "→ Updating apt repositories (IPv4 only)..."
+          # 🧠 FIX: Force IPv4 to bypass Azure's IPv6 network blackholes
+          sudo apt-get -o Acquire::ForceIPv4=true update -qq
           
+          echo "→ Installing ffmpeg and required utilities..."
+          sudo apt-get -o Acquire::ForceIPv4=true install -y -qq ffmpeg curl jq zip
+          echo "::endgroup::"
+
           echo "::group::Python virtual environment & tools"
           echo "→ Setting up Python virtual environment..."
           python3 -m venv /opt/venv
