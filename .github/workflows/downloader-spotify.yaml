@@ -96,7 +96,6 @@ jobs:
           source /opt/venv/bin/activate
           pip install --quiet --upgrade pip
           
-          # Pinned to 4.2.10 for maximum stability against API/NoneType crashes
           pip install --quiet "spotdl==4.2.10"
           pip install --quiet --upgrade pyOpenSSL cryptography
           echo "::endgroup::"
@@ -137,17 +136,13 @@ jobs:
           ${{ secrets.WG_CONFIG }}
           EOF
 
-            # 🧠 DEEP FIX 1: Enforce safe MTU to prevent silent TCP hangs in CI environments
             sed -i '/^MTU\s*=/d' /tmp/wg0.conf
             sed -i '/^\[Interface\]/a MTU = 1360' /tmp/wg0.conf
-            
-            # 🧠 DEEP FIX 2: Remove WireGuard DNS to prevent breaking GitHub Actions runner DNS resolution
             sed -i '/^DNS\s*=/d' /tmp/wg0.conf
 
             sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
             sudo chmod 600 /etc/wireguard/wg0.conf
 
-            # 🧠 DEEP FIX 3: Bypass VPN for GitHub backend IPs so the runner agent doesn't lose connection
             echo "→ Fetching GitHub IP ranges to bypass VPN..."
             DEFAULT_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
             if [ -z "$DEFAULT_IF" ]; then DEFAULT_IF="eth0"; fi
@@ -203,7 +198,7 @@ jobs:
             exit 1
           fi
 
-      - name: Download with spotdl (Robust Parallel)
+      - name: Download with spotdl (Real-Time Logs & Anti-Hang)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
         continue-on-error: true
@@ -236,8 +231,8 @@ jobs:
           download_with_retry() {
             local url="$1"
             local attempt=1
-            local output
             local down_exit=0
+            local log_file="/tmp/spotdl-log-$$-${RANDOM}.txt"
 
             while [ $attempt -le $MAX_RETRIES ]; do
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -245,38 +240,40 @@ jobs:
               
               BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
-              # 🧠 ROBUSTNESS FIX: Unique cache dir per thread prevents SQLite "database is locked" crashes
               CACHE_DIR="/tmp/spotdl-cache-$$-${RANDOM}"
               mkdir -p "$CACHE_DIR"
 
               if [ "$VPN_AVAILABLE" = "true" ]; then
                 echo "→ [VPN] Downloading..."
-                # FIXED: Changed --cache-dir to --cache-path for spotdl v4.x compatibility
-                output=$(spotdl download "$url" \
-                  --format "$FORMAT" \
-                  --bitrate "$BITRATE_ARG" \
-                  --output "$OUTPUT_TEMPLATE" \
-                  --cache-path "$CACHE_DIR" \
-                  --threads 4 2>&1) && down_exit=0 || down_exit=1
               else
                 echo "⚠️ [Direct] Downloading..."
-                # FIXED: Changed --cache-dir to --cache-path for spotdl v4.x compatibility
-                output=$(spotdl download "$url" \
-                  --format "$FORMAT" \
-                  --bitrate "$BITRATE_ARG" \
-                  --output "$OUTPUT_TEMPLATE" \
-                  --cache-path "$CACHE_DIR" \
-                  --threads 4 2>&1) && down_exit=0 || down_exit=1
+              fi
+
+              # 🧠 FIX 1 & 2: Stream output in real-time and force Python to flush logs instantly.
+              # 🧠 FIX 3: 'timeout 900' prevents infinite hangs if YouTube throttles/drops the connection.
+              export PYTHONUNBUFFERED=1
+              timeout 900 spotdl download "$url" \
+                --format "$FORMAT" \
+                --bitrate "$BITRATE_ARG" \
+                --output "$OUTPUT_TEMPLATE" \
+                --cache-path "$CACHE_DIR" \
+                --threads 4 2>&1 | tee "$log_file"
+              
+              down_exit=${PIPESTATUS[0]}
+              if [ $down_exit -eq 124 ]; then
+                echo "⏱️ Process timed out after 15 minutes (Network hang detected)."
               fi
 
               rm -rf "$CACHE_DIR"
-              echo "$output"
+              
+              local output=$(cat "$log_file")
+              rm -f "$log_file"
 
               AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
               if [ $down_exit -eq 0 ]; then
-                if echo "$output" | grep -qiE '(file already exists|duplicate)'; then
-                  echo "✅ spotdl skipped duplicate – treating as success."
+                if echo "$output" | grep -qiE '(file already exists|duplicate|Downloaded)'; then
+                  echo "✅ spotdl succeeded/skipped duplicate on attempt $attempt."
                   return 0
                 elif [ $AFTER -gt $BEFORE ]; then
                   echo "✅ spotdl succeeded on attempt $attempt (new files: $((AFTER - BEFORE)))"
