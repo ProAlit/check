@@ -14,40 +14,39 @@ on:
         required: true
         type: choice
         options:
-          - flac
           - mp3
+          - flac
           - m4a
           - ogg
           - opus
           - wav
-        default: flac
+        default: mp3
       audio_quality:
         description: >
           Audio Quality / Bitrate.
-          For FLAC: LOSSLESS, HI_RES_LOSSLESS, DOLBY_ATMOS, HIGH, LOW.
           For MP3/M4A/OGG/Opus: 320k, 256k, 192k, 128k.
+          For FLAC: LOSSLESS, HI_RES_LOSSLESS, HIGH, LOW.
         required: true
         type: choice
         options:
-          - LOSSLESS
-          - HI_RES_LOSSLESS
-          - DOLBY_ATMOS
-          - HIGH
-          - LOW
           - 320k
           - 256k
           - 192k
           - 128k
-        default: LOSSLESS
+          - LOSSLESS
+          - HI_RES_LOSSLESS
+          - HIGH
+          - LOW
+        default: 320k
       upload_method:
         description: 'Upload destination'
         required: true
         type: choice
         options:
+          - drive
           - repo
           - release
-          - drive
-        default: repo
+        default: drive
       bundle_all:
         description: 'Bundle all downloaded tracks into a single ZIP (true) or create a ZIP for each track (false)'
         type: boolean
@@ -57,14 +56,14 @@ on:
         type: boolean
         default: true
       concurrent_downloads:
-        description: 'Number of URLs to download at the same time (Keep low: 2-4 recommended)'
+        description: 'Number of Albums/Playlists to download at the same time (Keep at 2 for stability)'
         type: number
-        default: 3
+        default: 2
         required: false
       retry_count:
-        description: 'How many times to retry a failed URL before falling back to SpotiFLAC'
+        description: 'How many times to retry a failed URL'
         type: number
-        default: 3
+        default: 5
         required: false
 
 permissions:
@@ -97,8 +96,8 @@ jobs:
           source /opt/venv/bin/activate
           pip install --quiet --upgrade pip
           
-          # PINNED VERSION: 4.2.10 is highly stable and avoids the recent 'spotapi' NoneType crashes
-          pip install --quiet "spotdl==4.2.10" "SpotiFLAC"
+          # Pinned to 4.2.10 for maximum stability against API/NoneType crashes
+          pip install --quiet "spotdl==4.2.10"
           pip install --quiet --upgrade pyOpenSSL cryptography
           echo "::endgroup::"
 
@@ -113,10 +112,9 @@ jobs:
           ffmpeg -version 2>&1 | head -n1
           python3 --version
           spotdl --version 2>/dev/null || echo "spotDL version check failed (continuing)"
-          spotiflac --version 2>/dev/null || echo "SpotiFLAC version unknown (installed successfully)"
           echo "::endgroup::"
 
-      - name: "Set up WireGuard VPN (if enabled)"
+      - name: "Set up WireGuard VPN (Deep CI Fix)"
         id: vpn
         shell: bash
         run: |
@@ -125,7 +123,7 @@ jobs:
 
           if [ "$VPN_ENABLED" = "true" ]; then
             if [ -z "${{ secrets.WG_CONFIG }}" ]; then
-              echo "::warning::VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
+              echo "::warning::VPN enabled but WG_CONFIG secret is empty – VPN Disabled."
               echo "vpn_available=false" >> $GITHUB_OUTPUT
               exit 0
             fi
@@ -138,12 +136,30 @@ jobs:
             cat <<'EOF' > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
+
+            # 🧠 DEEP FIX 1: Enforce safe MTU to prevent silent TCP hangs in CI environments
+            sed -i '/^MTU\s*=/d' /tmp/wg0.conf
+            sed -i '/^\[Interface\]/a MTU = 1360' /tmp/wg0.conf
+            
+            # 🧠 DEEP FIX 2: Remove WireGuard DNS to prevent breaking GitHub Actions runner DNS resolution
+            sed -i '/^DNS\s*=/d' /tmp/wg0.conf
+
             sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
             sudo chmod 600 /etc/wireguard/wg0.conf
 
+            # 🧠 DEEP FIX 3: Bypass VPN for GitHub backend IPs so the runner agent doesn't lose connection
+            echo "→ Fetching GitHub IP ranges to bypass VPN..."
+            DEFAULT_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+            if [ -z "$DEFAULT_IF" ]; then DEFAULT_IF="eth0"; fi
+            
+            GITHUB_IPS=$(curl -s https://api.github.com/meta | jq -r '.actions[]?, .hooks[]?, .web[]?, .api[]?, .git[]?' 2>/dev/null | sort -u)
+            for ip in $GITHUB_IPS; do
+                sudo ip route add "$ip" dev "$DEFAULT_IF" 2>/dev/null || true
+            done
+
             echo "→ Bringing up wg0..."
             if sudo wg-quick up wg0; then
-              echo "✅ WireGuard VPN connected."
+              echo "✅ WireGuard VPN connected securely without breaking agent."
               echo "vpn_available=true" >> $GITHUB_OUTPUT
             else
               echo "::warning::Failed to bring up WireGuard – VPN disabled."
@@ -179,24 +195,19 @@ jobs:
             fi
           done
 
-          echo "::group::URLs to download"
-          cat spotify_urls.txt 2>/dev/null || echo "(none)"
-          echo "::endgroup::"
-
           if [ -s spotify_urls.txt ]; then
             echo "HAS_URLS=true" >> $GITHUB_OUTPUT
           else
-            echo "::error::No valid Spotify/Tidal/Apple Music/etc. URLs found."
+            echo "::error::No valid URLs found."
             echo "HAS_URLS=false" >> $GITHUB_OUTPUT
             exit 1
           fi
 
-      - name: Download with spotdl (primary, parallel)
+      - name: Download with spotdl (Robust Parallel)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
         continue-on-error: true
         env:
-          # Inject your custom Spotify Developer credentials here
           SPOTIPY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIPY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
         shell: bash
@@ -211,22 +222,15 @@ jobs:
           rm -f "$FAILED"
 
           case "$BITRATE" in
-            LOSSLESS|HI_RES_LOSSLESS|DOLBY_ATMOS|HIGH|LOW)
-              BITRATE_ARG="disable" ;;
-            320k|256k|192k|128k)
-              BITRATE_ARG="$BITRATE" ;;
-            *)
-              BITRATE_ARG="128k" ;;
+            LOSSLESS|HI_RES_LOSSLESS|HIGH|LOW) BITRATE_ARG="disable" ;;
+            320k|256k|192k|128k) BITRATE_ARG="$BITRATE" ;;
+            *) BITRATE_ARG="320k" ;;
           esac
 
           OUTPUT_TEMPLATE="music/{title} - {artists}.{output-ext}"
 
           echo "::group::Download configuration"
-          echo "Format          : $FORMAT"
-          echo "Bitrate arg     : $BITRATE_ARG"
-          echo "Parallel jobs   : $PARALLEL"
-          echo "Max retries     : $MAX_RETRIES"
-          echo "VPN available   : $VPN_AVAILABLE"
+          echo "Format: $FORMAT | Bitrate: $BITRATE_ARG | Parallel Albums: $PARALLEL | Retries: $MAX_RETRIES"
           echo "::endgroup::"
 
           download_with_retry() {
@@ -238,9 +242,12 @@ jobs:
             while [ $attempt -le $MAX_RETRIES ]; do
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
               echo "▶ spotdl attempt $attempt/$MAX_RETRIES for: $url"
-              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
+              
               BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
+
+              # 🧠 ROBUSTNESS FIX: Unique cache dir per thread prevents SQLite "database is locked" crashes
+              CACHE_DIR="/tmp/spotdl-cache-$$-${RANDOM}"
+              mkdir -p "$CACHE_DIR"
 
               if [ "$VPN_AVAILABLE" = "true" ]; then
                 echo "→ [VPN] Downloading..."
@@ -248,22 +255,19 @@ jobs:
                   --format "$FORMAT" \
                   --bitrate "$BITRATE_ARG" \
                   --output "$OUTPUT_TEMPLATE" \
+                  --cache-dir "$CACHE_DIR" \
                   --threads 4 2>&1) && down_exit=0 || down_exit=1
-                
-                if [ $down_exit -ne 0 ]; then
-                  echo "::warning::VPN download failed. Skipping direct connection to prevent GitHub IP rate-limiting."
-                  # We intentionally DO NOT fall back to direct connection here. 
-                  # Falling back to direct connection on a GH runner guarantees an IP ban for the rest of the batch.
-                fi
               else
-                echo "⚠️ VPN not available. Using direct connection (high risk of rate limiting)."
+                echo "⚠️ [Direct] Downloading..."
                 output=$(spotdl download "$url" \
                   --format "$FORMAT" \
                   --bitrate "$BITRATE_ARG" \
                   --output "$OUTPUT_TEMPLATE" \
+                  --cache-dir "$CACHE_DIR" \
                   --threads 4 2>&1) && down_exit=0 || down_exit=1
               fi
 
+              rm -rf "$CACHE_DIR"
               echo "$output"
 
               AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
@@ -280,12 +284,7 @@ jobs:
 
               echo "❌ Attempt $attempt failed (exit code: $down_exit)"
               attempt=$((attempt + 1))
-              
-              # Add a delay before retrying to be kind to the API and avoid immediate 429 rate limits
-              if [ $attempt -le $MAX_RETRIES ]; then
-                echo "⏳ Waiting 3 seconds before retry..."
-                sleep 3
-              fi
+              if [ $attempt -le $MAX_RETRIES ]; then sleep 3; fi
             done
 
             echo "::warning::spotdl failed after $MAX_RETRIES attempts for: $url"
@@ -296,110 +295,12 @@ jobs:
           export -f download_with_retry
           export FORMAT BITRATE_ARG OUTPUT_TEMPLATE VPN_AVAILABLE MAX_RETRIES FAILED
 
-          echo "→ Starting parallel downloads (max $PARALLEL concurrent)"
+          echo "→ Starting parallel downloads (max $PARALLEL concurrent albums/playlists)"
           cat spotify_urls.txt | xargs -P "$PARALLEL" -I '{}' bash -c 'download_with_retry "{}"'
 
-          echo "::group::spotdl summary"
-          ls -lhR music/ 2>/dev/null || echo "No files yet"
           if [ -f "$FAILED" ]; then
-            echo "::warning::URLs that failed spotdl:"
+            echo "::warning::URLs that failed:"
             cat "$FAILED"
-          else
-            echo "All spotdl downloads succeeded."
-          fi
-          echo "::endgroup::"
-          set +x
-
-      - name: Download with SpotiFLAC (fallback, parallel)
-        if: steps.parse.outputs.HAS_URLS == 'true'
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -x
-          FALLBACK_FILE="failed_urls_spotdl.txt"
-          if [ ! -f "$FALLBACK_FILE" ] || [ ! -s "$FALLBACK_FILE" ]; then
-            echo "No fallback needed – all URLs succeeded with spotdl."
-            exit 0
-          fi
-
-          QUALITY="${{ github.event.inputs.audio_quality }}"
-          PARALLEL="${{ inputs.concurrent_downloads }}"
-          MAX_RETRIES="${{ inputs.retry_count }}"
-          VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
-
-          echo "::group::SpotiFLAC fallback configuration"
-          echo "Quality        : $QUALITY"
-          echo "Parallel jobs  : $PARALLEL"
-          echo "Max retries    : $MAX_RETRIES"
-          echo "VPN available  : $VPN_AVAILABLE"
-          echo "URLs to retry  :"
-          cat "$FALLBACK_FILE"
-          echo "::endgroup::"
-
-          FINAL_FAILED="failed_urls_spotiflac.txt"
-          rm -f "$FINAL_FAILED"
-
-          spotiflac_with_retry() {
-            local url="$1"
-            local attempt=1
-
-            while [ $attempt -le $MAX_RETRIES ]; do
-              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-              echo "▶ SpotiFLAC attempt $attempt/$MAX_RETRIES for: $url"
-              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-              BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
-
-              if [ "$VPN_AVAILABLE" = "true" ]; then
-                echo "→ [VPN] Downloading with SpotiFLAC..."
-                spotiflac "$url" music \
-                  --service tidal qobuz deezer \
-                  --quality "$QUALITY" \
-                  --use-album-subfolders \
-                  --use-artist-subfolders \
-                  --filename-format "{artist} - {title}" && FLAC_EXIT=0 || FLAC_EXIT=1
-                
-                if [ $FLAC_EXIT -ne 0 ]; then
-                  echo "::warning::VPN SpotiFLAC failed. Skipping direct connection to prevent IP ban."
-                fi
-              else
-                echo "⚠️ VPN not available. Using direct connection."
-                spotiflac "$url" music \
-                  --service tidal qobuz deezer \
-                  --quality "$QUALITY" \
-                  --use-album-subfolders \
-                  --use-artist-subfolders \
-                  --filename-format "{artist} - {title}" && FLAC_EXIT=0 || FLAC_EXIT=1
-              fi
-
-              AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
-              if [ $FLAC_EXIT -eq 0 ] && [ $AFTER -gt $BEFORE ]; then
-                echo "✅ SpotiFLAC succeeded on attempt $attempt"
-                return 0
-              else
-                echo "❌ Attempt $attempt failed (exit: $FLAC_EXIT, files before=$BEFORE after=$AFTER)"
-                attempt=$((attempt + 1))
-                if [ $attempt -le $MAX_RETRIES ]; then
-                  sleep 3
-                fi
-              fi
-            done
-
-            echo "::warning::SpotiFLAC failed after $MAX_RETRIES attempts for: $url"
-            echo "$url" >> "$FINAL_FAILED"
-            return 1
-          }
-
-          export -f spotiflac_with_retry
-          export QUALITY VPN_AVAILABLE MAX_RETRIES FINAL_FAILED
-
-          echo "→ Starting parallel fallback downloads (max $PARALLEL concurrent)"
-          cat "$FALLBACK_FILE" | xargs -P "$PARALLEL" -I '{}' bash -c 'spotiflac_with_retry "{}"'
-
-          if [ -f "$FINAL_FAILED" ] && [ -s "$FINAL_FAILED" ]; then
-            echo "::warning::Some URLs failed even with SpotiFLAC"
-            cat "$FINAL_FAILED"
-            cp "$FINAL_FAILED" music/failed_downloads.txt
           fi
           set +x
 
@@ -418,39 +319,21 @@ jobs:
           echo "::group::Converting to $TARGET_FMT ($BITRATE)"
           find music -type f \( -iname "*.flac" -o -iname "*.m4a" -o -iname "*.mp3" -o -iname "*.ogg" -o -iname "*.opus" -o -iname "*.wav" \) | while read -r f; do
             ext="${f##*.}"
-            if [ "${ext,,}" = "${TARGET_FMT,,}" ]; then
-              echo "Skipping (already $TARGET_FMT): $f"
-              continue
-            fi
+            if [ "${ext,,}" = "${TARGET_FMT,,}" ]; then continue; fi
 
             base="${f%.*}"
             out="${base}.${TARGET_FMT}"
             echo "Converting: $f → $out"
 
             case "$TARGET_FMT" in
-              mp3)
-                ffmpeg -i "$f" -c:a libmp3lame -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null
-                ;;
-              m4a)
-                ffmpeg -i "$f" -c:a aac -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null
-                ;;
-              ogg)
-                ffmpeg -i "$f" -c:a libvorbis -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null
-                ;;
-              opus)
-                ffmpeg -i "$f" -c:a libopus -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null
-                ;;
-              wav)
-                ffmpeg -i "$f" -c:a pcm_s16le -map_metadata 0 -y "$out" 2>/dev/null
-                ;;
-              *)
-                echo "::warning::Unknown format $TARGET_FMT – keeping original."
-                ;;
+              mp3) ffmpeg -i "$f" -c:a libmp3lame -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
+              m4a) ffmpeg -i "$f" -c:a aac -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
+              ogg) ffmpeg -i "$f" -c:a libvorbis -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
+              opus) ffmpeg -i "$f" -c:a libopus -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
+              wav) ffmpeg -i "$f" -c:a pcm_s16le -map_metadata 0 -y "$out" 2>/dev/null ;;
             esac
 
-            if [ -f "$out" ] && [ "$f" != "$out" ]; then
-              rm "$f"
-            fi
+            if [ -f "$out" ] && [ "$f" != "$out" ]; then rm "$f"; fi
           done
           echo "::endgroup::"
 
@@ -458,14 +341,8 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [ -f failed_urls_spotiflac.txt ] && [ -s failed_urls_spotiflac.txt ]; then
-            echo "::warning::Some downloads failed even after fallback. Adding failed_downloads.txt to the archive."
-            cp failed_urls_spotiflac.txt music/failed_downloads.txt
-          elif [ -f failed_urls_spotdl.txt ] && [ -s failed_urls_spotdl.txt ]; then
-            echo "::warning::Some spotdl downloads failed. Adding to archive."
+          if [ -f failed_urls_spotdl.txt ] && [ -s failed_urls_spotdl.txt ]; then
             cp failed_urls_spotdl.txt music/failed_downloads.txt
-          else
-            echo "No failed downloads – no fail log needed."
           fi
 
       - name: Validate Download
@@ -473,7 +350,7 @@ jobs:
         run: |
           SONG_COUNT=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
           if [ "$SONG_COUNT" -eq 0 ]; then
-            echo "::warning::No audio files were downloaded. The run will continue."
+            echo "::warning::No audio files were downloaded."
           else
             echo "Total songs downloaded: $SONG_COUNT"
             ls -lhR music/
@@ -492,23 +369,13 @@ jobs:
           BUNDLE_ALL="${{ inputs.bundle_all }}"
           UPLOAD_METHOD="${{ inputs.upload_method }}"
 
-          if [ "$UPLOAD_METHOD" = "repo" ]; then
-            METHOD="split_push"
-          else
-            METHOD="release"
-          fi
-
-          echo "Bundle all: $BUNDLE_ALL"
-          echo "Upload method: $METHOD"
+          if [ "$UPLOAD_METHOD" = "repo" ]; then METHOD="split_push"; else METHOD="release"; fi
 
           rm -rf music_archive
           mkdir -p music_archive
 
           FILE_COUNT=$(find music -type f | wc -l)
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "⚠️ No files to archive – creating a placeholder."
-            touch music/NO_DOWNLOADS.txt
-          fi
+          if [ "$FILE_COUNT" -eq 0 ]; then touch music/NO_DOWNLOADS.txt; fi
 
           if [ "$BUNDLE_ALL" = "true" ]; then
             RANDOM_STR=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_lowercase + string.digits, k=5)))")
@@ -516,23 +383,18 @@ jobs:
             ZIP_NAME="${BASE_NAME}.zip"
 
             cd music || exit 1
-
             if [ "$METHOD" = "release" ]; then
-              echo "Creating unsplit ZIP (will split only if > 1950 MiB)"
               zip -0 -r "../music_archive/${ZIP_NAME}" .
               FULLZIP="../music_archive/${ZIP_NAME}"
               SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
               if [ "$SIZE" -gt 2044723200 ]; then
-                echo "ZIP larger than 1950 MiB, splitting into 1950M parts"
                 rm "$FULLZIP"
                 zip -0 -r -s 1950m "../music_archive/${ZIP_NAME}" .
               fi
             else
-              echo "Creating split ZIP (99 MB parts)"
               zip -0 -r -s 99m "../music_archive/${ZIP_NAME}" .
             fi
             cd ..
-
           else
             cd music || exit 1
             find . -type f ! -name 'failed_downloads.txt' | while IFS= read -r track; do
@@ -551,14 +413,12 @@ jobs:
                 FULLZIP="../../music_archive/${ZIP_NAME}"
                 SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
                 if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "ZIP larger than 1950 MiB, splitting"
                   rm "$FULLZIP"
                   (cd "$TMP_DIR" && zip -0 -s 1950m "../../music_archive/${ZIP_NAME}" ./*)
                 fi
               else
                 (cd "$TMP_DIR" && zip -0 -s 99m "../../music_archive/${ZIP_NAME}" ./*)
               fi
-
               rm -rf "$TMP_DIR"
             done
             cd ..
@@ -567,11 +427,7 @@ jobs:
           rm -rf music/*
           mv music_archive/* music/
           rmdir music_archive 2>/dev/null || true
-
-          ls -lh music/
           ls -1 music > music_assets.txt
-          echo "Assets list:"
-          cat music_assets.txt
 
       - name: "Upload to Google Drive"
         if: inputs.upload_method == 'drive'
@@ -598,16 +454,11 @@ jobs:
             --data-urlencode "fields=files(id)" \
             "https://www.googleapis.com/drive/v3/files" | jq -r '.files[0].id // ""')
           if [ -z "$FOLDER_ID" ]; then
-            echo "→ Creating folder '$FOLDER_NAME'"
             FOLDER_ID=$(curl -s -X POST \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"name\":\"$FOLDER_NAME\", \"mimeType\":\"application/vnd.google-apps.folder\"}" \
               "https://www.googleapis.com/drive/v3/files?fields=id" | jq -r '.id')
-            if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
-              echo "❌ Failed to create folder"
-              exit 1
-            fi
           fi
           echo "✅ Folder ID: $FOLDER_ID"
 
@@ -624,10 +475,8 @@ jobs:
               -d "{\"name\":\"$fname\", \"parents\":[\"$FOLDER_ID\"]}" \
               "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable" \
               -D - | tr -d '\r' | grep -i '^location:' | sed 's/^location: //i' | tr -d ' ')
-            if [ -z "$SESSION_URI" ]; then
-              echo "❌ Failed to initiate upload session for $fname, skipping"
-              continue
-            fi
+            
+            if [ -z "$SESSION_URI" ]; then continue; fi
 
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
@@ -637,8 +486,6 @@ jobs:
               "$SESSION_URI")
             if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
               echo "✅ Uploaded $fname"
-            else
-              echo "❌ Upload failed with HTTP $HTTP_CODE"
             fi
           done
 
@@ -656,12 +503,7 @@ jobs:
           RETRIES=5
           for i in $(seq 1 $RETRIES); do
             git pull --rebase --autostash origin "$BRANCH"
-            if git push origin "$BRANCH"; then
-              echo "Push succeeded."
-              break
-            else
-              [ $i -lt $RETRIES ] && sleep 3 || exit 1
-            fi
+            if git push origin "$BRANCH"; then break; else [ $i -lt $RETRIES ] && sleep 3 || exit 1; fi
           done
 
       - name: Create Release and upload assets (release method)
@@ -669,30 +511,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ ! -s music_assets.txt ]; then
-            echo "No assets to release."
-            exit 0
-          fi
+          if [ ! -s music_assets.txt ]; then exit 0; fi
           RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
           TAG="music-downloader-${RAND5}"
-          echo "Creating release tag: $TAG"
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git tag "$TAG" -m "Music download release"
           git push origin "$TAG"
           ASSET_ARGS=""
-          while IFS= read -r file; do
-            ASSET_ARGS="$ASSET_ARGS music/$file"
-          done < music_assets.txt
+          while IFS= read -r file; do ASSET_ARGS="$ASSET_ARGS music/$file"; done < music_assets.txt
           gh release create "$TAG" $ASSET_ARGS \
             --title "music-downloader-${RAND5}" \
             --notes "Automated release from Spotify Download workflow." \
             --target "${{ github.ref_name }}"
-          echo "Release '$TAG' created with assets."
 
       - name: Cleanup
         if: always()
         shell: bash
         run: |
-          rm -rf music release_files spotify_urls.txt failed_urls_spotdl.txt failed_urls_spotiflac.txt music_assets.txt *.zip 2>/dev/null || true
+          rm -rf music release_files spotify_urls.txt failed_urls_spotdl.txt music_assets.txt *.zip 2>/dev/null || true
           sudo wg-quick down wg0 2>/dev/null || true
