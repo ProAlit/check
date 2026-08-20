@@ -86,11 +86,13 @@ jobs:
           echo "VIRTUAL_ENV=/opt/venv" >> $GITHUB_ENV
           source /opt/venv/bin/activate
           
-          echo "⬆️ Upgrading pip..."
-          pip install --upgrade pip
+          echo "⬆️ Upgrading pip and setuptools..."
+          # 🧠 FIX: setuptools prevents 'pkg_resources' crashes in modern Python environments
+          pip install --upgrade pip setuptools
           
-          echo "⬇️ Installing spotdl v4.2.10..."
-          pip install "spotdl==4.2.10"
+          echo "⬇️ Installing LATEST spotdl (v4.4.4+ with Feb 2026 API fixes) & yt-dlp..."
+          # 🧠 FIX: Upgrading yt-dlp prevents YouTube from blocking the audio streams
+          pip install --upgrade spotdl yt-dlp
           
           echo "⬇️ Installing pyOpenSSL and cryptography..."
           pip install --upgrade pyOpenSSL cryptography
@@ -185,7 +187,7 @@ jobs:
             exit 1
           fi
 
-      - name: ⬇️ Download with spotdl (Real-Time Logs & Anti-Hang)
+      - name: ⬇️ Download with spotdl (Latest v4.4.4+ & Anti-Hang)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
         continue-on-error: true
@@ -220,6 +222,7 @@ jobs:
             *) BITRATE_ARG="320k" ;;
           esac
 
+          # 🧠 LATEST SPOTDL FORMAT: Uses standard variables for output paths
           OUTPUT_TEMPLATE="music/{title} - {artists}.{output-ext}"
 
           echo "::group::⚙️ Download configuration"
@@ -239,7 +242,8 @@ jobs:
               
               BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
-              # 🧠 CACHE FIX: Use a file, not a directory, to prevent API spam
+              # 🧠 CACHE FIX: v4.4.x expects a file path for --cache-path, NOT a directory.
+              # This prevents the API spam that causes 86400s (24-hour) bans.
               CACHE_FILE="/tmp/spotdl-cache-$$-${RANDOM}.json"
               touch "$CACHE_FILE"
 
@@ -250,6 +254,7 @@ jobs:
               fi
 
               export PYTHONUNBUFFERED=1
+              # 🧠 ANTI-HANG: 15-minute timeout per album prevents infinite network loops
               timeout 900 spotdl download "$url" \
                 --format "$FORMAT" \
                 --bitrate "$BITRATE_ARG" \
