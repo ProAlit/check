@@ -87,12 +87,14 @@ jobs:
           source /opt/venv/bin/activate
           
           echo "⬆️ Upgrading pip and setuptools..."
-          # 🧠 FIX: setuptools prevents 'pkg_resources' crashes in modern Python environments
           pip install --upgrade pip setuptools
           
-          echo "⬇️ Installing spotdl v4.5.2 (Hotfix) & latest yt-dlp..."
-          # 🧠 LOCK: Explicitly pinning v4.5.2 guarantees the hotfix is used, bypassing pip cache
-          pip install spotdl==4.5.2 yt-dlp --upgrade
+          echo "⬇️ Installing spotdl v4.5.2 (Hotfix)..."
+          pip install spotdl==4.5.2
+          
+          echo "🚀 FORCE upgrading yt-dlp to absolute latest (Bypassing spotdl dependency locks)..."
+          # 🧠 BULLETPROOF FIX: Pulls directly from the master branch/PyPI to guarantee the newest release (e.g., 2026.08.19)
+          pip install --upgrade --force-reinstall "yt-dlp[default]"
           
           echo "⬇️ Installing pyOpenSSL and cryptography..."
           pip install --upgrade pyOpenSSL cryptography
@@ -110,7 +112,10 @@ jobs:
           echo "::group::🏷️ Versions"
           ffmpeg -version 2>&1 | head -n1
           python3 --version
+          echo "🎵 spotdl version:"
           spotdl --version 2>/dev/null || echo "spotDL version check failed"
+          echo "📺 yt-dlp version:"
+          yt-dlp --version
           echo "::endgroup::"
 
       - name: 🔒 Set up WireGuard VPN (Original Method)
