@@ -1,4 +1,4 @@
-name: downloader-spotify
+name: 🎵 downloader-spotify
 
 on:
   workflow_dispatch:
@@ -111,7 +111,7 @@ jobs:
           spotdl --version 2>/dev/null || echo "spotDL version check failed"
           echo "::endgroup::"
 
-      - name: 🔒 Set up WireGuard VPN (Deep CI Fix)
+      - name: 🔒 Set up WireGuard VPN (Original Method)
         id: vpn
         shell: bash
         run: |
@@ -134,36 +134,8 @@ jobs:
           ${{ secrets.WG_CONFIG }}
           EOF
 
-            echo "🛠️ Applying Deep CI Fixes to WireGuard config..."
-            # 🧠 DEEP FIX 1: Enforce safe MTU
-            sed -i '/^MTU\s*=/d' /tmp/wg0.conf
-            sed -i '/^\[Interface\]/a MTU = 1360' /tmp/wg0.conf
-            
-            # 🧠 DEEP FIX 2: Remove WireGuard DNS
-            sed -i '/^DNS\s*=/d' /tmp/wg0.conf
-
             sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
             sudo chmod 600 /etc/wireguard/wg0.conf
-            echo "✅ WireGuard config prepared."
-
-            echo "🌐 Fetching GitHub IP ranges to bypass VPN (with timeout)..."
-            DEFAULT_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
-            if [ -z "$DEFAULT_IF" ]; then DEFAULT_IF="eth0"; fi
-            echo "🔌 Default interface detected: $DEFAULT_IF"
-            
-            # 🧠 FIX: Added -4 (IPv4 only) and timeouts to prevent hanging on Azure IPv6 blackholes
-            GITHUB_IPS=$(curl -s -4 --connect-timeout 5 --max-time 15 https://api.github.com/meta | jq -r '.actions[]?, .hooks[]?, .web[]?, .api[]?, .git[]?' 2>/dev/null | sort -u)
-            
-            if [ -n "$GITHUB_IPS" ]; then
-              IP_COUNT=$(echo "$GITHUB_IPS" | wc -l)
-              echo "🚀 Adding $IP_COUNT GitHub IP ranges to bypass..."
-              for ip in $GITHUB_IPS; do
-                  sudo ip route add "$ip" dev "$DEFAULT_IF" 2>/dev/null || true
-              done
-              echo "✅ GitHub IP bypass configured."
-            else
-              echo "⚠️ Could not fetch GitHub IPs (timeout or network issue). Skipping bypass. The agent will rely on MTU/DNS fixes to survive."
-            fi
 
             echo "🚀 Bringing up wg0..."
             if sudo wg-quick up wg0; then
