@@ -1,74 +1,54 @@
-name: downloader-spotify
+name: 🎵 downloader-spotify
 
 on:
   workflow_dispatch:
     inputs:
       urls:
         description: >
-          Enter one or more Spotify / Tidal / Apple Music / SoundCloud / YouTube / Pandora URLs
-          (track, album, playlist, artist). Separate by commas, spaces, or newlines.
+          🎵 Enter Spotify/Tidal/Apple/SoundCloud/YouTube URLs (comma, space, or newline separated)
         required: true
         type: string
       output_format:
-        description: "Output Format"
+        description: "🎧 Output Format"
         required: true
         type: choice
-        options:
-          - mp3
-          - flac
-          - m4a
-          - ogg
-          - opus
-          - wav
+        options: [mp3, flac, m4a, ogg, opus, wav]
         default: mp3
       audio_quality:
         description: >
-          Audio Quality / Bitrate.
-          For MP3/M4A/OGG/Opus: 320k, 256k, 192k, 128k.
-          For FLAC: LOSSLESS, HI_RES_LOSSLESS, HIGH, LOW.
+          🎚️ Audio Quality / Bitrate
         required: true
         type: choice
-        options:
-          - 320k
-          - 256k
-          - 192k
-          - 128k
-          - LOSSLESS
-          - HI_RES_LOSSLESS
-          - HIGH
-          - LOW
+        options: [320k, 256k, 192k, 128k, LOSSLESS, HI_RES_LOSSLESS, HIGH, LOW]
         default: 320k
       upload_method:
-        description: 'Upload destination'
+        description: '☁️ Upload destination'
         required: true
         type: choice
-        options:
-          - drive
-          - repo
-          - release
+        options: [drive, repo, release]
         default: drive
       bundle_all:
-        description: 'Bundle all downloaded tracks into a single ZIP (true) or create a ZIP for each track (false)'
+        description: '📦 Bundle all tracks into a single ZIP?'
         type: boolean
         default: true
       vpn_enabled:
-        description: 'Route downloads through WireGuard VPN (requires secret WG_CONFIG)'
+        description: '🔒 Route downloads through WireGuard VPN?'
         type: boolean
         default: true
+      use_custom_credentials:
+        description: '🔑 Use custom Spotify App? (Requires Premium. Turn OFF for Free accounts)'
+        type: boolean
+        default: false
       concurrent_downloads:
-        description: 'Number of Albums/Playlists to download at the same time (Keep at 2 for stability)'
+        description: '⚡ Concurrent Albums/Playlists (Keep at 2 for stability)'
         type: number
         default: 2
         required: false
       retry_count:
-        description: 'How many times to retry a failed URL'
+        description: '🔄 Retry count for failed URLs'
         type: number
         default: 5
         required: false
-      use_custom_credentials:
-        description: 'Use custom Spotify App (Requires Premium). Turn OFF to use spotdl defaults.'
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -79,45 +59,44 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Checkout Repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install System Dependencies
+      - name: 🛠️ Install System Dependencies
         shell: bash
         env:
           DEBIAN_FRONTEND: noninteractive
           PYTHONUNBUFFERED: 1
         run: |
           set -e
-          echo "::group::System packages (Forced IPv4 to prevent Azure hangs)"
-          echo "→ Updating apt repositories (IPv4 only)..."
-          # 🧠 FIX: Force IPv4 to bypass Azure's IPv6 network blackholes
+          echo "::group::📦 System packages (Forced IPv4)"
+          echo "🔄 Updating apt repositories (IPv4 only to prevent Azure hangs)..."
           sudo apt-get -o Acquire::ForceIPv4=true update -qq
           
-          echo "→ Installing ffmpeg and required utilities..."
+          echo "⬇️ Installing ffmpeg and required utilities..."
           sudo apt-get -o Acquire::ForceIPv4=true install -y -qq ffmpeg curl jq zip
           echo "::endgroup::"
 
-          echo "::group::Python virtual environment & tools"
-          echo "→ Setting up Python virtual environment..."
+          echo "::group::🐍 Python virtual environment & tools"
+          echo "⚙️ Setting up Python virtual environment..."
           python3 -m venv /opt/venv
           echo "/opt/venv/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=/opt/venv" >> $GITHUB_ENV
           source /opt/venv/bin/activate
           
-          echo "→ Upgrading pip..."
+          echo "⬆️ Upgrading pip..."
           pip install --upgrade pip
           
-          echo "→ Installing spotdl v4.2.10 (this may take a minute)..."
+          echo "⬇️ Installing spotdl v4.2.10..."
           pip install "spotdl==4.2.10"
           
-          echo "→ Installing pyOpenSSL and cryptography..."
+          echo "⬇️ Installing pyOpenSSL and cryptography..."
           pip install --upgrade pyOpenSSL cryptography
           echo "::endgroup::"
 
-          echo "::group::Deno runtime"
+          echo "::group::🦕 Deno runtime"
           echo "📥 Installing Deno..."
           if ! command -v deno &> /dev/null; then
             curl -fSL https://deno.land/install.sh | sh -s -- -y
@@ -126,69 +105,84 @@ jobs:
           echo "✅ Deno ready."
           echo "::endgroup::"
 
-          echo "::group::Versions"
+          echo "::group::🏷️ Versions"
           ffmpeg -version 2>&1 | head -n1
           python3 --version
-          spotdl --version 2>/dev/null || echo "spotDL version check failed (continuing)"
+          spotdl --version 2>/dev/null || echo "spotDL version check failed"
           echo "::endgroup::"
 
-      - name: "Set up WireGuard VPN (Deep CI Fix)"
+      - name: 🔒 Set up WireGuard VPN (Deep CI Fix)
         id: vpn
         shell: bash
         run: |
           VPN_ENABLED="${{ inputs.vpn_enabled }}"
-          echo "VPN_ENABLED=$VPN_ENABLED"
+          echo "🔍 VPN_ENABLED=$VPN_ENABLED"
 
           if [ "$VPN_ENABLED" = "true" ]; then
             if [ -z "${{ secrets.WG_CONFIG }}" ]; then
-              echo "::warning::VPN enabled but WG_CONFIG secret is empty – VPN Disabled."
+              echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN Disabled."
               echo "vpn_available=false" >> $GITHUB_OUTPUT
               exit 0
             fi
 
-            echo "→ Installing WireGuard tools..."
-            # 🧠 FIX: Force IPv4 to prevent Azure mirror IPv6 hangs
+            echo "📦 Installing WireGuard tools..."
             sudo apt-get -o Acquire::ForceIPv4=true update -qq
             sudo apt-get -o Acquire::ForceIPv4=true install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get -o Acquire::ForceIPv4=true install -y -qq wireguard-tools
 
-            echo "→ Writing WireGuard config..."
+            echo "📝 Writing WireGuard config..."
             cat <<'EOF' > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
 
+            echo "🛠️ Applying Deep CI Fixes to WireGuard config..."
+            # 🧠 DEEP FIX 1: Enforce safe MTU
             sed -i '/^MTU\s*=/d' /tmp/wg0.conf
             sed -i '/^\[Interface\]/a MTU = 1360' /tmp/wg0.conf
+            
+            # 🧠 DEEP FIX 2: Remove WireGuard DNS
             sed -i '/^DNS\s*=/d' /tmp/wg0.conf
 
             sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
             sudo chmod 600 /etc/wireguard/wg0.conf
+            echo "✅ WireGuard config prepared."
 
-            echo "→ Fetching GitHub IP ranges to bypass VPN..."
+            echo "🌐 Fetching GitHub IP ranges to bypass VPN (with timeout)..."
             DEFAULT_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
             if [ -z "$DEFAULT_IF" ]; then DEFAULT_IF="eth0"; fi
+            echo "🔌 Default interface detected: $DEFAULT_IF"
             
-            GITHUB_IPS=$(curl -s https://api.github.com/meta | jq -r '.actions[]?, .hooks[]?, .web[]?, .api[]?, .git[]?' 2>/dev/null | sort -u)
-            for ip in $GITHUB_IPS; do
-                sudo ip route add "$ip" dev "$DEFAULT_IF" 2>/dev/null || true
-            done
+            # 🧠 FIX: Added -4 (IPv4 only) and timeouts to prevent hanging on Azure IPv6 blackholes
+            GITHUB_IPS=$(curl -s -4 --connect-timeout 5 --max-time 15 https://api.github.com/meta | jq -r '.actions[]?, .hooks[]?, .web[]?, .api[]?, .git[]?' 2>/dev/null | sort -u)
+            
+            if [ -n "$GITHUB_IPS" ]; then
+              IP_COUNT=$(echo "$GITHUB_IPS" | wc -l)
+              echo "🚀 Adding $IP_COUNT GitHub IP ranges to bypass..."
+              for ip in $GITHUB_IPS; do
+                  sudo ip route add "$ip" dev "$DEFAULT_IF" 2>/dev/null || true
+              done
+              echo "✅ GitHub IP bypass configured."
+            else
+              echo "⚠️ Could not fetch GitHub IPs (timeout or network issue). Skipping bypass. The agent will rely on MTU/DNS fixes to survive."
+            fi
 
-            echo "→ Bringing up wg0..."
+            echo "🚀 Bringing up wg0..."
             if sudo wg-quick up wg0; then
-              echo "✅ WireGuard VPN connected securely without breaking agent."
+              echo "✅ WireGuard VPN connected securely!"
               echo "vpn_available=true" >> $GITHUB_OUTPUT
             else
-              echo "::warning::Failed to bring up WireGuard – VPN disabled."
+              echo "❌ Failed to bring up WireGuard – VPN disabled."
               sudo wg-quick down wg0 2>/dev/null || true
               echo "vpn_available=false" >> $GITHUB_OUTPUT
             fi
           else
+            echo "🚫 VPN disabled by user input."
             echo "vpn_available=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create Music Folder
+      - name: 📁 Create Music Folder
         run: mkdir -p music
 
-      - name: Parse and Filter URLs
+      - name: 🔗 Parse and Filter URLs
         id: parse
         shell: bash
         run: |
@@ -196,7 +190,7 @@ jobs:
           URLS=$(echo "$RAW" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
 
           if [ -z "$URLS" ]; then
-            echo "::error::No URLs provided."
+            echo "❌ No URLs provided."
             exit 1
           fi
 
@@ -206,24 +200,24 @@ jobs:
             if [[ "$url" =~ ^https?://(open\.spotify\.com|listen\.tidal\.com|music\.apple\.com|soundcloud\.com|youtube\.com|youtu\.be|music\.youtube\.com|pandora\.com|pandora\.app\.link) ]]; then
               echo "$url" >> spotify_urls.txt
             else
-              echo "::warning::Skipping unsupported URL: $url"
+              echo "⚠️ Skipping unsupported URL: $url"
             fi
           done
 
           if [ -s spotify_urls.txt ]; then
+            echo "✅ Found $(wc -l < spotify_urls.txt) valid URLs."
             echo "HAS_URLS=true" >> $GITHUB_OUTPUT
           else
-            echo "::error::No valid URLs found."
+            echo "❌ No valid URLs found."
             echo "HAS_URLS=false" >> $GITHUB_OUTPUT
             exit 1
           fi
 
-      - name: Download with spotdl (Real-Time Logs & Anti-Hang)
+      - name: ⬇️ Download with spotdl (Real-Time Logs & Anti-Hang)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
         continue-on-error: true
         env:
-          # Pass secrets into environment, the bash script will decide what to do.
           RAW_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           RAW_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
         shell: bash
@@ -238,15 +232,12 @@ jobs:
           FAILED="failed_urls_spotdl.txt"
           rm -f "$FAILED"
 
-          # 🧠 CREDENTIAL TOGGLE LOGIC
           if [ "$USE_CUSTOM" = "true" ] && [ -n "$RAW_CLIENT_ID" ] && [ -n "$RAW_CLIENT_SECRET" ]; then
             echo "✅ Using your custom Spotify Developer credentials."
             export SPOTIPY_CLIENT_ID="$RAW_CLIENT_ID"
             export SPOTIPY_CLIENT_SECRET="$RAW_CLIENT_SECRET"
           else
-            echo "⚠️ Using spotdl's built-in default credentials."
-            echo "   (Make sure your VPN is enabled to prevent IP bans!)"
-            # Unsetting these forces spotdl to use its own internal default app
+            echo "⚠️ Using spotdl's built-in default credentials (Mobile Scraper)."
             unset SPOTIPY_CLIENT_ID
             unset SPOTIPY_CLIENT_SECRET
           fi
@@ -259,9 +250,9 @@ jobs:
 
           OUTPUT_TEMPLATE="music/{title} - {artists}.{output-ext}"
 
-          echo "::group::Download configuration"
-          echo "Format: $FORMAT | Bitrate: $BITRATE_ARG | Parallel Albums: $PARALLEL | Retries: $MAX_RETRIES"
-          echo "Custom Credentials: $USE_CUSTOM"
+          echo "::group::⚙️ Download configuration"
+          echo "🎧 Format: $FORMAT | 🎚️ Bitrate: $BITRATE_ARG | ⚡ Parallel: $PARALLEL | 🔄 Retries: $MAX_RETRIES"
+          echo "🔑 Custom Credentials: $USE_CUSTOM"
           echo "::endgroup::"
 
           download_with_retry() {
@@ -272,7 +263,7 @@ jobs:
 
             while [ $attempt -le $MAX_RETRIES ]; do
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-              echo "▶ spotdl attempt $attempt/$MAX_RETRIES for: $url"
+              echo "▶️ spotdl attempt $attempt/$MAX_RETRIES for: $url"
               
               BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
@@ -281,7 +272,7 @@ jobs:
               touch "$CACHE_FILE"
 
               if [ "$VPN_AVAILABLE" = "true" ]; then
-                echo "→ [VPN] Downloading..."
+                echo "🔒 [VPN] Downloading..."
               else
                 echo "⚠️ [Direct] Downloading..."
               fi
@@ -321,7 +312,7 @@ jobs:
               if [ $attempt -le $MAX_RETRIES ]; then sleep 3; fi
             done
 
-            echo "::warning::spotdl failed after $MAX_RETRIES attempts for: $url"
+            echo "⚠️ spotdl failed after $MAX_RETRIES attempts for: $url"
             echo "$url" >> "$FAILED"
             return 1
           }
@@ -329,16 +320,16 @@ jobs:
           export -f download_with_retry
           export FORMAT BITRATE_ARG OUTPUT_TEMPLATE VPN_AVAILABLE MAX_RETRIES FAILED
 
-          echo "→ Starting parallel downloads (max $PARALLEL concurrent albums/playlists)"
+          echo "🚀 Starting parallel downloads (max $PARALLEL concurrent)"
           cat spotify_urls.txt | xargs -P "$PARALLEL" -I '{}' bash -c 'download_with_retry "{}"'
 
           if [ -f "$FAILED" ]; then
-            echo "::warning::URLs that failed:"
+            echo "⚠️ URLs that failed:"
             cat "$FAILED"
           fi
           set +x
 
-      - name: Convert Audio Format (if needed)
+      - name: 🔄 Convert Audio Format (if needed)
         if: steps.parse.outputs.HAS_URLS == 'true'
         shell: bash
         run: |
@@ -346,18 +337,18 @@ jobs:
           BITRATE="${{ github.event.inputs.audio_quality }}"
 
           if [ "$TARGET_FMT" = "flac" ]; then
-            echo "Output format is FLAC – skipping conversion."
+            echo "✅ Output format is FLAC – skipping conversion."
             exit 0
           fi
 
-          echo "::group::Converting to $TARGET_FMT ($BITRATE)"
+          echo "::group::🔄 Converting to $TARGET_FMT ($BITRATE)"
           find music -type f \( -iname "*.flac" -o -iname "*.m4a" -o -iname "*.mp3" -o -iname "*.ogg" -o -iname "*.opus" -o -iname "*.wav" \) | while read -r f; do
             ext="${f##*.}"
             if [ "${ext,,}" = "${TARGET_FMT,,}" ]; then continue; fi
 
             base="${f%.*}"
             out="${base}.${TARGET_FMT}"
-            echo "Converting: $f → $out"
+            echo "🎵 Converting: $f → $out"
 
             case "$TARGET_FMT" in
               mp3) ffmpeg -i "$f" -c:a libmp3lame -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
@@ -371,7 +362,7 @@ jobs:
           done
           echo "::endgroup::"
 
-      - name: Collect Failed URLs
+      - name: 📝 Collect Failed URLs
         if: always()
         shell: bash
         run: |
@@ -379,24 +370,24 @@ jobs:
             cp failed_urls_spotdl.txt music/failed_downloads.txt
           fi
 
-      - name: Validate Download
+      - name: ✅ Validate Download
         shell: bash
         run: |
           SONG_COUNT=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
           if [ "$SONG_COUNT" -eq 0 ]; then
-            echo "::warning::No audio files were downloaded."
+            echo "⚠️ No audio files were downloaded."
           else
-            echo "Total songs downloaded: $SONG_COUNT"
+            echo "🎉 Total songs downloaded: $SONG_COUNT"
             ls -lhR music/
           fi
 
-      - name: Disconnect VPN for uploads
+      - name: 🔌 Disconnect VPN for uploads
         if: steps.vpn.outputs.vpn_available == 'true'
         run: |
-          echo "→ Bringing down WireGuard to use runner's native internet for uploads"
+          echo "🔌 Bringing down WireGuard to use runner's native internet for uploads"
           sudo wg-quick down wg0
 
-      - name: Archive Music Folder
+      - name: 📦 Archive Music Folder
         id: archive
         shell: bash
         run: |
@@ -463,7 +454,7 @@ jobs:
           rmdir music_archive 2>/dev/null || true
           ls -1 music > music_assets.txt
 
-      - name: "Upload to Google Drive"
+      - name: ☁️ Upload to Google Drive
         if: inputs.upload_method == 'drive'
         env:
           CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -500,7 +491,7 @@ jobs:
             [ -f "$file" ] || continue
             fname=$(basename "$file")
             size=$(stat -c%s "$file")
-            echo "→ Uploading $fname ($size bytes)..."
+            echo "⬆️ Uploading $fname ($size bytes)..."
 
             SESSION_URI=$(curl -s -X POST \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
@@ -523,7 +514,7 @@ jobs:
             fi
           done
 
-      - name: Upload to repository (split_push method)
+      - name: 📤 Upload to repository (split_push method)
         if: ${{ inputs.upload_method == 'repo' }}
         env:
           BRANCH: ${{ github.ref_name }}
@@ -540,7 +531,7 @@ jobs:
             if git push origin "$BRANCH"; then break; else [ $i -lt $RETRIES ] && sleep 3 || exit 1; fi
           done
 
-      - name: Create Release and upload assets (release method)
+      - name: 🏷️ Create Release and upload assets (release method)
         if: ${{ inputs.upload_method == 'release' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -559,7 +550,7 @@ jobs:
             --notes "Automated release from Spotify Download workflow." \
             --target "${{ github.ref_name }}"
 
-      - name: Cleanup
+      - name: 🧹 Cleanup
         if: always()
         shell: bash
         run: |
