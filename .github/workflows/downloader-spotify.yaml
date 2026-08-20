@@ -90,9 +90,9 @@ jobs:
           # 🧠 FIX: setuptools prevents 'pkg_resources' crashes in modern Python environments
           pip install --upgrade pip setuptools
           
-          echo "⬇️ Installing LATEST spotdl (v4.4.4+ with Feb 2026 API fixes) & yt-dlp..."
-          # 🧠 FIX: Upgrading yt-dlp prevents YouTube from blocking the audio streams
-          pip install --upgrade spotdl yt-dlp
+          echo "⬇️ Installing spotdl v4.5.2 (Hotfix) & latest yt-dlp..."
+          # 🧠 LOCK: Explicitly pinning v4.5.2 guarantees the hotfix is used, bypassing pip cache
+          pip install spotdl==4.5.2 yt-dlp --upgrade
           
           echo "⬇️ Installing pyOpenSSL and cryptography..."
           pip install --upgrade pyOpenSSL cryptography
