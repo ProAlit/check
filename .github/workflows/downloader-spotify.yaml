@@ -74,7 +74,7 @@ jobs:
           echo "::group::📦 System packages (Forced IPv4)"
           echo "🔄 Updating apt repositories (IPv4 only to prevent Azure hangs)..."
           sudo apt-get -o Acquire::ForceIPv4=true update -qq
-
+          
           echo "⬇️ Installing ffmpeg and required utilities..."
           sudo apt-get -o Acquire::ForceIPv4=true install -y -qq ffmpeg curl jq zip
           echo "::endgroup::"
@@ -85,17 +85,17 @@ jobs:
           echo "/opt/venv/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=/opt/venv" >> $GITHUB_ENV
           source /opt/venv/bin/activate
-
+          
           echo "⬆️ Upgrading pip and setuptools..."
           pip install --upgrade pip setuptools
-
+          
           echo "⬇️ Installing spotdl v4.5.2 (Hotfix)..."
           pip install spotdl==4.5.2
-
+          
           echo "🚀 FORCE upgrading yt-dlp to absolute latest (Bypassing spotdl dependency locks)..."
           # 🧠 BULLETPROOF FIX: Pulls directly from the master branch/PyPI to guarantee the newest release (e.g., 2026.08.19)
           pip install --upgrade --force-reinstall "yt-dlp[default]"
-
+          
           echo "⬇️ Installing pyOpenSSL and cryptography..."
           pip install --upgrade pyOpenSSL cryptography
           echo "::endgroup::"
@@ -117,6 +117,46 @@ jobs:
           echo "📺 yt-dlp version:"
           yt-dlp --version
           echo "::endgroup::"
+
+      - name: 🔒 Set up WireGuard VPN (Original Method)
+        id: vpn
+        shell: bash
+        run: |
+          VPN_ENABLED="${{ inputs.vpn_enabled }}"
+          echo "🔍 VPN_ENABLED=$VPN_ENABLED"
+
+          if [ "$VPN_ENABLED" = "true" ]; then
+            if [ -z "${{ secrets.WG_CONFIG }}" ]; then
+              echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN Disabled."
+              echo "vpn_available=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "📦 Installing WireGuard tools..."
+            sudo apt-get -o Acquire::ForceIPv4=true update -qq
+            sudo apt-get -o Acquire::ForceIPv4=true install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get -o Acquire::ForceIPv4=true install -y -qq wireguard-tools
+
+            echo "📝 Writing WireGuard config..."
+            cat <<'EOF' > /tmp/wg0.conf
+          ${{ secrets.WG_CONFIG }}
+          EOF
+
+            sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
+            sudo chmod 600 /etc/wireguard/wg0.conf
+
+            echo "🚀 Bringing up wg0..."
+            if sudo wg-quick up wg0; then
+              echo "✅ WireGuard VPN connected securely!"
+              echo "vpn_available=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Failed to bring up WireGuard – VPN disabled."
+              sudo wg-quick down wg0 2>/dev/null || true
+              echo "vpn_available=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "🚫 VPN disabled by user input."
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: 📁 Create Music Folder
         run: mkdir -p music
@@ -152,9 +192,9 @@ jobs:
             exit 1
           fi
 
-      - name: 🔒 Set up WireGuard VPN & Download with spotdl
+      - name: ⬇️ Download with spotdl (Latest v4.4.4+ & Anti-Hang)
         if: steps.parse.outputs.HAS_URLS == 'true'
-        id: vpn_download
+        id: spotdl_download
         continue-on-error: true
         env:
           RAW_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
@@ -162,45 +202,14 @@ jobs:
         shell: bash
         run: |
           set -x
-          VPN_ENABLED="${{ inputs.vpn_enabled }}"
           FORMAT="${{ github.event.inputs.output_format }}"
           BITRATE="${{ github.event.inputs.audio_quality }}"
           PARALLEL="${{ inputs.concurrent_downloads }}"
           MAX_RETRIES="${{ inputs.retry_count }}"
+          VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
           USE_CUSTOM="${{ inputs.use_custom_credentials }}"
           FAILED="failed_urls_spotdl.txt"
           rm -f "$FAILED"
-
-          # Set up VPN if enabled
-          VPN_AVAILABLE="false"
-          if [ "$VPN_ENABLED" = "true" ]; then
-            if [ -z "${{ secrets.WG_CONFIG }}" ]; then
-              echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN Disabled."
-            else
-              echo "📦 Installing WireGuard tools..."
-              sudo apt-get -o Acquire::ForceIPv4=true update -qq
-              sudo apt-get -o Acquire::ForceIPv4=true install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get -o Acquire::ForceIPv4=true install -y -qq wireguard-tools
-
-              echo "📝 Writing WireGuard config..."
-              cat <<'EOF' > /tmp/wg0.conf
-          ${{ secrets.WG_CONFIG }}
-          EOF
-
-              sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
-              sudo chmod 600 /etc/wireguard/wg0.conf
-
-              echo "🚀 Bringing up wg0..."
-              if sudo wg-quick up wg0; then
-                echo "✅ WireGuard VPN connected securely!"
-                VPN_AVAILABLE="true"
-              else
-                echo "❌ Failed to bring up WireGuard – VPN disabled."
-                sudo wg-quick down wg0 2>/dev/null || true
-              fi
-            fi
-          else
-            echo "🚫 VPN disabled by user input."
-          fi
 
           if [ "$USE_CUSTOM" = "true" ] && [ -n "$RAW_CLIENT_ID" ] && [ -n "$RAW_CLIENT_SECRET" ]; then
             echo "✅ Using your custom Spotify Developer credentials."
@@ -224,7 +233,6 @@ jobs:
           echo "::group::⚙️ Download configuration"
           echo "🎧 Format: $FORMAT | 🎚️ Bitrate: $BITRATE_ARG | ⚡ Parallel: $PARALLEL | 🔄 Retries: $MAX_RETRIES"
           echo "🔑 Custom Credentials: $USE_CUSTOM"
-          echo "🔒 VPN Available: $VPN_AVAILABLE"
           echo "::endgroup::"
 
           download_with_retry() {
@@ -236,7 +244,7 @@ jobs:
             while [ $attempt -le $MAX_RETRIES ]; do
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
               echo "▶️ spotdl attempt $attempt/$MAX_RETRIES for: $url"
-
+              
               BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
               # 🧠 CACHE FIX: v4.4.x expects a file path for --cache-path, NOT a directory.
@@ -258,14 +266,14 @@ jobs:
                 --output "$OUTPUT_TEMPLATE" \
                 --cache-path "$CACHE_FILE" \
                 --threads 4 2>&1 | tee "$log_file"
-
+              
               down_exit=${PIPESTATUS[0]}
               if [ $down_exit -eq 124 ]; then
                 echo "⏱️ Process timed out after 15 minutes (Network hang detected)."
               fi
 
               rm -f "$CACHE_FILE"
-
+              
               local output=$(cat "$log_file")
               rm -f "$log_file"
 
@@ -301,37 +309,7 @@ jobs:
             echo "⚠️ URLs that failed:"
             cat "$FAILED"
           fi
-
-          # Store VPN status for later step
-          echo "vpn_available=$VPN_AVAILABLE" >> $GITHUB_OUTPUT
-
           set +x
-
-      - name: 🔌 Disconnect VPN
-        if: steps.vpn_download.outputs.vpn_available == 'true'
-        shell: bash
-        run: |
-          echo "🔌 Bringing down WireGuard to use runner's native internet for uploads and conversion"
-          sudo wg-quick down wg0
-
-      - name: 📝 Collect Failed URLs
-        if: always()
-        shell: bash
-        run: |
-          if [ -f failed_urls_spotdl.txt ] && [ -s failed_urls_spotdl.txt ]; then
-            cp failed_urls_spotdl.txt music/failed_downloads.txt
-          fi
-
-      - name: ✅ Validate Download
-        shell: bash
-        run: |
-          SONG_COUNT=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
-          if [ "$SONG_COUNT" -eq 0 ]; then
-            echo "⚠️ No audio files were downloaded."
-          else
-            echo "🎉 Total songs downloaded: $SONG_COUNT"
-            ls -lhR music/
-          fi
 
       - name: 🔄 Convert Audio Format (if needed)
         if: steps.parse.outputs.HAS_URLS == 'true'
@@ -356,7 +334,7 @@ jobs:
 
             case "$TARGET_FMT" in
               mp3) ffmpeg -i "$f" -c:a libmp3lame -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
-              m4a) ffmpeg -i "$f" -c:a aac -b_a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
+              m4a) ffmpeg -i "$f" -c:a aac -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
               ogg) ffmpeg -i "$f" -c:a libvorbis -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
               opus) ffmpeg -i "$f" -c:a libopus -b:a "$BITRATE" -map_metadata 0 -y "$out" 2>/dev/null ;;
               wav) ffmpeg -i "$f" -c:a pcm_s16le -map_metadata 0 -y "$out" 2>/dev/null ;;
@@ -365,6 +343,31 @@ jobs:
             if [ -f "$out" ] && [ "$f" != "$out" ]; then rm "$f"; fi
           done
           echo "::endgroup::"
+
+      - name: 📝 Collect Failed URLs
+        if: always()
+        shell: bash
+        run: |
+          if [ -f failed_urls_spotdl.txt ] && [ -s failed_urls_spotdl.txt ]; then
+            cp failed_urls_spotdl.txt music/failed_downloads.txt
+          fi
+
+      - name: ✅ Validate Download
+        shell: bash
+        run: |
+          SONG_COUNT=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
+          if [ "$SONG_COUNT" -eq 0 ]; then
+            echo "⚠️ No audio files were downloaded."
+          else
+            echo "🎉 Total songs downloaded: $SONG_COUNT"
+            ls -lhR music/
+          fi
+
+      - name: 🔌 Disconnect VPN for uploads
+        if: steps.vpn.outputs.vpn_available == 'true'
+        run: |
+          echo "🔌 Bringing down WireGuard to use runner's native internet for uploads"
+          sudo wg-quick down wg0
 
       - name: 📦 Archive Music Folder
         id: archive
@@ -479,7 +482,7 @@ jobs:
               -d "{\"name\":\"$fname\", \"parents\":[\"$FOLDER_ID\"]}" \
               "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable" \
               -D - | tr -d '\r' | grep -i '^location:' | sed 's/^location: //i' | tr -d ' ')
-
+            
             if [ -z "$SESSION_URI" ]; then continue; fi
 
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
@@ -502,7 +505,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config http.postBuffer 524288000
           git add music/
-          COMMIT_MSG="Add: $(ls -1 music/ | tr '\n' ' ' | sed 's/ *$//')"
+          COMMIT_MSG="Add: $(ls -1 music/ | tr '\n' ' ' | sed 's/ *$//') [skip ci]"
           git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
           RETRIES=5
           for i in $(seq 1 $RETRIES); do
@@ -534,3 +537,4 @@ jobs:
         shell: bash
         run: |
           rm -rf music release_files spotify_urls.txt failed_urls_spotdl.txt music_assets.txt *.zip 2>/dev/null || true
+          sudo wg-quick down wg0 2>/dev/null || true
