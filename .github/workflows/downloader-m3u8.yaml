@@ -6,8 +6,8 @@ on:
       url:
         description: >
           Enter one or more M3U8 / HLS stream URLs.
-          You can optionally put a title on the line immediately before a URL.
-          Separate multiple URLs by commas, spaces, or newlines.
+          Separate multiple entries by commas or newlines.
+          Optionally specify a custom filename after the URL separated by a space (e.g. 'https://.../stream.m3u8 My Video Name').
         required: true
       quality:
         description: 'Select video quality or audio-only'
@@ -105,70 +105,59 @@ jobs:
 
       - name: '🔗 Parse and validate URLs'
         id: parse
-        env:
-          RAW_INPUT: ${{ inputs.url }}
         run: |
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "🔗  PARSING INPUT URLs"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
-          # GitHub Actions UI/API often converts newlines in string inputs to literal "\n".
-          # Passing via 'env' prevents bash injection issues, and 'sed' converts literal "\n" to real newlines.
-          URLS_INPUT_CLEAN=$(printf "%s" "$RAW_INPUT" | sed 's/\\n/\n/g; s/\r//g' | tr ',' '\n')
+          URLS_INPUT="${{ github.event.inputs.url }}"
           
-          idx=0
-          current_title=""
+          # Normalize separators: replace commas with newlines
+          NORMALIZED=$(echo "$URLS_INPUT" | tr ',' '\n')
           
-          > tasks.txt
-          
-          while IFS= read -r line || [ -n "$line" ]; do
-            # Trim leading and trailing whitespace
-            line=$(printf "%s" "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            
-            # Skip empty lines
+          > urls.txt
+          while IFS= read -r line; do
+            # Trim leading/trailing whitespace
+            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             [ -z "$line" ] && continue
             
-            # Check if line is a URL (starts with http:// or https://)
-            if [[ "$line" =~ ^https?:// ]]; then
-              idx=$((idx + 1))
-              if [ -n "$current_title" ] && ! [[ "$current_title" =~ ^https?:// ]]; then
-                # Sanitize title for filename: allow only alphanumeric, dots, underscores, hyphens
-                safe_title=$(printf "%s\n" "$current_title" | sed -e 's/[^A-Za-z0-9._-]/_/g' | sed -e 's/__*/_/g' | sed -e 's/^_//;s/_$//')
-                if [ -z "$safe_title" ]; then
-                  safe_title="video-${idx}"
-                fi
-              else
-                # Fallback if no valid title preceded the URL
-                safe_title="video-${idx}"
-              fi
-              echo "${idx}|${line}|${safe_title}" >> tasks.txt
-              current_title="" # Reset after consuming
-            else
-              # It's a title or some other text
-              current_title="$line"
+            # Extract URL (first token) and optional filename (rest)
+            url=$(echo "$line" | awk '{print $1}')
+            fname="${line#"$url"}"
+            fname=$(echo "$fname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            
+            # Basic URL validation
+            if [[ ! "$url" =~ ^[a-zA-Z]+:// ]]; then
+               echo "  ⚠️  Skipping invalid URL format: $url"
+               continue
             fi
-          done <<< "$URLS_INPUT_CLEAN"
+            
+            echo "${url}|${fname}" >> urls.txt
+          done <<< "$NORMALIZED"
           
-          NUM_URLS=$(wc -l < tasks.txt)
-          
-          if [ "$NUM_URLS" -eq 0 ]; then
+          NUM=$(wc -l < urls.txt)
+          if [ "$NUM" -eq 0 ]; then
             echo ""
-            echo "❌ ERROR: No URLs provided. Please supply at least one M3U8/HLS URL."
-            echo ""
+            echo "❌ ERROR: No valid URLs provided."
             exit 1
           fi
           
           echo ""
-          echo "📋 Detected $NUM_URLS URL(s) to process:"
+          echo "📋 Detected $NUM URL(s) to process:"
           echo "────────────────────────────────────────────────────"
-          while IFS='|' read -r t_idx t_url t_title; do
-            echo "  [$t_idx] Title: '$t_title'"
-            echo "      URL:  $t_url"
-          done < tasks.txt
+          i=1
+          while IFS='|' read -r url fname; do
+            if [ -n "$fname" ]; then
+              echo "  [$i] $url -> '$fname'"
+            else
+              echo "  [$i] $url"
+            fi
+            i=$((i+1))
+          done < urls.txt
           echo "────────────────────────────────────────────────────"
           echo ""
-          echo "NUM_URLS=$NUM_URLS" >> $GITHUB_OUTPUT
-          echo "✅ URL parsing complete: $NUM_URLS stream(s) queued"
+          echo "NUM_URLS=$NUM" >> $GITHUB_OUTPUT
+          echo "✅ URL parsing complete: $NUM stream(s) queued"
 
       - name: '🔒 Set up WireGuard VPN (if enabled)'
         id: vpn
@@ -251,8 +240,10 @@ jobs:
           FAILED_FILE="failed_urls.txt"
           SUCCESS_FILE="success_urls.txt"
 
+          # Get total URL count from parse step
           NUM_URLS="${{ steps.parse.outputs.NUM_URLS }}"
 
+          # Generate random string for file naming
           RANDOM_STR=$(head /dev/urandom | tr -dc a-z0-9 | head -c5)
           echo ""
           echo "  🎲 Random string for this run: $RANDOM_STR"
@@ -275,23 +266,35 @@ jobs:
 
           download_one() {
             local input="$1"
-            local p_idx="${input%%|*}"
-            local rest="${input#*|}"
-            local p_url="${rest%%|*}"
-            local p_title="${rest#*|}"
+            local idx=$(echo "$input" | cut -d'|' -f1)
+            local url=$(echo "$input" | cut -d'|' -f2)
+            local custom_fname=$(echo "$input" | cut -d'|' -f3-)
             
-            local url_hash=$(echo "$p_url" | md5sum | cut -c1-8)
+            local url_hash=$(echo "$url" | md5sum | cut -c1-8)
             local dl_dir="dl_$$_${url_hash}"
             local start_time=$(date +%s)
             mkdir -p "$DOWNLOAD_DIR/$dl_dir"
 
+            local out_name=""
+            if [ -n "$custom_fname" ]; then
+              # Basic sanitization: replace slashes to avoid directory creation issues, escape % for yt-dlp
+              local safe_fname=$(echo "$custom_fname" | tr '/' '_' | tr -d '\\' | sed 's/%/%%/g')
+              out_name="${safe_fname}"
+            else
+              out_name="${RANDOM_STR}-video-${idx}"
+            fi
+
             echo ""
             echo "┌──────────────────────────────────────────────────┐"
-            echo "│ ⬇️  Starting download [$p_idx/$NUM_URLS]"
-            echo "│ Title: ${p_title}"
-            echo "│ URL:   ${p_url}"
+            echo "│ ⬇️  Starting download [$idx/$NUM_URLS]"
+            if [ -n "$custom_fname" ]; then
+              echo "│ Custom Name: $custom_fname"
+            else
+              echo "│ Default Name: ${out_name}"
+            fi
             echo "└──────────────────────────────────────────────────┘"
             
+            # Map user selection to yt-dlp format selectors
             local format=""
             case "$QUALITY" in
               "best")   format="bv*+ba/b" ;;
@@ -304,7 +307,7 @@ jobs:
               *)        format="bv*+ba/b" ;;
             esac
             
-            local output_template="$DOWNLOAD_DIR/$dl_dir/${p_title}.%(ext)s"
+            local output_template="$DOWNLOAD_DIR/$dl_dir/${out_name}.%(ext)s"
             local log_file="$DOWNLOAD_DIR/$dl_dir/yt-dlp.log"
             
             local dl_cmd=(
@@ -321,18 +324,21 @@ jobs:
               -o "$output_template"
             )
             
+            # Add verbose flag only if verbose logging is enabled
             if [ "$VERBOSE_LOG" = "true" ]; then
               dl_cmd+=(--verbose)
             else
               dl_cmd+=(--quiet --no-warnings)
             fi
             
+            # Parse custom args safely
             if [ -n "$CUSTOM_ARGS" ]; then
               eval "local parsed_args=($CUSTOM_ARGS)"
               dl_cmd+=("${parsed_args[@]}")
             fi
-            dl_cmd+=("$p_url")
+            dl_cmd+=("$url")
             
+            # Execute download
             local dl_success=false
             if [ "$VERBOSE_LOG" = "true" ]; then
               echo ""
@@ -343,7 +349,7 @@ jobs:
               fi
               echo "────────────────────────────────────────────────────"
             else
-              echo "  ⏳ Download in progress [$p_idx/$NUM_URLS]..."
+              echo "  ⏳ Download in progress [$idx/$NUM_URLS]..."
               if "${dl_cmd[@]}" > "$log_file" 2>&1; then
                 dl_success=true
               fi
@@ -357,39 +363,28 @@ jobs:
               if [ -n "$dl_file" ]; then
                 local file_size=$(stat -c%s "$DOWNLOAD_DIR/$dl_dir/$dl_file" 2>/dev/null || echo 0)
                 local file_size_mb=$(echo "scale=2; $file_size / 1048576" | bc 2>/dev/null || echo "?")
-                
-                local ext="${dl_file##*.}"
-                local final_name="${p_title}.${ext}"
-                
-                # Handle potential name collision in DOWNLOAD_DIR
-                local counter=1
-                while [ -e "$DOWNLOAD_DIR/$final_name" ]; do
-                  final_name="${p_title}-${counter}.${ext}"
-                  counter=$((counter + 1))
-                done
-                
-                mv "$DOWNLOAD_DIR/$dl_dir/$dl_file" "$DOWNLOAD_DIR/$final_name"
+                mv "$DOWNLOAD_DIR/$dl_dir/$dl_file" "$DOWNLOAD_DIR/"
                 echo ""
-                echo "  ✅ SUCCESS [$p_idx/$NUM_URLS]: $final_name"
+                echo "  ✅ SUCCESS [$idx/$NUM_URLS]: $dl_file"
                 echo "     Size: ${file_size_mb} MB | Time: ${duration}s"
-                echo "$p_url|$final_name|${file_size_mb}MB|${duration}s|$p_idx" >> "$SUCCESS_FILE"
+                echo "$url|$dl_file|${file_size_mb}MB|${duration}s|$idx" >> "$SUCCESS_FILE"
               else
                 echo ""
-                echo "  ❌ FAILED [$p_idx/$NUM_URLS]: No output file produced"
+                echo "  ❌ FAILED [$idx/$NUM_URLS]: No output file produced"
                 if [ "$VERBOSE_LOG" = "false" ] && [ -f "$log_file" ]; then
                   echo "     Last 3 lines of log:"
                   tail -3 "$log_file" | sed 's/^/     /'
                 fi
-                echo "$p_url|no_file_produced|$p_idx" >> "$FAILED_FILE"
+                echo "$url|no_file_produced|$idx" >> "$FAILED_FILE"
               fi
             else
               echo ""
-              echo "  ❌ FAILED [$p_idx/$NUM_URLS]: Download error (${duration}s)"
+              echo "  ❌ FAILED [$idx/$NUM_URLS]: Download error (${duration}s)"
               if [ "$VERBOSE_LOG" = "false" ] && [ -f "$log_file" ]; then
                 echo "     Last 5 lines of log:"
                 tail -5 "$log_file" | sed 's/^/     /'
               fi
-              echo "$p_url|yt-dlp_error|${duration}s|$p_idx" >> "$FAILED_FILE"
+              echo "$url|yt-dlp_error|${duration}s|$idx" >> "$FAILED_FILE"
             fi
             rm -rf "$DOWNLOAD_DIR/$dl_dir"
           }
@@ -400,8 +395,9 @@ jobs:
           echo "→ 🚀 Launching parallel downloads..."
           echo ""
           
-          # Pass tasks.txt lines safely to the function
-          cat tasks.txt | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "$1"' _ '{}'
+          # Add line numbers to URLs for sequential naming
+          # Using null-byte delimiter to safely handle spaces and special characters in filenames
+          awk '{print NR "|" $0}' urls.txt | tr '\n' '\0' | xargs -0 -P "$CONCURRENT" -n 1 bash -c 'download_one "$0"'
 
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -460,6 +456,7 @@ jobs:
           echo ""
           echo "  🎲 Random string (from download): $RANDOM_STR"
 
+          # Determine split size based on upload target
           if [ "$UPLOAD_METHOD_INPUT" = "repo" ]; then
             SPLIT_SIZE="99m"
             echo "  📏 Split size: 99 MB (GitHub repo file limit)"
@@ -480,6 +477,7 @@ jobs:
           echo "  📤 Upload method: $UPLOAD_METHOD_INPUT"
           echo ""
 
+          # Move failure log to output if exists
           if [ -s "$FAILED_FILE" ]; then
             RAND_FAIL=$(mktemp -u XXXXX)
             FAIL_NAME="m3u8-failed-${RAND_FAIL}.txt"
@@ -494,6 +492,7 @@ jobs:
             [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
           }
 
+          # ----- Bundle all files into single archive -----
           if [ "$BUNDLE_ALL" = "true" ]; then
             echo ""
             echo "→ 📦 Mode: BUNDLE ALL into single archive"
@@ -561,6 +560,7 @@ jobs:
             fi
 
           else
+            # ----- Zip each file individually -----
             echo ""
             echo "→ 🗜️  Mode: INDIVIDUAL zip per file"
             
@@ -578,13 +578,9 @@ jobs:
               fsize=$(stat -c%s "$f" 2>/dev/null || echo 0)
               fsize_mb=$(echo "scale=2; $fsize / 1048576" | bc 2>/dev/null || echo "?")
               
-              # Create a safe base name for the zip file from the title
-              base_name="${fname%.*}"
-              safe_zip_base=$(printf "%s" "$base_name" | sed -e 's/[^A-Za-z0-9._-]/_/g' | sed -e 's/__*/_/g' | cut -c1-50)
-              if [ -z "$safe_zip_base" ] || [ "$safe_zip_base" = "_" ]; then
-                safe_zip_base="file-${FILE_INDEX}"
-              fi
-              ZIP_NAME="m3u8-${RANDOM_STR}-${safe_zip_base}.zip"
+              # Extract video index from filename (pattern: XXXXX-video-N.ext)
+              video_idx=$(echo "$fname" | grep -oP '(?<=-video-)\d+' || echo "$FILE_INDEX")
+              ZIP_NAME="m3u8-${RANDOM_STR}-${video_idx}.zip"
               
               echo ""
               echo "  [$FILE_INDEX] 🗜️  Zipping: $fname (${fsize_mb} MB) → $ZIP_NAME"
@@ -637,6 +633,7 @@ jobs:
             done
           fi
 
+          # If DRIVE_DIRECT, move raw files to output
           if [ "$DRIVE_DIRECT" = true ]; then
             echo ""
             echo "→ 📂 Moving raw files to output directory (DRIVE_DIRECT mode)..."
@@ -644,6 +641,7 @@ jobs:
             mv "$DOWNLOAD_DIR"/* "$OUTPUT_DIR/" 2>/dev/null || true
           fi
 
+          # Cleanup temp download dir
           rm -rf "$DOWNLOAD_DIR"
 
           echo ""
@@ -735,6 +733,7 @@ jobs:
             size_mb=$(echo "scale=2; $size / 1048576" | bc 2>/dev/null || echo "?")
             echo "  ⬆️  Uploading: $fname (${size_mb} MB / $size bytes)"
 
+            # Determine MIME type
             ext="${fname##*.}"
             case "$ext" in
               zip|z01|z02|z03|z04|z05) MTYPE="application/zip" ;;
@@ -916,7 +915,7 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           echo "→ Removing temporary directories and files..."
-          rm -rf m3u8_out downloads_tmp tasks.txt failed_urls.txt success_urls.txt 2>/dev/null || true
+          rm -rf m3u8_out downloads_tmp urls.txt failed_urls.txt success_urls.txt 2>/dev/null || true
           rm -f m3u8_out_assets.txt 2>/dev/null || true
           echo "  ✅ Temporary files removed"
           
