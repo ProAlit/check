@@ -6,8 +6,7 @@ on:
       url:
         description: >
           Enter one or more M3U8 / HLS stream URLs.
-          Separate multiple entries by commas or newlines.
-          Optionally specify a custom filename after the URL separated by a space (e.g. 'https://.../stream.m3u8 My Video Name').
+          Separate by commas, spaces, or newlines.
         required: true
       quality:
         description: 'Select video quality or audio-only'
@@ -111,47 +110,24 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
           URLS_INPUT="${{ github.event.inputs.url }}"
+          URLS=$(echo "$URLS_INPUT" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
           
-          # Normalize separators: replace commas with newlines
-          NORMALIZED=$(echo "$URLS_INPUT" | tr ',' '\n')
-          
-          > urls.txt
-          while IFS= read -r line; do
-            # Trim leading/trailing whitespace
-            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            [ -z "$line" ] && continue
-            
-            # Extract URL (first token) and optional filename (rest)
-            url=$(echo "$line" | awk '{print $1}')
-            fname="${line#"$url"}"
-            fname=$(echo "$fname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            
-            # Basic URL validation
-            if [[ ! "$url" =~ ^[a-zA-Z]+:// ]]; then
-               echo "  ⚠️  Skipping invalid URL format: $url"
-               continue
-            fi
-            
-            echo "${url}|${fname}" >> urls.txt
-          done <<< "$NORMALIZED"
-          
-          NUM=$(wc -l < urls.txt)
-          if [ "$NUM" -eq 0 ]; then
+          if [ -z "$URLS" ]; then
             echo ""
-            echo "❌ ERROR: No valid URLs provided."
+            echo "❌ ERROR: No URLs provided. Please supply at least one M3U8/HLS URL."
+            echo ""
             exit 1
           fi
+          
+          echo "$URLS" | tr ' ' '\n' > urls.txt
+          NUM=$(wc -l < urls.txt)
           
           echo ""
           echo "📋 Detected $NUM URL(s) to process:"
           echo "────────────────────────────────────────────────────"
           i=1
-          while IFS='|' read -r url fname; do
-            if [ -n "$fname" ]; then
-              echo "  [$i] $url -> '$fname'"
-            else
-              echo "  [$i] $url"
-            fi
+          while IFS= read -r url; do
+            echo "  [$i] $url"
             i=$((i+1))
           done < urls.txt
           echo "────────────────────────────────────────────────────"
@@ -266,32 +242,17 @@ jobs:
 
           download_one() {
             local input="$1"
-            local idx=$(echo "$input" | cut -d'|' -f1)
-            local url=$(echo "$input" | cut -d'|' -f2)
-            local custom_fname=$(echo "$input" | cut -d'|' -f3-)
-            
+            local idx="${input%%|*}"
+            local url="${input#*|}"
             local url_hash=$(echo "$url" | md5sum | cut -c1-8)
             local dl_dir="dl_$$_${url_hash}"
             local start_time=$(date +%s)
             mkdir -p "$DOWNLOAD_DIR/$dl_dir"
 
-            local out_name=""
-            if [ -n "$custom_fname" ]; then
-              # Basic sanitization: replace slashes to avoid directory creation issues, escape % for yt-dlp
-              local safe_fname=$(echo "$custom_fname" | tr '/' '_' | tr -d '\\' | sed 's/%/%%/g')
-              out_name="${safe_fname}"
-            else
-              out_name="${RANDOM_STR}-video-${idx}"
-            fi
-
             echo ""
             echo "┌──────────────────────────────────────────────────┐"
             echo "│ ⬇️  Starting download [$idx/$NUM_URLS]"
-            if [ -n "$custom_fname" ]; then
-              echo "│ Custom Name: $custom_fname"
-            else
-              echo "│ Default Name: ${out_name}"
-            fi
+            echo "│ Output: ${RANDOM_STR}-video-${idx}"
             echo "└──────────────────────────────────────────────────┘"
             
             # Map user selection to yt-dlp format selectors
@@ -307,7 +268,7 @@ jobs:
               *)        format="bv*+ba/b" ;;
             esac
             
-            local output_template="$DOWNLOAD_DIR/$dl_dir/${out_name}.%(ext)s"
+            local output_template="$DOWNLOAD_DIR/$dl_dir/${RANDOM_STR}-video-${idx}.%(ext)s"
             local log_file="$DOWNLOAD_DIR/$dl_dir/yt-dlp.log"
             
             local dl_cmd=(
@@ -396,8 +357,7 @@ jobs:
           echo ""
           
           # Add line numbers to URLs for sequential naming
-          # Using null-byte delimiter to safely handle spaces and special characters in filenames
-          awk '{print NR "|" $0}' urls.txt | tr '\n' '\0' | xargs -0 -P "$CONCURRENT" -n 1 bash -c 'download_one "$0"'
+          awk '{print NR "|" $0}' urls.txt | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"'
 
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
