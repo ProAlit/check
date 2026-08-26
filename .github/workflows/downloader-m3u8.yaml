@@ -56,6 +56,10 @@ on:
         type: number
         default: 2
         required: false
+      verbose_log:
+        description: 'Show full yt-dlp download progress logs (default: minimal logging)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -193,10 +197,12 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: '⬇️ Download HLS streams concurrently'
+        id: download
         env:
           QUALITY: ${{ inputs.quality }}
           CUSTOM_ARGS: ${{ inputs.custom_args }}
           MERGE_FORMAT: ${{ inputs.merge_format }}
+          VERBOSE_LOG: ${{ inputs.verbose_log }}
         run: |
           set -e
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -214,6 +220,7 @@ jobs:
           RANDOM_STR=$(head /dev/urandom | tr -dc a-z0-9 | head -c5)
           echo ""
           echo "  🎲 Random string for this run: $RANDOM_STR"
+          echo "random_str=$RANDOM_STR" >> $GITHUB_OUTPUT
 
           mkdir -p "$OUTPUT_DIR" "$DOWNLOAD_DIR"
           > "$FAILED_FILE"
@@ -225,6 +232,7 @@ jobs:
           echo "     Merge format:         $MERGE_FORMAT"
           echo "     Concurrent downloads: $CONCURRENT"
           echo "     VPN active:           $VPN_AVAILABLE"
+          echo "     Verbose logging:      $VERBOSE_LOG"
           echo "     Custom args:          ${CUSTOM_ARGS:-'(none)'}"
           echo ""
 
@@ -239,9 +247,8 @@ jobs:
 
             echo ""
             echo "┌──────────────────────────────────────────────────┐"
-            echo "│ ⬇️  Starting download [$idx/$NUM_URLS] [hash: $url_hash]"
-            echo "│ URL: $url"
-            echo "│ Output name: ${RANDOM_STR}-video-${idx}"
+            echo "│ ⬇️  Starting download [$idx/$NUM_URLS]"
+            echo "│ Output: ${RANDOM_STR}-video-${idx}"
             echo "└──────────────────────────────────────────────────┘"
             
             # Map user selection to yt-dlp format selectors
@@ -257,11 +264,8 @@ jobs:
               *)        format="bv*+ba/b" ;;
             esac
             
-            # Output template: XXXXX-video-N.ext
             local output_template="$DOWNLOAD_DIR/$dl_dir/${RANDOM_STR}-video-${idx}.%(ext)s"
-            
-            echo "  📐 Format selector: $format"
-            echo "  📦 Output template: $output_template"
+            local log_file="$DOWNLOAD_DIR/$dl_dir/yt-dlp.log"
             
             local dl_cmd=(
               yt-dlp
@@ -274,53 +278,76 @@ jobs:
               --retries 5
               --fragment-retries 5
               --retry-sleep 3
-              --verbose
               -o "$output_template"
             )
             
+            # Add verbose flag only if verbose logging is enabled
+            if [ "$VERBOSE_LOG" = "true" ]; then
+              dl_cmd+=(--verbose)
+            else
+              dl_cmd+=(--quiet --no-warnings)
+            fi
+            
             # Parse custom args safely
             if [ -n "$CUSTOM_ARGS" ]; then
-              echo "  🔧 Custom args: $CUSTOM_ARGS"
               eval "local parsed_args=($CUSTOM_ARGS)"
               dl_cmd+=("${parsed_args[@]}")
             fi
             dl_cmd+=("$url")
             
-            echo "  🚀 Executing: ${dl_cmd[*]}"
-            echo ""
+            # Execute download
+            local dl_success=false
+            if [ "$VERBOSE_LOG" = "true" ]; then
+              echo ""
+              echo "  🚀 Executing: ${dl_cmd[*]}"
+              echo "────────────────────────────────────────────────────"
+              if "${dl_cmd[@]}"; then
+                dl_success=true
+              fi
+              echo "────────────────────────────────────────────────────"
+            else
+              echo "  ⏳ Download in progress [$idx/$NUM_URLS]..."
+              if "${dl_cmd[@]}" > "$log_file" 2>&1; then
+                dl_success=true
+              fi
+            fi
             
-            if "${dl_cmd[@]}"; then
-              local end_time=$(date +%s)
-              local duration=$((end_time - start_time))
-              local dl_file=$(ls -1 "$DOWNLOAD_DIR/$dl_dir" 2>/dev/null | head -n1)
-              
+            local end_time=$(date +%s)
+            local duration=$((end_time - start_time))
+            
+            if [ "$dl_success" = true ]; then
+              local dl_file=$(ls -1 "$DOWNLOAD_DIR/$dl_dir" 2>/dev/null | grep -v '\.log$' | head -n1)
               if [ -n "$dl_file" ]; then
                 local file_size=$(stat -c%s "$DOWNLOAD_DIR/$dl_dir/$dl_file" 2>/dev/null || echo 0)
                 local file_size_mb=$(echo "scale=2; $file_size / 1048576" | bc 2>/dev/null || echo "?")
                 mv "$DOWNLOAD_DIR/$dl_dir/$dl_file" "$DOWNLOAD_DIR/"
                 echo ""
                 echo "  ✅ SUCCESS [$idx/$NUM_URLS]: $dl_file"
-                echo "     Size: ${file_size_mb} MB ($file_size bytes)"
-                echo "     Time: ${duration}s"
+                echo "     Size: ${file_size_mb} MB | Time: ${duration}s"
                 echo "$url|$dl_file|${file_size_mb}MB|${duration}s|$idx" >> "$SUCCESS_FILE"
               else
                 echo ""
-                echo "  ❌ FAILED (no output file) [$idx/$NUM_URLS]: $url"
+                echo "  ❌ FAILED [$idx/$NUM_URLS]: No output file produced"
+                if [ "$VERBOSE_LOG" = "false" ] && [ -f "$log_file" ]; then
+                  echo "     Last 3 lines of log:"
+                  tail -3 "$log_file" | sed 's/^/     /'
+                fi
                 echo "$url|no_file_produced|$idx" >> "$FAILED_FILE"
               fi
             else
-              local end_time=$(date +%s)
-              local duration=$((end_time - start_time))
               echo ""
-              echo "  ❌ FAILED (yt-dlp error) [$idx/$NUM_URLS]: $url"
-              echo "     Duration before failure: ${duration}s"
+              echo "  ❌ FAILED [$idx/$NUM_URLS]: Download error (${duration}s)"
+              if [ "$VERBOSE_LOG" = "false" ] && [ -f "$log_file" ]; then
+                echo "     Last 5 lines of log:"
+                tail -5 "$log_file" | sed 's/^/     /'
+              fi
               echo "$url|yt-dlp_error|${duration}s|$idx" >> "$FAILED_FILE"
             fi
             rm -rf "$DOWNLOAD_DIR/$dl_dir"
           }
 
           export -f download_one
-          export DOWNLOAD_DIR FAILED_FILE SUCCESS_FILE VPN_AVAILABLE QUALITY CUSTOM_ARGS MERGE_FORMAT RANDOM_STR NUM_URLS="$NUM"
+          export DOWNLOAD_DIR FAILED_FILE SUCCESS_FILE VPN_AVAILABLE QUALITY CUSTOM_ARGS MERGE_FORMAT RANDOM_STR VERBOSE_LOG NUM_URLS="$NUM"
 
           echo "→ 🚀 Launching parallel downloads..."
           echo ""
@@ -335,7 +362,7 @@ jobs:
           
           SUCCESS_COUNT=$(wc -l < "$SUCCESS_FILE" 2>/dev/null || echo 0)
           FAIL_COUNT=$(wc -l < "$FAILED_FILE" 2>/dev/null || echo 0)
-          TOTAL_FILES=$(ls -1 "$DOWNLOAD_DIR" 2>/dev/null | wc -l)
+          TOTAL_FILES=$(ls -1 "$DOWNLOAD_DIR" 2>/dev/null | grep -v '\.log$' | wc -l)
           TOTAL_SIZE=$(du -sh "$DOWNLOAD_DIR" 2>/dev/null | cut -f1)
           
           echo ""
@@ -366,7 +393,7 @@ jobs:
           
           echo ""
           echo "📂 Files in download directory:"
-          ls -lh "$DOWNLOAD_DIR/" 2>/dev/null || echo "  (empty)"
+          ls -lh "$DOWNLOAD_DIR/" 2>/dev/null | grep -v '\.log$' || echo "  (empty)"
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         shell: bash
@@ -380,6 +407,10 @@ jobs:
           
           BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
           UPLOAD_METHOD_INPUT="${{ inputs.upload_method }}"
+          RANDOM_STR="${{ steps.download.outputs.random_str }}"
+
+          echo ""
+          echo "  🎲 Random string (from download): $RANDOM_STR"
 
           # Determine split size based on upload target
           if [ "$UPLOAD_METHOD_INPUT" = "repo" ]; then
@@ -431,8 +462,7 @@ jobs:
               echo "  📁 Files to bundle: $BUNDLE_FILE_COUNT"
               echo "  💾 Total content size: $BUNDLE_TOTAL_SIZE"
               
-              RAND_BUNDLE=$(mktemp -u XXXXX)
-              BUNDLE_ZIP="m3u8_bundle_${RAND_BUNDLE}.zip"
+              BUNDLE_ZIP="m3u8-bundle-${RANDOM_STR}.zip"
               echo "  🗜️  Creating archive: $BUNDLE_ZIP"
               echo ""
 
@@ -503,9 +533,10 @@ jobs:
               fname=$(basename "$f")
               fsize=$(stat -c%s "$f" 2>/dev/null || echo 0)
               fsize_mb=$(echo "scale=2; $fsize / 1048576" | bc 2>/dev/null || echo "?")
-              RAND5=$(mktemp -u XXXXX)
-              ZIP_BASE="${fname%.*}_${RAND5}"
-              ZIP_NAME="${ZIP_BASE}.zip"
+              
+              # Extract video index from filename (pattern: XXXXX-video-N.ext)
+              video_idx=$(echo "$fname" | grep -oP '(?<=-video-)\d+' || echo "$FILE_INDEX")
+              ZIP_NAME="m3u8-${RANDOM_STR}-${video_idx}.zip"
               
               echo ""
               echo "  [$FILE_INDEX] 🗜️  Zipping: $fname (${fsize_mb} MB) → $ZIP_NAME"
