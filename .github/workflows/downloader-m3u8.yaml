@@ -105,13 +105,16 @@ jobs:
 
       - name: '🔗 Parse and validate URLs'
         id: parse
+        env:
+          RAW_INPUT: ${{ inputs.url }}
         run: |
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "🔗  PARSING INPUT URLs"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
-          # Replace commas with newlines to handle comma-separated URLs uniformly
-          URLS_INPUT_CLEAN=$(echo "${{ github.event.inputs.url }}" | tr ',' '\n')
+          # GitHub Actions UI/API often converts newlines in string inputs to literal "\n".
+          # Passing via 'env' prevents bash injection issues, and 'sed' converts literal "\n" to real newlines.
+          URLS_INPUT_CLEAN=$(printf "%s" "$RAW_INPUT" | sed 's/\\n/\n/g; s/\r//g' | tr ',' '\n')
           
           idx=0
           current_title=""
@@ -120,7 +123,7 @@ jobs:
           
           while IFS= read -r line || [ -n "$line" ]; do
             # Trim leading and trailing whitespace
-            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            line=$(printf "%s" "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             
             # Skip empty lines
             [ -z "$line" ] && continue
@@ -130,7 +133,7 @@ jobs:
               idx=$((idx + 1))
               if [ -n "$current_title" ] && ! [[ "$current_title" =~ ^https?:// ]]; then
                 # Sanitize title for filename: allow only alphanumeric, dots, underscores, hyphens
-                safe_title=$(echo "$current_title" | sed -e 's/[^A-Za-z0-9._-]/_/g' | sed -e 's/__*/_/g' | sed -e 's/^_//;s/_$//')
+                safe_title=$(printf "%s\n" "$current_title" | sed -e 's/[^A-Za-z0-9._-]/_/g' | sed -e 's/__*/_/g' | sed -e 's/^_//;s/_$//')
                 if [ -z "$safe_title" ]; then
                   safe_title="video-${idx}"
                 fi
@@ -577,7 +580,7 @@ jobs:
               
               # Create a safe base name for the zip file from the title
               base_name="${fname%.*}"
-              safe_zip_base=$(echo "$base_name" | sed -e 's/[^A-Za-z0-9._-]/_/g' | sed -e 's/__*/_/g' | cut -c1-50)
+              safe_zip_base=$(printf "%s" "$base_name" | sed -e 's/[^A-Za-z0-9._-]/_/g' | sed -e 's/__*/_/g' | cut -c1-50)
               if [ -z "$safe_zip_base" ] || [ "$safe_zip_base" = "_" ]; then
                 safe_zip_base="file-${FILE_INDEX}"
               fi
