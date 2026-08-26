@@ -21,6 +21,34 @@ on:
           - 360p
           - audio
         default: best
+      audio_format:
+        description: 'Audio extraction format (only used if Quality is "audio")'
+        required: false
+        type: choice
+        options:
+          - mp3
+          - m4a
+          - ogg
+          - flac
+          - opus
+          - wav
+          - aac
+          - alac
+          - best
+        default: mp3
+      audio_bitrate:
+        description: 'Audio quality/bitrate (only used if Quality is "audio")'
+        required: false
+        type: choice
+        options:
+          - best
+          - '320K'
+          - '256K'
+          - '192K'
+          - '160K'
+          - '128K'
+          - '96K'
+        default: best
       custom_args:
         description: 'Extra yt-dlp arguments (e.g., --referer https://example.com --cookies-from-browser chrome)'
         required: false
@@ -200,6 +228,8 @@ jobs:
         id: download
         env:
           QUALITY: ${{ inputs.quality }}
+          AUDIO_FORMAT: ${{ inputs.audio_format }}
+          AUDIO_BITRATE: ${{ inputs.audio_bitrate }}
           CUSTOM_ARGS: ${{ inputs.custom_args }}
           MERGE_FORMAT: ${{ inputs.merge_format }}
           VERBOSE_LOG: ${{ inputs.verbose_log }}
@@ -232,7 +262,12 @@ jobs:
           echo ""
           echo "  📋 Configuration:"
           echo "     Quality requested:    $QUALITY"
-          echo "     Merge format:         $MERGE_FORMAT"
+          if [ "$QUALITY" = "audio" ]; then
+            echo "     Audio format:         ${AUDIO_FORMAT:-mp3}"
+            echo "     Audio bitrate:        ${AUDIO_BITRATE:-best}"
+          else
+            echo "     Merge format:         $MERGE_FORMAT"
+          fi
           echo "     Concurrent downloads: $CONCURRENT"
           echo "     Total URLs:           $NUM_URLS"
           echo "     VPN active:           $VPN_AVAILABLE"
@@ -257,6 +292,10 @@ jobs:
             
             # Map user selection to yt-dlp format selectors
             local format=""
+            local extract_audio=false
+            local a_fmt=""
+            local a_bitrate=""
+
             case "$QUALITY" in
               "best")   format="bv*+ba/b" ;;
               "2160p")  format="bv*[height<=2160]+ba/b[height<=2160]/bv*+ba/b" ;;
@@ -264,7 +303,12 @@ jobs:
               "720p")   format="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" ;;
               "480p")   format="bv*[height<=480]+ba/b[height<=480]/bv*+ba/b" ;;
               "360p")   format="bv*[height<=360]+ba/b[height<=360]/bv*+ba/b" ;;
-              "audio")  format="ba/b" ;;
+              "audio")  
+                format="ba/b" 
+                extract_audio=true
+                a_fmt="${AUDIO_FORMAT:-mp3}"
+                a_bitrate="${AUDIO_BITRATE:-best}"
+                ;;
               *)        format="bv*+ba/b" ;;
             esac
             
@@ -275,7 +319,6 @@ jobs:
               yt-dlp
               --no-playlist
               -f "$format"
-              --merge-output-format "$MERGE_FORMAT"
               --concurrent-fragments 16
               --restrict-filenames
               --no-overwrites
@@ -284,6 +327,23 @@ jobs:
               --retry-sleep 3
               -o "$output_template"
             )
+
+            if [ "$extract_audio" = true ]; then
+              dl_cmd+=(--extract-audio)
+              
+              # Map user-friendly 'ogg' to 'vorbis' for yt-dlp
+              local yt_dlp_fmt="$a_fmt"
+              if [ "$yt_dlp_fmt" = "ogg" ]; then yt_dlp_fmt="vorbis"; fi
+              
+              if [ "$yt_dlp_fmt" != "best" ] && [ -n "$yt_dlp_fmt" ]; then
+                dl_cmd+=(--audio-format "$yt_dlp_fmt")
+              fi
+              if [ "$a_bitrate" != "best" ] && [ -n "$a_bitrate" ]; then
+                dl_cmd+=(--audio-quality "$a_bitrate")
+              fi
+            else
+              dl_cmd+=(--merge-output-format "$MERGE_FORMAT")
+            fi
             
             # Add verbose flag only if verbose logging is enabled
             if [ "$VERBOSE_LOG" = "true" ]; then
@@ -351,7 +411,7 @@ jobs:
           }
 
           export -f download_one
-          export DOWNLOAD_DIR FAILED_FILE SUCCESS_FILE VPN_AVAILABLE QUALITY CUSTOM_ARGS MERGE_FORMAT RANDOM_STR VERBOSE_LOG NUM_URLS
+          export DOWNLOAD_DIR FAILED_FILE SUCCESS_FILE VPN_AVAILABLE QUALITY CUSTOM_ARGS MERGE_FORMAT RANDOM_STR VERBOSE_LOG NUM_URLS AUDIO_FORMAT AUDIO_BITRATE
 
           echo "→ 🚀 Launching parallel downloads..."
           echo ""
@@ -702,6 +762,11 @@ jobs:
               webm)                     MTYPE="video/webm" ;;
               m4a)                      MTYPE="audio/mp4" ;;
               mp3)                      MTYPE="audio/mpeg" ;;
+              ogg|oga)                  MTYPE="audio/ogg" ;;
+              flac)                     MTYPE="audio/flac" ;;
+              wav)                      MTYPE="audio/wav" ;;
+              opus)                     MTYPE="audio/opus" ;;
+              aac)                      MTYPE="audio/aac" ;;
               *)                        MTYPE="application/octet-stream" ;;
             esac
             echo "     MIME: $MTYPE"
