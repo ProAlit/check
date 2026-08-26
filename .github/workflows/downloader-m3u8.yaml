@@ -216,6 +216,9 @@ jobs:
           FAILED_FILE="failed_urls.txt"
           SUCCESS_FILE="success_urls.txt"
 
+          # Get total URL count from parse step
+          NUM_URLS="${{ steps.parse.outputs.NUM_URLS }}"
+
           # Generate random string for file naming
           RANDOM_STR=$(head /dev/urandom | tr -dc a-z0-9 | head -c5)
           echo ""
@@ -231,6 +234,7 @@ jobs:
           echo "     Quality requested:    $QUALITY"
           echo "     Merge format:         $MERGE_FORMAT"
           echo "     Concurrent downloads: $CONCURRENT"
+          echo "     Total URLs:           $NUM_URLS"
           echo "     VPN active:           $VPN_AVAILABLE"
           echo "     Verbose logging:      $VERBOSE_LOG"
           echo "     Custom args:          ${CUSTOM_ARGS:-'(none)'}"
@@ -347,7 +351,7 @@ jobs:
           }
 
           export -f download_one
-          export DOWNLOAD_DIR FAILED_FILE SUCCESS_FILE VPN_AVAILABLE QUALITY CUSTOM_ARGS MERGE_FORMAT RANDOM_STR VERBOSE_LOG NUM_URLS="$NUM"
+          export DOWNLOAD_DIR FAILED_FILE SUCCESS_FILE VPN_AVAILABLE QUALITY CUSTOM_ARGS MERGE_FORMAT RANDOM_STR VERBOSE_LOG NUM_URLS
 
           echo "→ 🚀 Launching parallel downloads..."
           echo ""
@@ -376,7 +380,7 @@ jobs:
             echo "  📋 Successful downloads:"
             echo "  ────────────────────────────────────────────────"
             while IFS='|' read -r s_url s_file s_size s_time s_idx; do
-              echo "    ✅ [$s_idx] $s_file ($s_size, ${s_time})"
+              echo "    ✅ [$s_idx/$NUM_URLS] $s_file ($s_size, ${s_time})"
             done < "$SUCCESS_FILE"
             echo "  ────────────────────────────────────────────────"
           fi
@@ -386,7 +390,7 @@ jobs:
             echo "  📋 Failed downloads:"
             echo "  ────────────────────────────────────────────────"
             while IFS='|' read -r f_url f_reason f_duration f_idx; do
-              echo "    ❌ [$f_idx] $f_url ($f_reason)"
+              echo "    ❌ [$f_idx/$NUM_URLS] $f_url ($f_reason)"
             done < "$FAILED_FILE"
             echo "  ────────────────────────────────────────────────"
           fi
