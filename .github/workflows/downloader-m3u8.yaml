@@ -5,7 +5,7 @@ on:
     inputs:
       url:
         description: >
-          Enter one or more M3U8 / HLS URLs.
+          Enter one or more M3U8 / HLS stream URLs.
           Separate by commas, spaces, or newlines.
         required: true
       quality:
@@ -14,15 +14,26 @@ on:
         type: choice
         options:
           - best
+          - 2160p
           - 1080p
           - 720p
           - 480p
+          - 360p
           - audio
         default: best
       custom_args:
-        description: 'Additional arguments to pass to yt-dlp (e.g., --referer URL, --cookies cookies.txt)'
+        description: 'Extra yt-dlp arguments (e.g., --referer https://example.com --cookies-from-browser chrome)'
         required: false
         default: ''
+      merge_format:
+        description: 'Output container format when video+audio are merged'
+        required: true
+        type: choice
+        options:
+          - mp4
+          - mkv
+          - webm
+        default: mp4
       bundle_all:
         description: 'Bundle all downloaded files into a single split ZIP archive'
         type: boolean
@@ -41,7 +52,7 @@ on:
         type: boolean
         default: false
       concurrent_downloads:
-        description: 'Number of URLs to download at the same time'
+        description: 'Number of URLs to download simultaneously'
         type: number
         default: 2
         required: false
@@ -56,153 +67,330 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: '📦 Checkout repository'
+        uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: Install yt-dlp, ffmpeg, and aria2
+      - name: '🛠️ Install dependencies (yt-dlp + ffmpeg)'
         run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🛠️  INSTALLING DEPENDENCIES"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          echo ""
+          echo "→ [1/3] Updating apt package index..."
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg aria2 jq
-          # Download the latest yt-dlp binary directly for maximum speed and compatibility
-          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          
+          echo "→ [2/3] Installing ffmpeg and jq..."
+          sudo apt-get install -y -qq ffmpeg jq
+          echo "  ✅ ffmpeg version: $(ffmpeg -version 2>&1 | head -n1)"
+          echo "  ✅ jq version:     $(jq --version 2>&1)"
+          
+          echo "→ [3/3] Installing latest yt-dlp binary..."
+          sudo curl -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o /usr/local/bin/yt-dlp
           sudo chmod a+rx /usr/local/bin/yt-dlp
-          echo "yt-dlp version: $(yt-dlp --version)"
+          echo "  ✅ yt-dlp version: $(yt-dlp --version)"
+          
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ All dependencies installed successfully"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-      - name: Parse URLs
+      - name: '🔗 Parse and validate URLs'
         id: parse
         run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔗  PARSING INPUT URLs"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
           URLS_INPUT="${{ github.event.inputs.url }}"
           URLS=$(echo "$URLS_INPUT" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+          
           if [ -z "$URLS" ]; then
-            echo "No URLs provided." >&2
+            echo ""
+            echo "❌ ERROR: No URLs provided. Please supply at least one M3U8/HLS URL."
+            echo ""
             exit 1
           fi
+          
           echo "$URLS" | tr ' ' '\n' > urls.txt
-          echo "URLs to download:"
-          cat urls.txt
           NUM=$(wc -l < urls.txt)
+          
+          echo ""
+          echo "📋 Detected $NUM URL(s) to process:"
+          echo "────────────────────────────────────────────────────"
+          i=1
+          while IFS= read -r url; do
+            echo "  [$i] $url"
+            i=$((i+1))
+          done < urls.txt
+          echo "────────────────────────────────────────────────────"
+          echo ""
           echo "NUM_URLS=$NUM" >> $GITHUB_OUTPUT
+          echo "✅ URL parsing complete: $NUM stream(s) queued"
 
       - name: '🔒 Set up WireGuard VPN (if enabled)'
         id: vpn
         shell: bash
         run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔒  WIREGUARD VPN SETUP"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
           VPN_ENABLED="${{ inputs.vpn_enabled }}"
-          echo "VPN_ENABLED=$VPN_ENABLED"
-
+          echo ""
+          echo "  VPN requested: $VPN_ENABLED"
+          
           if [ "$VPN_ENABLED" = "true" ]; then
             if [ -z "${{ secrets.WG_CONFIG }}" ]; then
-              echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN Disabled for this run."
+              echo ""
+              echo "⚠️  WARNING: VPN enabled but WG_CONFIG secret is empty."
+              echo "   Proceeding WITHOUT VPN for this run."
               echo "vpn_available=false" >> $GITHUB_OUTPUT
               exit 0
             fi
 
-            echo "→ Installing WireGuard tools..."
+            echo ""
+            echo "→ [1/4] Installing WireGuard tools..."
             sudo apt-get update -qq
-            sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get install -y -qq wireguard-tools
+            sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null \
+              || sudo apt-get install -y -qq wireguard-tools
+            echo "  ✅ wireguard-tools installed"
 
-            echo "→ Writing WireGuard config..."
+            echo "→ [2/4] Writing WireGuard configuration..."
             cat <<'EOF' > /tmp/wg0.conf
           ${{ secrets.WG_CONFIG }}
           EOF
             sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
             sudo chmod 600 /etc/wireguard/wg0.conf
+            rm -f /tmp/wg0.conf
+            echo "  ✅ Config written to /etc/wireguard/wg0.conf (mode 600)"
 
-            echo "→ Bringing up wg0..."
+            echo "→ [3/4] Bringing up wg0 interface..."
             if sudo wg-quick up wg0; then
-              echo "✅ WireGuard VPN connected."
+              echo ""
+              echo "  ✅ WireGuard VPN CONNECTED successfully"
+              echo "  📡 Public IP via VPN:"
+              curl -s https://ifconfig.me || echo "  (unable to verify IP)"
+              echo ""
               echo "vpn_available=true" >> $GITHUB_OUTPUT
             else
-              echo "⚠️ Failed to bring up WireGuard – VPN disabled."
+              echo ""
+              echo "⚠️  WARNING: Failed to bring up WireGuard interface."
+              echo "   Proceeding WITHOUT VPN."
               sudo wg-quick down wg0 2>/dev/null || true
               echo "vpn_available=false" >> $GITHUB_OUTPUT
             fi
           else
+            echo ""
+            echo "ℹ️  VPN not requested – skipping setup."
             echo "vpn_available=false" >> $GITHUB_OUTPUT
           fi
+          
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-      - name: Download HLS streams concurrently
+      - name: '⬇️ Download HLS streams concurrently'
         env:
           QUALITY: ${{ inputs.quality }}
           CUSTOM_ARGS: ${{ inputs.custom_args }}
+          MERGE_FORMAT: ${{ inputs.merge_format }}
         run: |
           set -e
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⬇️  DOWNLOADING HLS STREAMS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
           VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
           CONCURRENT="${{ inputs.concurrent_downloads }}"
           OUTPUT_DIR="m3u8_out"
           DOWNLOAD_DIR="downloads_tmp"
           FAILED_FILE="failed_urls.txt"
+          SUCCESS_FILE="success_urls.txt"
+
+          # Generate random string for file naming
+          RANDOM_STR=$(head /dev/urandom | tr -dc a-z0-9 | head -c5)
+          echo ""
+          echo "  🎲 Random string for this run: $RANDOM_STR"
 
           mkdir -p "$OUTPUT_DIR" "$DOWNLOAD_DIR"
           > "$FAILED_FILE"
+          > "$SUCCESS_FILE"
+
+          echo ""
+          echo "  📋 Configuration:"
+          echo "     Quality requested:    $QUALITY"
+          echo "     Merge format:         $MERGE_FORMAT"
+          echo "     Concurrent downloads: $CONCURRENT"
+          echo "     VPN active:           $VPN_AVAILABLE"
+          echo "     Custom args:          ${CUSTOM_ARGS:-'(none)'}"
+          echo ""
 
           download_one() {
-            local url="$1"
-            local dl_dir="dl_$$_$(echo "$url" | md5sum | cut -c1-8)"
+            local input="$1"
+            local idx="${input%%|*}"
+            local url="${input#*|}"
+            local url_hash=$(echo "$url" | md5sum | cut -c1-8)
+            local dl_dir="dl_$$_${url_hash}"
+            local start_time=$(date +%s)
             mkdir -p "$DOWNLOAD_DIR/$dl_dir"
 
-            echo "→ Downloading: $url (Quality: $QUALITY)"
+            echo ""
+            echo "┌──────────────────────────────────────────────────┐"
+            echo "│ ⬇️  Starting download [$idx/$NUM_URLS] [hash: $url_hash]"
+            echo "│ URL: $url"
+            echo "│ Output name: ${RANDOM_STR}-video-${idx}"
+            echo "└──────────────────────────────────────────────────┘"
             
-            # Map user selection to yt-dlp format codes
+            # Map user selection to yt-dlp format selectors
             local format=""
             case "$QUALITY" in
-              "best") format="bv*+ba/b" ;;
-              "1080p") format="bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" ;;
-              "720p") format="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" ;;
-              "480p") format="bv*[height<=480]+ba/b[height<=480]/bv*+ba/b" ;;
-              "audio") format="ba/b" ;;
-              *) format="bv*+ba/b" ;;
+              "best")   format="bv*+ba/b" ;;
+              "2160p")  format="bv*[height<=2160]+ba/b[height<=2160]/bv*+ba/b" ;;
+              "1080p")  format="bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" ;;
+              "720p")   format="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b" ;;
+              "480p")   format="bv*[height<=480]+ba/b[height<=480]/bv*+ba/b" ;;
+              "360p")   format="bv*[height<=360]+ba/b[height<=360]/bv*+ba/b" ;;
+              "audio")  format="ba/b" ;;
+              *)        format="bv*+ba/b" ;;
             esac
             
-            local dl_cmd=(yt-dlp --no-playlist -f "$format" --concurrent-fragments 16 --restrict-filenames -o "$DOWNLOAD_DIR/$dl_dir/%(title)s.%(ext)s")
+            # Output template: XXXXX-video-N.ext
+            local output_template="$DOWNLOAD_DIR/$dl_dir/${RANDOM_STR}-video-${idx}.%(ext)s"
             
-            # Safely parse custom args containing quotes
+            echo "  📐 Format selector: $format"
+            echo "  📦 Output template: $output_template"
+            
+            local dl_cmd=(
+              yt-dlp
+              --no-playlist
+              -f "$format"
+              --merge-output-format "$MERGE_FORMAT"
+              --concurrent-fragments 16
+              --restrict-filenames
+              --no-overwrites
+              --retries 5
+              --fragment-retries 5
+              --retry-sleep 3
+              --verbose
+              -o "$output_template"
+            )
+            
+            # Parse custom args safely
             if [ -n "$CUSTOM_ARGS" ]; then
-                eval "local parsed_args=($CUSTOM_ARGS)"
-                dl_cmd+=("${parsed_args[@]}")
+              echo "  🔧 Custom args: $CUSTOM_ARGS"
+              eval "local parsed_args=($CUSTOM_ARGS)"
+              dl_cmd+=("${parsed_args[@]}")
             fi
             dl_cmd+=("$url")
             
+            echo "  🚀 Executing: ${dl_cmd[*]}"
+            echo ""
+            
             if "${dl_cmd[@]}"; then
-              local dl_file=$(ls -1 "$DOWNLOAD_DIR/$dl_dir" | head -n1)
+              local end_time=$(date +%s)
+              local duration=$((end_time - start_time))
+              local dl_file=$(ls -1 "$DOWNLOAD_DIR/$dl_dir" 2>/dev/null | head -n1)
+              
               if [ -n "$dl_file" ]; then
+                local file_size=$(stat -c%s "$DOWNLOAD_DIR/$dl_dir/$dl_file" 2>/dev/null || echo 0)
+                local file_size_mb=$(echo "scale=2; $file_size / 1048576" | bc 2>/dev/null || echo "?")
                 mv "$DOWNLOAD_DIR/$dl_dir/$dl_file" "$DOWNLOAD_DIR/"
-                echo "✅ Success: $url -> $dl_file"
+                echo ""
+                echo "  ✅ SUCCESS [$idx/$NUM_URLS]: $dl_file"
+                echo "     Size: ${file_size_mb} MB ($file_size bytes)"
+                echo "     Time: ${duration}s"
+                echo "$url|$dl_file|${file_size_mb}MB|${duration}s|$idx" >> "$SUCCESS_FILE"
               else
-                echo "❌ No file produced for: $url"
-                echo "$url" >> "$FAILED_FILE"
+                echo ""
+                echo "  ❌ FAILED (no output file) [$idx/$NUM_URLS]: $url"
+                echo "$url|no_file_produced|$idx" >> "$FAILED_FILE"
               fi
             else
-              echo "❌ Download failed: $url"
-              echo "$url" >> "$FAILED_FILE"
+              local end_time=$(date +%s)
+              local duration=$((end_time - start_time))
+              echo ""
+              echo "  ❌ FAILED (yt-dlp error) [$idx/$NUM_URLS]: $url"
+              echo "     Duration before failure: ${duration}s"
+              echo "$url|yt-dlp_error|${duration}s|$idx" >> "$FAILED_FILE"
             fi
             rm -rf "$DOWNLOAD_DIR/$dl_dir"
           }
 
           export -f download_one
-          export DOWNLOAD_DIR FAILED_FILE VPN_AVAILABLE QUALITY CUSTOM_ARGS
+          export DOWNLOAD_DIR FAILED_FILE SUCCESS_FILE VPN_AVAILABLE QUALITY CUSTOM_ARGS MERGE_FORMAT RANDOM_STR NUM_URLS="$NUM"
 
-          echo "→ Starting parallel downloads (concurrency: $CONCURRENT, VPN: $VPN_AVAILABLE)"
-          cat urls.txt | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"'
+          echo "→ 🚀 Launching parallel downloads..."
+          echo ""
+          
+          # Add line numbers to URLs for sequential naming
+          awk '{print NR "|" $0}' urls.txt | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"'
 
-          echo "📊 Downloads finished."
-          echo "Files downloaded:"
-          ls -la "$DOWNLOAD_DIR/"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊  DOWNLOAD SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          SUCCESS_COUNT=$(wc -l < "$SUCCESS_FILE" 2>/dev/null || echo 0)
+          FAIL_COUNT=$(wc -l < "$FAILED_FILE" 2>/dev/null || echo 0)
+          TOTAL_FILES=$(ls -1 "$DOWNLOAD_DIR" 2>/dev/null | wc -l)
+          TOTAL_SIZE=$(du -sh "$DOWNLOAD_DIR" 2>/dev/null | cut -f1)
+          
+          echo ""
+          echo "  ✅ Successful: $SUCCESS_COUNT"
+          echo "  ❌ Failed:     $FAIL_COUNT"
+          echo "  📁 Files:      $TOTAL_FILES"
+          echo "  💾 Total size: ${TOTAL_SIZE:-0}"
+          echo ""
+          
+          if [ -s "$SUCCESS_FILE" ]; then
+            echo "  📋 Successful downloads:"
+            echo "  ────────────────────────────────────────────────"
+            while IFS='|' read -r s_url s_file s_size s_time s_idx; do
+              echo "    ✅ [$s_idx] $s_file ($s_size, ${s_time})"
+            done < "$SUCCESS_FILE"
+            echo "  ────────────────────────────────────────────────"
+          fi
+          
+          if [ -s "$FAILED_FILE" ]; then
+            echo ""
+            echo "  📋 Failed downloads:"
+            echo "  ────────────────────────────────────────────────"
+            while IFS='|' read -r f_url f_reason f_duration f_idx; do
+              echo "    ❌ [$f_idx] $f_url ($f_reason)"
+            done < "$FAILED_FILE"
+            echo "  ────────────────────────────────────────────────"
+          fi
+          
+          echo ""
+          echo "📂 Files in download directory:"
+          ls -lh "$DOWNLOAD_DIR/" 2>/dev/null || echo "  (empty)"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         shell: bash
 
-      - name: Zip and bundle files
+      - name: '🗜️ Compress and bundle files'
         run: |
           set -e
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🗜️  COMPRESSION & BUNDLING"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
           BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
           UPLOAD_METHOD_INPUT="${{ inputs.upload_method }}"
 
+          # Determine split size based on upload target
           if [ "$UPLOAD_METHOD_INPUT" = "repo" ]; then
             SPLIT_SIZE="99m"
+            echo "  📏 Split size: 99 MB (GitHub repo file limit)"
           elif [ "$UPLOAD_METHOD_INPUT" = "release" ]; then
             SPLIT_SIZE="1950m"
+            echo "  📏 Split size: 1950 MB (GitHub release asset limit)"
           else
             SPLIT_SIZE="none"
+            echo "  📏 Split size: none (Google Drive – no splitting needed)"
           fi
 
           OUTPUT_DIR="m3u8_out"
@@ -210,12 +398,16 @@ jobs:
           FAILED_FILE="failed_urls.txt"
           DRIVE_DIRECT=false
 
-          # move failed log if any
+          echo "  📦 Bundle all: $BUNDLE_ALL"
+          echo "  📤 Upload method: $UPLOAD_METHOD_INPUT"
+          echo ""
+
+          # Move failure log to output if exists
           if [ -s "$FAILED_FILE" ]; then
             RAND_FAIL=$(mktemp -u XXXXX)
-            FAIL_NAME="links-failed-${RAND_FAIL}.txt"
+            FAIL_NAME="m3u8-failed-${RAND_FAIL}.txt"
             mv "$FAILED_FILE" "${OUTPUT_DIR}/$FAIL_NAME"
-            echo "Created failure report: ${OUTPUT_DIR}/$FAIL_NAME"
+            echo "  📝 Created failure report: ${OUTPUT_DIR}/$FAIL_NAME"
           else
             rm -f "$FAILED_FILE"
           fi
@@ -225,123 +417,140 @@ jobs:
             [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
           }
 
-          # ----- Bundle all files -----
+          # ----- Bundle all files into single archive -----
           if [ "$BUNDLE_ALL" = "true" ]; then
+            echo ""
+            echo "→ 📦 Mode: BUNDLE ALL into single archive"
             BUNDLE_DIR="bundle_contents"
             mkdir -p "$BUNDLE_DIR"
             cp "$DOWNLOAD_DIR"/* "$BUNDLE_DIR/" 2>/dev/null || true
+            
             if [ -n "$(ls -A "$BUNDLE_DIR" 2>/dev/null)" ]; then
+              BUNDLE_FILE_COUNT=$(ls -1 "$BUNDLE_DIR" | wc -l)
+              BUNDLE_TOTAL_SIZE=$(du -sh "$BUNDLE_DIR" | cut -f1)
+              echo "  📁 Files to bundle: $BUNDLE_FILE_COUNT"
+              echo "  💾 Total content size: $BUNDLE_TOTAL_SIZE"
+              
               RAND_BUNDLE=$(mktemp -u XXXXX)
-              BUNDLE_ZIP="bundle_${RAND_BUNDLE}.zip"
-              echo "Creating bundle: $BUNDLE_ZIP"
+              BUNDLE_ZIP="m3u8_bundle_${RAND_BUNDLE}.zip"
+              echo "  🗜️  Creating archive: $BUNDLE_ZIP"
+              echo ""
 
               set +e
-              if [ "$SPLIT_SIZE" = "none" ]; then
-                zip_output=$( (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
-                zip_exit=$?
-              else
-                zip_output=$( (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
-                zip_exit=$?
-                if [ $zip_exit -eq 0 ]; then
-                  FULLBUNDLE="${OUTPUT_DIR}/${BUNDLE_ZIP}"
-                  SIZE=$(stat -c%s "$FULLBUNDLE" 2>/dev/null || echo 0)
-                  SPLIT_LIMIT=$(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 ))
-                  if [ "$SIZE" -gt "$SPLIT_LIMIT" ]; then
-                    echo "Bundle ZIP larger than limit, splitting"
-                    rm "$FULLBUNDLE"
-                    zip_output=$( (cd "$BUNDLE_DIR" && zip -0 -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
-                    zip_exit=$?
-                  fi
+              zip_output=$( (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
+              zip_exit=$?
+              
+              if [ $zip_exit -eq 0 ] && [ "$SPLIT_SIZE" != "none" ]; then
+                FULLBUNDLE="${OUTPUT_DIR}/${BUNDLE_ZIP}"
+                SIZE=$(stat -c%s "$FULLBUNDLE" 2>/dev/null || echo 0)
+                SPLIT_LIMIT=$(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 ))
+                if [ "$SIZE" -gt "$SPLIT_LIMIT" ]; then
+                  SIZE_MB=$(echo "scale=1; $SIZE / 1048576" | bc)
+                  echo "  ⚠️  Archive size (${SIZE_MB} MB) exceeds limit – splitting into ${SPLIT_SIZE} parts"
+                  rm "$FULLBUNDLE"
+                  zip_output=$( (cd "$BUNDLE_DIR" && zip -0 -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *) 2>&1 )
+                  zip_exit=$?
                 fi
               fi
               set -e
 
               if [ $zip_exit -ne 0 ]; then
-                echo "Zip command failed with exit code $zip_exit"
+                echo ""
+                echo "  ❌ Zip failed (exit code: $zip_exit)"
                 if [ "$UPLOAD_METHOD_INPUT" = "drive" ] && is_disk_full "$zip_output"; then
-                  echo "⚠️  Disk full – switching to direct raw upload (Google Drive)."
+                  echo "  ⚠️  Disk full detected – switching to RAW upload (Google Drive)."
                   DRIVE_DIRECT=true
                   mkdir -p "$OUTPUT_DIR"
                   mv "$BUNDLE_DIR"/* "$OUTPUT_DIR/" 2>/dev/null || true
                   rm -rf "$BUNDLE_DIR"
                   rm -f "${OUTPUT_DIR}/${BUNDLE_ZIP}" 2>/dev/null || true
                 else
-                  echo "❌ Zipping failed due to insufficient disk space."
+                  echo "  ❌ Zipping failed due to insufficient disk space."
                   if [ "$UPLOAD_METHOD_INPUT" != "drive" ]; then
-                    echo "→ Consider using the 'drive' upload method to upload large files directly without zipping."
+                    echo "  💡 Tip: Use 'drive' upload method for files that exceed runner disk space."
                   fi
                   rm -rf "$BUNDLE_DIR"
                   exit 1
                 fi
               else
-                echo "✅ Bundle created successfully"
+                echo ""
+                echo "  ✅ Bundle archive created successfully"
+                ls -lh "${OUTPUT_DIR}/${BUNDLE_ZIP}"* 2>/dev/null || true
                 if [ "$DRIVE_DIRECT" = false ]; then
                   rm -rf "$BUNDLE_DIR"
                 fi
               fi
             else
-              echo "No files to bundle."
+              echo "  ⚠️  No files found to bundle."
               rm -rf "$BUNDLE_DIR"
             fi
 
           else
             # ----- Zip each file individually -----
+            echo ""
+            echo "→ 🗜️  Mode: INDIVIDUAL zip per file"
+            
+            FILE_INDEX=0
             for f in "$DOWNLOAD_DIR"/*; do
               [ -f "$f" ] || continue
+              FILE_INDEX=$((FILE_INDEX + 1))
 
               if [ "$DRIVE_DIRECT" = true ]; then
-                echo "DRIVE_DIRECT flag set – skipping further zipping, will upload raw files."
+                echo "  ⚠️  DRIVE_DIRECT active – skipping remaining zips."
                 break
               fi
 
               fname=$(basename "$f")
+              fsize=$(stat -c%s "$f" 2>/dev/null || echo 0)
+              fsize_mb=$(echo "scale=2; $fsize / 1048576" | bc 2>/dev/null || echo "?")
               RAND5=$(mktemp -u XXXXX)
-              ZIP_BASE="${fname}_${RAND5}"
+              ZIP_BASE="${fname%.*}_${RAND5}"
               ZIP_NAME="${ZIP_BASE}.zip"
-              echo "Zipping: $fname → $ZIP_NAME"
+              
+              echo ""
+              echo "  [$FILE_INDEX] 🗜️  Zipping: $fname (${fsize_mb} MB) → $ZIP_NAME"
 
               TMPZIP="tmpzip_$$"
               mkdir -p "$TMPZIP"
               cp "$f" "$TMPZIP/"
 
               set +e
-              if [ "$SPLIT_SIZE" = "none" ]; then
-                zip_output=$( (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname") 2>&1 )
-                zip_exit=$?
-              else
-                zip_output=$( (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname") 2>&1 )
-                zip_exit=$?
-                if [ $zip_exit -eq 0 ]; then
-                  FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
-                  SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                  SPLIT_LIMIT=$(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 ))
-                  if [ "$SIZE" -gt "$SPLIT_LIMIT" ]; then
-                    echo "ZIP larger than limit, splitting"
-                    rm "$FULLZIP"
-                    zip_output=$( (cd "$TMPZIP" && zip -0 -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname") 2>&1 )
-                    zip_exit=$?
-                  fi
+              zip_output=$( (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname") 2>&1 )
+              zip_exit=$?
+              
+              if [ $zip_exit -eq 0 ] && [ "$SPLIT_SIZE" != "none" ]; then
+                FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
+                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
+                SPLIT_LIMIT=$(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 ))
+                if [ "$SIZE" -gt "$SPLIT_LIMIT" ]; then
+                  SIZE_MB=$(echo "scale=1; $SIZE / 1048576" | bc)
+                  echo "      ⚠️  ZIP (${SIZE_MB} MB) exceeds limit – splitting into ${SPLIT_SIZE} parts"
+                  rm "$FULLZIP"
+                  zip_output=$( (cd "$TMPZIP" && zip -0 -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname") 2>&1 )
+                  zip_exit=$?
                 fi
               fi
               set -e
               rm -rf "$TMPZIP"
 
               if [ $zip_exit -ne 0 ]; then
-                echo "Zip command failed with exit code $zip_exit"
+                echo "      ❌ Zip failed (exit: $zip_exit)"
                 if [ "$UPLOAD_METHOD_INPUT" = "drive" ] && is_disk_full "$zip_output"; then
-                  echo "⚠️  Disk full – switching to direct raw upload (Google Drive)."
+                  echo "      ⚠️  Disk full – switching to RAW upload (Google Drive)."
                   DRIVE_DIRECT=true
                   rm -f "${OUTPUT_DIR}/${ZIP_NAME}" 2>/dev/null || true
-                  break   # stop zipping further files
+                  break
                 else
-                  echo "❌ Zipping failed due to insufficient disk space."
+                  echo "      ❌ Insufficient disk space."
                   if [ "$UPLOAD_METHOD_INPUT" != "drive" ]; then
-                    echo "→ Consider using the 'drive' upload method to upload large files directly without zipping."
+                    echo "      💡 Tip: Use 'drive' upload method for large files."
                   fi
                   exit 1
                 fi
               else
-                echo "✅ Zipped $fname"
+                ZIP_SIZE=$(stat -c%s "${OUTPUT_DIR}/${ZIP_NAME}" 2>/dev/null || echo 0)
+                ZIP_SIZE_MB=$(echo "scale=2; $ZIP_SIZE / 1048576" | bc 2>/dev/null || echo "?")
+                echo "      ✅ Zipped: $ZIP_NAME (${ZIP_SIZE_MB} MB)"
                 if [ "$DRIVE_DIRECT" = false ]; then
                   rm "$f"
                 fi
@@ -349,45 +558,71 @@ jobs:
             done
           fi
 
-          # If DRIVE_DIRECT is true, move all remaining raw files from DOWNLOAD_DIR to OUTPUT_DIR
+          # If DRIVE_DIRECT, move raw files to output
           if [ "$DRIVE_DIRECT" = true ]; then
-            echo "→ Moving raw files to output directory for direct upload..."
+            echo ""
+            echo "→ 📂 Moving raw files to output directory (DRIVE_DIRECT mode)..."
             mkdir -p "$OUTPUT_DIR"
             mv "$DOWNLOAD_DIR"/* "$OUTPUT_DIR/" 2>/dev/null || true
           fi
 
-          # Cleanup download dir
+          # Cleanup temp download dir
           rm -rf "$DOWNLOAD_DIR"
 
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📋  FINAL ASSET LIST"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          ls -lh "$OUTPUT_DIR/" 2>/dev/null || echo "  (no files)"
           ls -1 "$OUTPUT_DIR" > "${OUTPUT_DIR}_assets.txt"
-          echo "Assets to upload:"
-          cat "${OUTPUT_DIR}_assets.txt"
+          echo ""
+          echo "  📊 Total assets: $(wc -l < "${OUTPUT_DIR}_assets.txt")"
+          echo "  💾 Total size:   $(du -sh "$OUTPUT_DIR" | cut -f1)"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         shell: bash
 
-      - name: 'Disconnect VPN for uploads'
+      - name: '🔌 Disconnect VPN for uploads'
         if: steps.vpn.outputs.vpn_available == 'true'
         run: |
-          echo "→ Bringing down WireGuard to use runner's native internet for uploads"
-          sudo wg-quick down wg0
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔌  DISCONNECTING VPN FOR UPLOAD"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "→ Bringing down wg0 to use runner's native connection..."
+          if sudo wg-quick down wg0; then
+            echo "✅ WireGuard VPN disconnected successfully"
+          else
+            echo "⚠️  Warning: wg-quick down returned non-zero (interface may already be down)"
+          fi
+          echo ""
 
-      - name: "Upload to Google Drive"
+      - name: '☁️ Upload to Google Drive'
         if: inputs.upload_method == 'drive'
         env:
           CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "☁️  UPLOADING TO GOOGLE DRIVE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          echo "→ [1/3] Obtaining OAuth2 access token..."
           ACCESS_TOKEN=$(curl -s -X POST https://oauth2.googleapis.com/token \
             -d client_id="$CLIENT_ID" \
             -d client_secret="$CLIENT_SECRET" \
             -d refresh_token="$REFRESH_TOKEN" \
             -d grant_type=refresh_token | jq -r '.access_token')
           if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "❌ Failed to obtain access token"
+            echo "❌ ERROR: Failed to obtain Google Drive access token."
+            echo "   Check your GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN secrets."
             exit 1
           fi
+          echo "  ✅ Access token obtained"
 
-          FOLDER_NAME="m3u8-downloads"
+          echo "→ [2/3] Preparing upload folder..."
+          FOLDER_NAME="github-actions"
           QUERY="mimeType='application/vnd.google-apps.folder' and name='$FOLDER_NAME' and trashed=false"
           FOLDER_ID=$(curl -s -G \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
@@ -395,39 +630,46 @@ jobs:
             --data-urlencode "fields=files(id)" \
             "https://www.googleapis.com/drive/v3/files" | jq -r '.files[0].id // ""')
           if [ -z "$FOLDER_ID" ]; then
-            echo "→ Creating folder '$FOLDER_NAME'"
+            echo "  → Folder '$FOLDER_NAME' not found – creating..."
             FOLDER_ID=$(curl -s -X POST \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"name\":\"$FOLDER_NAME\", \"mimeType\":\"application/vnd.google-apps.folder\"}" \
               "https://www.googleapis.com/drive/v3/files?fields=id" | jq -r '.id')
             if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
-              echo "❌ Failed to create folder"
+              echo "  ❌ ERROR: Failed to create folder"
               exit 1
             fi
+            echo "  ✅ Folder created"
           fi
-          echo "✅ Folder ID: $FOLDER_ID"
+          echo "  📁 Folder: '$FOLDER_NAME' (ID: $FOLDER_ID)"
+          echo ""
 
+          echo "→ [3/3] Uploading files..."
+          echo ""
           OUTPUT_DIR="m3u8_out"
+          UPLOAD_SUCCESS=0
+          UPLOAD_FAIL=0
+          
           for file in "$OUTPUT_DIR"/*; do
             [ -f "$file" ] || continue
             fname=$(basename "$file")
             size=$(stat -c%s "$file")
-            echo "→ Uploading $fname ($size bytes)..."
-            
-            # Determine correct MIME type if uploading raw files (when DRIVE_DIRECT=true)
+            size_mb=$(echo "scale=2; $size / 1048576" | bc 2>/dev/null || echo "?")
+            echo "  ⬆️  Uploading: $fname (${size_mb} MB / $size bytes)"
+
+            # Determine MIME type
             ext="${fname##*.}"
-            if [ "$ext" = "zip" ] || [ "$ext" = "z01" ] || [ "$ext" = "z02" ]; then
-              MTYPE="application/zip"
-            elif [ "$ext" = "mp4" ]; then
-              MTYPE="video/mp4"
-            elif [ "$ext" = "mkv" ]; then
-              MTYPE="video/x-matroska"
-            elif [ "$ext" = "m4a" ]; then
-              MTYPE="audio/mp4"
-            else
-              MTYPE="application/octet-stream"
-            fi
+            case "$ext" in
+              zip|z01|z02|z03|z04|z05) MTYPE="application/zip" ;;
+              mp4)                      MTYPE="video/mp4" ;;
+              mkv)                      MTYPE="video/x-matroska" ;;
+              webm)                     MTYPE="video/webm" ;;
+              m4a)                      MTYPE="audio/mp4" ;;
+              mp3)                      MTYPE="audio/mpeg" ;;
+              *)                        MTYPE="application/octet-stream" ;;
+            esac
+            echo "     MIME: $MTYPE"
 
             SESSION_URI=$(curl -s -X POST \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
@@ -437,7 +679,8 @@ jobs:
               "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable" \
               -D - | tr -d '\r' | grep -i '^location:' | sed 's/^location: //i' | tr -d ' ')
             if [ -z "$SESSION_URI" ]; then
-              echo "❌ Failed to initiate upload session for $fname, skipping"
+              echo "     ❌ Failed to initiate resumable upload session – skipping"
+              UPLOAD_FAIL=$((UPLOAD_FAIL + 1))
               continue
             fi
 
@@ -447,76 +690,161 @@ jobs:
               --upload-file "$file" \
               "$SESSION_URI")
             if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
-              echo "✅ Uploaded $fname"
+              echo "     ✅ Upload complete (HTTP $HTTP_CODE)"
+              UPLOAD_SUCCESS=$((UPLOAD_SUCCESS + 1))
             else
-              echo "❌ Upload failed with HTTP $HTTP_CODE"
+              echo "     ❌ Upload failed (HTTP $HTTP_CODE)"
+              UPLOAD_FAIL=$((UPLOAD_FAIL + 1))
             fi
+            echo ""
           done
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "☁️  DRIVE UPLOAD SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  ✅ Uploaded: $UPLOAD_SUCCESS"
+          echo "  ❌ Failed:   $UPLOAD_FAIL"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-      - name: Upload to repository (split_push method)
+      - name: '📤 Upload to repository (git push)'
         if: ${{ inputs.upload_method == 'repo' }}
         env:
           BRANCH: ${{ github.ref_name }}
         run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📤  UPLOADING TO REPOSITORY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git config http.postBuffer 524288000
 
           OUTPUT_DIR="m3u8_out"
-          if [ -z "$(ls -A "$OUTPUT_DIR/")" ]; then
-            echo "No files to upload."
+          if [ -z "$(ls -A "$OUTPUT_DIR/" 2>/dev/null)" ]; then
+            echo "⚠️  No files to upload – output directory is empty."
             exit 0
           fi
 
-          git add "$OUTPUT_DIR/"
-          COMMIT_MSG="Add M3U8 downloads: $(ls -1 "$OUTPUT_DIR/" | tr '\n' ' ' | sed 's/ *$//') [skip ci]"
-          git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
+          FILE_COUNT=$(ls -1 "$OUTPUT_DIR/" | wc -l)
+          TOTAL_SIZE=$(du -sh "$OUTPUT_DIR/" | cut -f1)
+          echo "  📁 Files to commit: $FILE_COUNT"
+          echo "  💾 Total size: $TOTAL_SIZE"
+          echo "  🌿 Target branch: $BRANCH"
+          echo ""
 
+          echo "→ Staging files..."
+          git add "$OUTPUT_DIR/"
+          
+          FILE_LIST=$(ls -1 "$OUTPUT_DIR/" | tr '\n' ', ' | sed 's/,$//')
+          COMMIT_MSG="🎬 Add M3U8 downloads: $FILE_LIST [skip ci]"
+          
+          echo "→ Committing: $COMMIT_MSG"
+          git commit -m "$COMMIT_MSG" || echo "  ℹ️  Nothing to commit"
+          echo ""
+
+          echo "→ Pushing to origin/$BRANCH (with retry)..."
           RETRIES=5
           for i in $(seq 1 $RETRIES); do
-            echo "Push attempt $i..."
+            echo "  🔄 Push attempt $i/$RETRIES..."
             git pull --rebase --autostash origin "$BRANCH"
             if git push origin "$BRANCH"; then
-              echo "Push succeeded."
+              echo ""
+              echo "  ✅ Push succeeded on attempt $i"
               break
             else
-              [ $i -lt $RETRIES ] && sleep 3 || exit 1
+              if [ $i -lt $RETRIES ]; then
+                echo "  ⚠️  Push failed – retrying in 3s..."
+                sleep 3
+              else
+                echo ""
+                echo "  ❌ Push failed after $RETRIES attempts"
+                exit 1
+              fi
             fi
           done
+          
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Repository upload complete"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-      - name: Create Release and upload assets (release method)
+      - name: '🏷️ Create Release and upload assets'
         if: ${{ inputs.upload_method == 'release' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🏷️  CREATING GITHUB RELEASE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
           OUTPUT_DIR="m3u8_out"
           if [ ! -s "${OUTPUT_DIR}_assets.txt" ]; then
-            echo "No assets to release."
+            echo "⚠️  No assets to release."
             exit 0
           fi
 
           RAND5=$(mktemp -u XXXXX)
-          TAG="m3u8-downloader-${RAND5}"
-          echo "Creating release tag: $TAG"
+          TAG="m3u8-download-${RAND5}"
+          echo "  🏷️  Tag: $TAG"
+          echo "  🌿 Target: ${{ github.ref_name }}"
+          echo ""
 
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
 
-          git tag "$TAG" -m "M3U8 download release"
+          echo "→ Creating and pushing tag..."
+          git tag "$TAG" -m "M3U8 HLS download – automated release"
           git push origin "$TAG"
+          echo "  ✅ Tag pushed"
+          echo ""
 
+          echo "→ Collecting assets..."
           ASSET_ARGS=""
+          ASSET_COUNT=0
           while IFS= read -r file; do
             ASSET_ARGS="$ASSET_ARGS ${OUTPUT_DIR}/$file"
+            ASSET_COUNT=$((ASSET_COUNT + 1))
+            ASSET_SIZE=$(stat -c%s "${OUTPUT_DIR}/$file" 2>/dev/null || echo 0)
+            ASSET_SIZE_MB=$(echo "scale=2; $ASSET_SIZE / 1048576" | bc 2>/dev/null || echo "?")
+            echo "    📎 $file (${ASSET_SIZE_MB} MB)"
           done < "${OUTPUT_DIR}_assets.txt"
+          echo ""
+          echo "  📊 Total assets: $ASSET_COUNT"
+          echo ""
 
+          echo "→ Creating release via gh CLI..."
           gh release create "$TAG" $ASSET_ARGS \
-            --title "m3u8-downloader-${RAND5}" \
-            --notes "Automated release from M3U8 Downloader workflow." \
-            --target "${{ github.ref_name }}"
+            --title "🎬 M3U8 Download – ${RAND5}" \
+            --notes "Automated M3U8/HLS stream download via GitHub Actions workflow.
 
-      - name: Cleanup
+          **Quality:** ${{ inputs.quality }}
+          **Format:** ${{ inputs.merge_format }}
+          **Assets:** $ASSET_COUNT file(s)
+
+          ---
+          *Generated by downloader-m3u8 workflow*" \
+            --target "${{ github.ref_name }}"
+          
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Release created: $TAG"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: '🧹 Cleanup temporary files'
         if: always()
         run: |
-          rm -rf m3u8_out downloads_tmp urls.txt failed_urls.txt 2>/dev/null || true
-          sudo wg-quick down wg0 2>/dev/null || true
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🧹  CLEANUP"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "→ Removing temporary directories and files..."
+          rm -rf m3u8_out downloads_tmp urls.txt failed_urls.txt success_urls.txt 2>/dev/null || true
+          rm -f m3u8_out_assets.txt 2>/dev/null || true
+          echo "  ✅ Temporary files removed"
+          
+          echo "→ Ensuring VPN is disconnected..."
+          sudo wg-quick down wg0 2>/dev/null && echo "  ✅ VPN interface down" || echo "  ℹ️  No active VPN interface"
+          echo ""
+          echo "🏁 Workflow complete."
