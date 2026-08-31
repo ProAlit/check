@@ -192,7 +192,7 @@ jobs:
             exit 1
           fi
 
-      - name: ⬇️ Download with spotdl (Provider Fallback)
+      - name: ⬇️ Download with spotdl (Smart Provider Fallback)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
         continue-on-error: true
@@ -240,7 +240,6 @@ jobs:
           # 🧠 PROVIDER PRIORITY LIST (dynamic)
           # -------------------------------
           PROVIDERS=("youtube-music" "youtube" "soundcloud")
-          # Add Deezer only if token exists
           if [ -n "$DEEZER_TOKEN" ]; then
             echo "✅ Deezer token detected – adding Deezer provider."
             PROVIDERS+=("deezer")
@@ -248,17 +247,17 @@ jobs:
             echo "ℹ️ Deezer token not set – skipping Deezer provider."
           fi
 
-          # Convert array to space-separated string (safe, provider names have no spaces)
+          # Convert array to space-separated string for export
           PROVIDERS_STR="${PROVIDERS[*]}"
 
           echo "::group::⚙️ Download configuration"
-          echo "🎧 Format: $FORMAT | 🎚️ Bitrate: $BITRATE_ARG | ⚡ Parallel: $PARALLEL | 🔄 Retries per provider: $MAX_RETRIES"
+          echo "🎧 Format: $FORMAT | 🎚️ Bitrate: $BITRATE_ARG | ⚡ Parallel: $PARALLEL | 🔄 Retries per provider (only for transient errors): $MAX_RETRIES"
           echo "🔑 Custom Credentials: $USE_CUSTOM"
           echo "📻 Provider priority: $PROVIDERS_STR"
           echo "::endgroup::"
 
           # -------------------------------
-          # 🔁 Download function with provider fallback
+          # 🔁 Download function with smart fallback
           # -------------------------------
           download_with_fallback() {
             local url="$1"
@@ -266,24 +265,20 @@ jobs:
             local provider
             local down_exit
             local log_file="/tmp/spotdl-log-$$-${RANDOM}.txt"
-            local success=0
 
             # Convert provider string back to array inside subshell
             IFS=' ' read -ra PROVIDERS <<< "$PROVIDERS_STR"
 
-            # Loop through each provider in order
             for provider in "${PROVIDERS[@]}"; do
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
               echo "▶️ Trying provider: $provider for $url"
 
-              # Retry the same provider multiple times
               attempt=1
               while [ $attempt -le $MAX_RETRIES ]; do
                 echo "   🔁 Attempt $attempt/$MAX_RETRIES with $provider"
 
                 BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
-                # Cache file per attempt
                 CACHE_FILE="/tmp/spotdl-cache-$$-${RANDOM}.json"
                 touch "$CACHE_FILE"
 
@@ -294,7 +289,6 @@ jobs:
                 fi
 
                 export PYTHONUNBUFFERED=1
-                # ⚠️ IMPORTANT: Pass --audio "$provider" to use the desired provider
                 timeout 900 spotdl download "$url" \
                   --format "$FORMAT" \
                   --bitrate "$BITRATE_ARG" \
@@ -313,7 +307,7 @@ jobs:
 
                 AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
-                # Check success conditions
+                # Success checks
                 if [ $down_exit -eq 0 ]; then
                   if echo "$output" | grep -qiE '(file already exists|duplicate|Downloaded)'; then
                     echo "   ✅ Success (duplicate or downloaded) with $provider on attempt $attempt."
@@ -326,7 +320,15 @@ jobs:
                   fi
                 fi
 
-                # Print last 20 lines of log for debugging
+                # If we get here, attempt failed.
+                # Check if failure is due to "no results" → don't retry this provider
+                if echo "$output" | grep -qiE '(LookupError|No results found|returned no usable results)'; then
+                  echo "   🚫 Provider $provider reported 'no results'. Skipping remaining retries for this provider."
+                  rm -f "$log_file"
+                  break  # exit the while loop, go to next provider
+                fi
+
+                # Otherwise, print last lines and retry
                 echo "   ❌ Attempt $attempt with $provider failed (exit $down_exit). Last log lines:"
                 tail -n 20 "$log_file" || true
                 rm -f "$log_file"
@@ -334,11 +336,9 @@ jobs:
                 attempt=$((attempt + 1))
                 [ $attempt -le $MAX_RETRIES ] && sleep 3
               done
-
-              echo "⚠️ Provider $provider failed after $MAX_RETRIES attempts."
             done
 
-            # If we get here, all providers failed
+            # All providers exhausted
             echo "🚫 All providers failed for $url"
             echo "$url" >> "$FAILED"
             return 1
