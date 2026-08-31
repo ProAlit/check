@@ -199,7 +199,6 @@ jobs:
         env:
           RAW_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           RAW_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
-          DEEZER_TOKEN: ${{ secrets.DEEZER_TOKEN }}
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
           YOUTUBE_MUSIC_COOKIES: ${{ secrets.YOUTUBE_MUSIC_COOKIES }}
         shell: bash
@@ -241,8 +240,6 @@ jobs:
           # -------------------------------
           # 🍪 Cookies Setup
           # -------------------------------
-          # We create separate cookie files for YouTube and YouTube Music if secrets are provided.
-          # If not, we leave empty and spotDL will run without cookies.
           COOKIE_FILE_YT=""
           COOKIE_FILE_YT_MUSIC=""
 
@@ -259,16 +256,9 @@ jobs:
           fi
 
           # -------------------------------
-          # 🧠 PROVIDER PRIORITY LIST (dynamic)
+          # 🧠 PROVIDER PRIORITY LIST (no Deezer)
           # -------------------------------
           PROVIDERS=("youtube-music" "youtube" "soundcloud")
-          if [ -n "$DEEZER_TOKEN" ]; then
-            echo "✅ Deezer token detected – adding Deezer provider."
-            PROVIDERS+=("deezer")
-          else
-            echo "ℹ️ Deezer token not set – skipping Deezer provider."
-          fi
-
           PROVIDERS_STR="${PROVIDERS[*]}"
 
           echo "::group::⚙️ Download configuration"
@@ -394,9 +384,6 @@ jobs:
           export -f download_with_fallback
           export FORMAT BITRATE_ARG OUTPUT_TEMPLATE VPN_AVAILABLE MAX_RETRIES FAILED PROVIDERS_STR
           export COOKIE_FILE_YT COOKIE_FILE_YT_MUSIC
-          if [ -n "$DEEZER_TOKEN" ]; then
-            export DEEZER_TOKEN
-          fi
 
           echo "🚀 Starting parallel downloads (max $PARALLEL concurrent)"
           cat spotify_urls.txt | xargs -P "$PARALLEL" -I '{}' bash -c 'download_with_fallback "{}"'
