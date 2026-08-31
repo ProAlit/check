@@ -244,15 +244,17 @@ jobs:
           if [ -n "$DEEZER_TOKEN" ]; then
             echo "✅ Deezer token detected – adding Deezer provider."
             PROVIDERS+=("deezer")
-            export DEEZER_TOKEN
           else
             echo "ℹ️ Deezer token not set – skipping Deezer provider."
           fi
 
+          # Convert array to space-separated string (safe, provider names have no spaces)
+          PROVIDERS_STR="${PROVIDERS[*]}"
+
           echo "::group::⚙️ Download configuration"
           echo "🎧 Format: $FORMAT | 🎚️ Bitrate: $BITRATE_ARG | ⚡ Parallel: $PARALLEL | 🔄 Retries per provider: $MAX_RETRIES"
           echo "🔑 Custom Credentials: $USE_CUSTOM"
-          echo "📻 Provider priority: ${PROVIDERS[*]}"
+          echo "📻 Provider priority: $PROVIDERS_STR"
           echo "::endgroup::"
 
           # -------------------------------
@@ -265,6 +267,9 @@ jobs:
             local down_exit
             local log_file="/tmp/spotdl-log-$$-${RANDOM}.txt"
             local success=0
+
+            # Convert provider string back to array inside subshell
+            IFS=' ' read -ra PROVIDERS <<< "$PROVIDERS_STR"
 
             # Loop through each provider in order
             for provider in "${PROVIDERS[@]}"; do
@@ -305,7 +310,6 @@ jobs:
 
                 rm -f "$CACHE_FILE"
                 local output=$(cat "$log_file")
-                rm -f "$log_file"
 
                 AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
@@ -313,14 +317,20 @@ jobs:
                 if [ $down_exit -eq 0 ]; then
                   if echo "$output" | grep -qiE '(file already exists|duplicate|Downloaded)'; then
                     echo "   ✅ Success (duplicate or downloaded) with $provider on attempt $attempt."
+                    rm -f "$log_file"
                     return 0
                   elif [ $AFTER -gt $BEFORE ]; then
                     echo "   ✅ Success with $provider on attempt $attempt (new files: $((AFTER - BEFORE)))"
+                    rm -f "$log_file"
                     return 0
                   fi
                 fi
 
-                echo "   ❌ Attempt $attempt with $provider failed (exit $down_exit)."
+                # Print last 20 lines of log for debugging
+                echo "   ❌ Attempt $attempt with $provider failed (exit $down_exit). Last log lines:"
+                tail -n 20 "$log_file" || true
+                rm -f "$log_file"
+
                 attempt=$((attempt + 1))
                 [ $attempt -le $MAX_RETRIES ] && sleep 3
               done
@@ -335,7 +345,7 @@ jobs:
           }
 
           export -f download_with_fallback
-          export FORMAT BITRATE_ARG OUTPUT_TEMPLATE VPN_AVAILABLE MAX_RETRIES FAILED PROVIDERS
+          export FORMAT BITRATE_ARG OUTPUT_TEMPLATE VPN_AVAILABLE MAX_RETRIES FAILED PROVIDERS_STR
           if [ -n "$DEEZER_TOKEN" ]; then
             export DEEZER_TOKEN
           fi
