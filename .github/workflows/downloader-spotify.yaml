@@ -192,13 +192,14 @@ jobs:
             exit 1
           fi
 
-      - name: ⬇️ Download with spotdl (Latest v4.4.4+ & Anti-Hang)
+      - name: ⬇️ Download with spotdl (Provider Fallback)
         if: steps.parse.outputs.HAS_URLS == 'true'
         id: spotdl_download
         continue-on-error: true
         env:
           RAW_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           RAW_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          DEEZER_TOKEN: ${{ secrets.DEEZER_TOKEN }}
         shell: bash
         run: |
           set -x
@@ -211,6 +212,9 @@ jobs:
           FAILED="failed_urls_spotdl.txt"
           rm -f "$FAILED"
 
+          # -------------------------------
+          # 🔑 Credential Handling
+          # -------------------------------
           if [ "$USE_CUSTOM" = "true" ] && [ -n "$RAW_CLIENT_ID" ] && [ -n "$RAW_CLIENT_SECRET" ]; then
             echo "✅ Using your custom Spotify Developer credentials."
             export SPOTIPY_CLIENT_ID="$RAW_CLIENT_ID"
@@ -221,92 +225,126 @@ jobs:
             unset SPOTIPY_CLIENT_SECRET
           fi
 
+          # -------------------------------
+          # 🎚️ Bitrate Mapping
+          # -------------------------------
           case "$BITRATE" in
             LOSSLESS|HI_RES_LOSSLESS|HIGH|LOW) BITRATE_ARG="disable" ;;
             320k|256k|192k|128k) BITRATE_ARG="$BITRATE" ;;
             *) BITRATE_ARG="320k" ;;
           esac
 
-          # 🧠 LATEST SPOTDL FORMAT: Uses standard variables for output paths
           OUTPUT_TEMPLATE="music/{title} - {artists}.{output-ext}"
 
+          # -------------------------------
+          # 🧠 PROVIDER PRIORITY LIST (dynamic)
+          # -------------------------------
+          PROVIDERS=("youtube-music" "youtube" "soundcloud")
+          # Add Deezer only if token exists
+          if [ -n "$DEEZER_TOKEN" ]; then
+            echo "✅ Deezer token detected – adding Deezer provider."
+            PROVIDERS+=("deezer")
+            export DEEZER_TOKEN
+          else
+            echo "ℹ️ Deezer token not set – skipping Deezer provider."
+          fi
+
           echo "::group::⚙️ Download configuration"
-          echo "🎧 Format: $FORMAT | 🎚️ Bitrate: $BITRATE_ARG | ⚡ Parallel: $PARALLEL | 🔄 Retries: $MAX_RETRIES"
+          echo "🎧 Format: $FORMAT | 🎚️ Bitrate: $BITRATE_ARG | ⚡ Parallel: $PARALLEL | 🔄 Retries per provider: $MAX_RETRIES"
           echo "🔑 Custom Credentials: $USE_CUSTOM"
+          echo "📻 Provider priority: ${PROVIDERS[*]}"
           echo "::endgroup::"
 
-          download_with_retry() {
+          # -------------------------------
+          # 🔁 Download function with provider fallback
+          # -------------------------------
+          download_with_fallback() {
             local url="$1"
-            local attempt=1
-            local down_exit=0
+            local attempt
+            local provider
+            local down_exit
             local log_file="/tmp/spotdl-log-$$-${RANDOM}.txt"
+            local success=0
 
-            while [ $attempt -le $MAX_RETRIES ]; do
+            # Loop through each provider in order
+            for provider in "${PROVIDERS[@]}"; do
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-              echo "▶️ spotdl attempt $attempt/$MAX_RETRIES for: $url"
-              
-              BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
+              echo "▶️ Trying provider: $provider for $url"
 
-              # 🧠 CACHE FIX: v4.4.x expects a file path for --cache-path, NOT a directory.
-              # This prevents the API spam that causes 86400s (24-hour) bans.
-              CACHE_FILE="/tmp/spotdl-cache-$$-${RANDOM}.json"
-              touch "$CACHE_FILE"
+              # Retry the same provider multiple times
+              attempt=1
+              while [ $attempt -le $MAX_RETRIES ]; do
+                echo "   🔁 Attempt $attempt/$MAX_RETRIES with $provider"
 
-              if [ "$VPN_AVAILABLE" = "true" ]; then
-                echo "🔒 [VPN] Downloading..."
-              else
-                echo "⚠️ [Direct] Downloading..."
-              fi
+                BEFORE=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
 
-              export PYTHONUNBUFFERED=1
-              # 🧠 ANTI-HANG: 15-minute timeout per album prevents infinite network loops
-              timeout 900 spotdl download "$url" \
-                --format "$FORMAT" \
-                --bitrate "$BITRATE_ARG" \
-                --output "$OUTPUT_TEMPLATE" \
-                --cache-path "$CACHE_FILE" \
-                --threads 4 2>&1 | tee "$log_file"
-              
-              down_exit=${PIPESTATUS[0]}
-              if [ $down_exit -eq 124 ]; then
-                echo "⏱️ Process timed out after 15 minutes (Network hang detected)."
-              fi
+                # Cache file per attempt
+                CACHE_FILE="/tmp/spotdl-cache-$$-${RANDOM}.json"
+                touch "$CACHE_FILE"
 
-              rm -f "$CACHE_FILE"
-              
-              local output=$(cat "$log_file")
-              rm -f "$log_file"
-
-              AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
-
-              if [ $down_exit -eq 0 ]; then
-                if echo "$output" | grep -qiE '(file already exists|duplicate|Downloaded)'; then
-                  echo "✅ spotdl succeeded/skipped duplicate on attempt $attempt."
-                  return 0
-                elif [ $AFTER -gt $BEFORE ]; then
-                  echo "✅ spotdl succeeded on attempt $attempt (new files: $((AFTER - BEFORE)))"
-                  return 0
+                if [ "$VPN_AVAILABLE" = "true" ]; then
+                  echo "   🔒 [VPN] Downloading..."
+                else
+                  echo "   ⚠️ [Direct] Downloading..."
                 fi
-              fi
 
-              echo "❌ Attempt $attempt failed (exit code: $down_exit)"
-              attempt=$((attempt + 1))
-              if [ $attempt -le $MAX_RETRIES ]; then sleep 3; fi
+                export PYTHONUNBUFFERED=1
+                # ⚠️ IMPORTANT: Pass --audio "$provider" to use the desired provider
+                timeout 900 spotdl download "$url" \
+                  --format "$FORMAT" \
+                  --bitrate "$BITRATE_ARG" \
+                  --audio "$provider" \
+                  --output "$OUTPUT_TEMPLATE" \
+                  --cache-path "$CACHE_FILE" \
+                  --threads 4 2>&1 | tee "$log_file"
+
+                down_exit=${PIPESTATUS[0]}
+                if [ $down_exit -eq 124 ]; then
+                  echo "   ⏱️ Timeout after 15 minutes (network hang)."
+                fi
+
+                rm -f "$CACHE_FILE"
+                local output=$(cat "$log_file")
+                rm -f "$log_file"
+
+                AFTER=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
+
+                # Check success conditions
+                if [ $down_exit -eq 0 ]; then
+                  if echo "$output" | grep -qiE '(file already exists|duplicate|Downloaded)'; then
+                    echo "   ✅ Success (duplicate or downloaded) with $provider on attempt $attempt."
+                    return 0
+                  elif [ $AFTER -gt $BEFORE ]; then
+                    echo "   ✅ Success with $provider on attempt $attempt (new files: $((AFTER - BEFORE)))"
+                    return 0
+                  fi
+                fi
+
+                echo "   ❌ Attempt $attempt with $provider failed (exit $down_exit)."
+                attempt=$((attempt + 1))
+                [ $attempt -le $MAX_RETRIES ] && sleep 3
+              done
+
+              echo "⚠️ Provider $provider failed after $MAX_RETRIES attempts."
             done
 
-            echo "⚠️ spotdl failed after $MAX_RETRIES attempts for: $url"
+            # If we get here, all providers failed
+            echo "🚫 All providers failed for $url"
             echo "$url" >> "$FAILED"
             return 1
           }
 
-          export -f download_with_retry
-          export FORMAT BITRATE_ARG OUTPUT_TEMPLATE VPN_AVAILABLE MAX_RETRIES FAILED
+          export -f download_with_fallback
+          export FORMAT BITRATE_ARG OUTPUT_TEMPLATE VPN_AVAILABLE MAX_RETRIES FAILED PROVIDERS
+          if [ -n "$DEEZER_TOKEN" ]; then
+            export DEEZER_TOKEN
+          fi
 
           echo "🚀 Starting parallel downloads (max $PARALLEL concurrent)"
-          cat spotify_urls.txt | xargs -P "$PARALLEL" -I '{}' bash -c 'download_with_retry "{}"'
+          cat spotify_urls.txt | xargs -P "$PARALLEL" -I '{}' bash -c 'download_with_fallback "{}"'
 
           if [ -f "$FAILED" ]; then
-            echo "⚠️ URLs that failed:"
+            echo "⚠️ URLs that failed after all providers:"
             cat "$FAILED"
           fi
           set +x
