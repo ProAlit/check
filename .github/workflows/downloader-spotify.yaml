@@ -84,7 +84,7 @@ on:
         description: "❌ Mark workflow failed if some URLs fail?"
         required: true
         type: boolean
-        default: true
+        default: False
 
 
 permissions:
