@@ -70,7 +70,7 @@ on:
         default: false
 
       concurrent_downloads:
-        description: "⚡ Concurrent download workers"
+        description: "⚡ Concurrent URL workers"
         required: true
         type: number
         default: 2
@@ -83,8 +83,9 @@ on:
 
       raw_logs:
         description: >
-          🧪 Show raw spotDL/yt-dlp logs live?
-          Disable for clean visual logs.
+          🧪 Show full raw spotDL/yt-dlp logs live?
+          OFF = clean visual logs
+          ON = verbose raw logs
         required: true
         type: boolean
         default: false
@@ -106,35 +107,19 @@ concurrency:
 
 
 env:
-  # ================================================================
-  # LATEST / FLOATING COMPONENTS
-  # ================================================================
-
   POT_SERVER_PORT: "4416"
-
-  # ================================================================
-  # PERFORMANCE
-  # ================================================================
 
   DEFAULT_PARALLEL: "2"
   DEFAULT_RETRIES: "3"
 
   SPOTDL_THREADS: "3"
-  YTDLP_CONCURRENT_FRAGMENTS: "3"
-
-  # ================================================================
-  # NETWORK RETRIES
-  # ================================================================
 
   YTDLP_RETRIES: "8"
   YTDLP_FRAGMENT_RETRIES: "8"
   YTDLP_EXTRACTOR_RETRIES: "5"
   YTDLP_FILE_ACCESS_RETRIES: "5"
   YTDLP_SOCKET_TIMEOUT: "30"
-
-  # ================================================================
-  # GOOGLE DRIVE
-  # ================================================================
+  YTDLP_CONCURRENT_FRAGMENTS: "3"
 
   DRIVE_CHUNK_SIZE: "16777216"
 
@@ -144,7 +129,6 @@ jobs:
   music-download:
 
     runs-on: ubuntu-latest
-
     timeout-minutes: 120
 
     defaults:
@@ -159,7 +143,7 @@ jobs:
       # ============================================================
 
       - name: "📥 Checkout repository"
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: true
@@ -169,8 +153,8 @@ jobs:
       # PYTHON
       # ============================================================
 
-      - name: "🐍 Setup latest Python"
-        uses: actions/setup-python@v7
+      - name: "🐍 Setup latest Python 3.x"
+        uses: actions/setup-python@v6
         with:
           python-version: "3.x"
           check-latest: true
@@ -188,7 +172,7 @@ jobs:
 
           echo
           echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║                  🛠️ SYSTEM DEPENDENCIES                   ║"
+          echo "║                  🛠️ SYSTEM SETUP                          ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo
 
@@ -202,7 +186,7 @@ jobs:
               break
             fi
 
-            echo "⚠️ apt update failed (${attempt}/3)"
+            echo "⚠️ apt update failed: ${attempt}/3"
 
             if [ "$attempt" -eq 3 ]; then
               echo "❌ apt update failed permanently."
@@ -212,8 +196,7 @@ jobs:
             sleep $((attempt * 3))
           done
 
-
-          echo "📦 Installing FFmpeg / networking utilities..."
+          echo "📦 Installing packages..."
 
           sudo apt-get \
             -o Acquire::ForceIPv4=true \
@@ -228,15 +211,14 @@ jobs:
             aria2 \
             wireguard-tools
 
-
-          echo "✅ System dependencies installed."
+          echo "✅ System packages installed."
 
 
       # ============================================================
-      # RESOLVCONF COMPATIBILITY
+      # DNS / WIREGUARD COMPATIBILITY
       # ============================================================
 
-      - name: "🌐 Configure DNS compatibility for WireGuard"
+      - name: "🌐 Configure DNS compatibility"
         run: |
           set -Eeuo pipefail
 
@@ -245,14 +227,14 @@ jobs:
 
           if command -v resolvconf >/dev/null 2>&1; then
 
-            echo "✅ Existing resolvconf detected:"
+            echo "✅ Native resolvconf available:"
             command -v resolvconf
 
           elif command -v resolvectl >/dev/null 2>&1; then
 
-            echo "ℹ️ openresolv/resolvconf not installed."
+            echo "ℹ️ resolvconf not installed."
             echo "✅ systemd-resolved detected."
-            echo "🛠️ Creating WireGuard resolvconf compatibility wrapper."
+            echo "🛠️ Installing compatibility wrapper."
 
 
             sudo tee /usr/local/bin/resolvconf >/dev/null <<'EOF'
@@ -325,6 +307,7 @@ jobs:
             *)
 
               exit 0
+
               ;;
 
           esac
@@ -333,11 +316,11 @@ jobs:
 
             sudo chmod 755 /usr/local/bin/resolvconf
 
-            echo "✅ Compatibility wrapper installed."
+            echo "✅ resolvconf compatibility wrapper installed."
 
           else
 
-            echo "⚠️ resolvconf and resolvectl are unavailable."
+            echo "⚠️ Neither resolvconf nor resolvectl is available."
 
           fi
 
@@ -355,6 +338,7 @@ jobs:
 
           echo "::group::🦕 Deno"
 
+
           curl \
             --fail \
             --location \
@@ -364,34 +348,32 @@ jobs:
             https://deno.land/install.sh \
             | sh -s -- -y
 
+
           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+
 
           export PATH="$HOME/.deno/bin:$PATH"
 
+
+          echo "Deno:"
           deno --version
+
 
           echo "::endgroup::"
 
 
       # ============================================================
-      # PYTHON DEPENDENCIES
+      # PYTHON PACKAGES - ALWAYS LATEST
       # ============================================================
 
-      - name: "📦 Install latest Python tools"
+      - name: "📦 Install latest Python packages"
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
           PIP_NO_INPUT: "1"
         run: |
           set -Eeuo pipefail
 
-          echo
-          echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║                  📦 PYTHON TOOLCHAIN                       ║"
-          echo "╚══════════════════════════════════════════════════════════════╝"
-          echo
-
-
-          echo "::group::⬆️ pip"
+          echo "::group::⬆️ Upgrade pip"
 
           python -m pip install \
             --upgrade \
@@ -404,7 +386,7 @@ jobs:
           echo "::endgroup::"
 
 
-          echo "::group::🎵 spotDL"
+          echo "::group::🎵 Install latest spotDL"
 
           python -m pip install \
             --upgrade \
@@ -415,7 +397,7 @@ jobs:
           echo "::endgroup::"
 
 
-          echo "::group::📺 yt-dlp"
+          echo "::group::📺 Install latest yt-dlp"
 
           python -m pip install \
             --upgrade \
@@ -426,7 +408,7 @@ jobs:
           echo "::endgroup::"
 
 
-          echo "::group::🧩 yt-dlp EJS"
+          echo "::group::🧩 Install latest yt-dlp EJS"
 
           python -m pip install \
             --upgrade \
@@ -437,7 +419,7 @@ jobs:
           echo "::endgroup::"
 
 
-          echo "::group::🛡️ bgutil PO-token plugin"
+          echo "::group::🛡️ Install latest bgutil PO-token plugin"
 
           python -m pip install \
             --upgrade \
@@ -449,50 +431,50 @@ jobs:
 
 
       # ============================================================
-      # TOOLCHAIN INFORMATION
+      # TOOLCHAIN
       # ============================================================
 
-      - name: "🔎 Toolchain diagnostics"
+      - name: "🔎 Show installed versions"
         run: |
           set -Eeuo pipefail
 
           echo
           echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║                   🔎 TOOLCHAIN                             ║"
+          echo "║                    🔎 TOOLCHAIN                            ║"
           echo "╠══════════════════════════════════════════════════════════════╣"
 
-          echo "║ Python:"
+          echo "Python:"
           python --version
 
           echo
-          echo "║ spotDL:"
+          echo "spotDL:"
           spotdl --version || true
 
           echo
-          echo "║ yt-dlp:"
+          echo "yt-dlp:"
           yt-dlp --version
 
           echo
-          echo "║ FFmpeg:"
+          echo "FFmpeg:"
           ffmpeg -version | head -n1
 
           echo
-          echo "║ FFprobe:"
+          echo "FFprobe:"
           ffprobe -version | head -n1
 
           echo
-          echo "║ Deno:"
+          echo "Deno:"
           deno --version | head -n1
 
           echo
-          echo "║ aria2:"
+          echo "aria2:"
           aria2c --version | head -n1
 
           echo
-          echo "║ Python packages:"
+          echo "Python packages:"
           python -m pip list |
             grep -Ei \
-              'spotdl|yt-dlp|bgutil|ejs|spotipy|mutagen|rapidfuzz' \
+              'spotdl|yt-dlp|ejs|bgutil|spotipy|mutagen|rapidfuzz' \
             || true
 
           echo
@@ -507,7 +489,9 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          rm -rf work music
+          rm -rf \
+            work \
+            music
 
           mkdir -p \
             work/downloads \
@@ -522,7 +506,7 @@ jobs:
 
 
       # ============================================================
-      # INPUT PARSING
+      # URL PARSING
       # ============================================================
 
       - name: "🔗 Parse and validate URLs"
@@ -532,8 +516,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-
-          echo "::group::🔗 URL parsing"
+          echo "::group::🔗 URL processing"
 
 
           : > work/input_urls.txt
@@ -615,7 +598,6 @@ jobs:
               "$url" \
               >> work/jobs.tsv
 
-
           done < work/input_urls.txt
 
 
@@ -662,7 +644,6 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-
           echo "::group::🔒 WireGuard"
 
 
@@ -681,7 +662,7 @@ jobs:
 
           if [ -z "$WG_CONFIG" ]; then
 
-            echo "⚠️ VPN requested but WG_CONFIG is empty."
+            echo "⚠️ VPN requested, but WG_CONFIG is empty."
 
             echo "vpn_available=false" >> "$GITHUB_OUTPUT"
 
@@ -705,13 +686,10 @@ jobs:
             /etc/wireguard/wg0.conf
 
 
-          echo "🚀 Starting WireGuard..."
+          echo "🚀 Starting wg0..."
 
 
           if sudo wg-quick up wg0; then
-
-            echo "✅ WireGuard connected."
-
 
             public_ip="$(
               curl \
@@ -721,11 +699,11 @@ jobs:
                 --max-time 15 \
                 https://api.ipify.org \
               || echo "unavailable"
-            )"
+            )
 
 
+            echo "✅ WireGuard connected."
             echo "🌐 Public IPv4: $public_ip"
-
 
             echo "vpn_available=true" >> "$GITHUB_OUTPUT"
 
@@ -737,7 +715,6 @@ jobs:
               >/dev/null 2>&1 \
               || true
 
-
             echo "vpn_available=false" >> "$GITHUB_OUTPUT"
 
           fi
@@ -747,7 +724,7 @@ jobs:
 
 
       # ============================================================
-      # BGUTIL PO TOKEN PROVIDER
+      # BGUTIL PO TOKEN SERVER
       # ============================================================
 
       - name: "🛡️ Start latest bgutil PO-token provider"
@@ -755,14 +732,14 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-
           echo "::group::🛡️ bgutil PO-token provider"
 
 
           IMAGE="brainicism/bgutil-ytdlp-pot-provider:latest"
 
 
-          echo "🐳 Image: $IMAGE"
+          echo "🐳 Pulling:"
+          echo "   $IMAGE"
 
 
           pulled="false"
@@ -778,22 +755,19 @@ jobs:
             fi
 
 
-            echo "⚠️ Docker pull failed (${attempt}/3)"
+            echo "⚠️ Docker pull failed: ${attempt}/3"
 
 
-            if [ "$attempt" -eq 3 ]; then
-              break
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 3))
             fi
-
-
-            sleep $((attempt * 3))
 
           done
 
 
           if [ "$pulled" != "true" ]; then
 
-            echo "⚠️ bgutil image unavailable."
+            echo "⚠️ bgutil provider unavailable."
 
             echo "pot_available=false" >> "$GITHUB_OUTPUT"
 
@@ -809,10 +783,9 @@ jobs:
             || true
 
 
-          echo "🚀 Starting bgutil..."
+          echo "🚀 Starting bgutil on 127.0.0.1:${POT_SERVER_PORT}"
 
 
-          # Default bgutil HTTP port is 4416.
           docker run \
             --name bgutil-provider \
             --detach \
@@ -835,7 +808,7 @@ jobs:
               --fail \
               --max-time 3 \
               "http://127.0.0.1:${POT_SERVER_PORT}/ping" \
-              >/tmp/bgutil-ping.txt \
+              >/tmp/bgutil-ping.json \
               2>/dev/null; then
 
               ready="true"
@@ -853,6 +826,8 @@ jobs:
 
             echo "✅ bgutil PO-token provider is ready."
 
+            cat /tmp/bgutil-ping.json || true
+
             echo "pot_available=true" >> "$GITHUB_OUTPUT"
 
           else
@@ -864,7 +839,6 @@ jobs:
               2>&1 \
               || true
 
-
             echo "pot_available=false" >> "$GITHUB_OUTPUT"
 
           fi
@@ -874,17 +848,16 @@ jobs:
 
 
       # ============================================================
-      # PO TOKEN TEST
+      # BGUTIL / YT-DLP VERIFICATION
       # ============================================================
 
-      - name: "🧪 Verify bgutil + yt-dlp"
+      - name: "🧪 Verify yt-dlp and PO-token provider"
         if: steps.pot.outputs.pot_available == 'true'
         continue-on-error: true
         run: |
           set -Eeuo pipefail
 
-
-          echo "::group::🧪 PO-token verification"
+          echo "::group::🧪 PO-token integration"
 
 
           TEST_URL="https://www.youtube.com/watch?v=BaW_jenozKc"
@@ -896,21 +869,19 @@ jobs:
             --skip-download \
             --extractor-args \
               "youtube:player-client=mweb" \
-            --extractor-args \
-              "youtubepot-bgutilhttp:base_url=http://127.0.0.1:${POT_SERVER_PORT}" \
             "$TEST_URL" \
             > work/logs/pot-verification.log \
             2>&1 \
             || true
 
 
-          echo "Relevant PO-token information:"
+          echo "PO-token diagnostics:"
 
 
           grep -iE \
             'PO Token|bgutil|player-client|challenge' \
             work/logs/pot-verification.log \
-            | tail -n 80 \
+            | tail -n 100 \
             || true
 
 
@@ -918,7 +889,7 @@ jobs:
 
 
       # ============================================================
-      # DOWNLOAD ENGINE
+      # DOWNLOAD
       # ============================================================
 
       - name: "⬇️ Download media"
@@ -932,10 +903,13 @@ jobs:
 
           USE_CUSTOM_CREDENTIALS: ${{ inputs.use_custom_credentials }}
 
+          OUTPUT_FORMAT: ${{ inputs.output_format }}
+          AUDIO_QUALITY: ${{ inputs.audio_quality }}
+
           PARALLEL_INPUT: ${{ inputs.concurrent_downloads }}
           RETRIES_INPUT: ${{ inputs.retry_count }}
 
-          RAW_LOGS_INPUT: ${{ inputs.raw_logs }}
+          SHOW_RAW_LOGS: ${{ inputs.raw_logs }}
 
           VPN_AVAILABLE: ${{ steps.vpn.outputs.vpn_available }}
           POT_AVAILABLE: ${{ steps.pot.outputs.pot_available }}
@@ -945,12 +919,14 @@ jobs:
 
 
           # ==========================================================
-          # INPUTS
+          # NORMALIZE INPUTS
           # ==========================================================
+
+          FORMAT="$OUTPUT_FORMAT"
+          QUALITY="$AUDIO_QUALITY"
 
           PARALLEL="$PARALLEL_INPUT"
           MAX_RETRIES="$RETRIES_INPUT"
-          SHOW_RAW_LOGS="$RAW_LOGS_INPUT"
 
 
           if ! [[ "$PARALLEL" =~ ^[1-8]$ ]]; then
@@ -962,14 +938,6 @@ jobs:
             MAX_RETRIES="$DEFAULT_RETRIES"
           fi
 
-
-          FORMAT="${{ inputs.output_format }}"
-          QUALITY="${{ inputs.audio_quality }}"
-
-
-          # ==========================================================
-          # BITRATE
-          # ==========================================================
 
           case "$QUALITY" in
 
@@ -1053,10 +1021,10 @@ jobs:
 
 
           # ==========================================================
-          # VISUAL LOGGING
+          # LOGGING HELPERS
           # ==========================================================
 
-          timestamp() {
+          now() {
             date '+%H:%M:%S'
           }
 
@@ -1064,64 +1032,60 @@ jobs:
           log() {
 
             local level="$1"
-            local index="$2"
+            local id="$2"
             local message="$3"
 
+            local icon="•"
 
-            local symbol
 
             case "$level" in
 
               START)
-                symbol="▶"
+                icon="▶"
                 ;;
 
               SEARCH)
-                symbol="🔎"
-                ;;
-
-              MATCH)
-                symbol="🎯"
+                icon="🔎"
                 ;;
 
               AUTH)
-                symbol="🔐"
+                icon="🔐"
                 ;;
 
               PROVIDER)
-                symbol="🔌"
+                icon="🔌"
+                ;;
+
+              MATCH)
+                icon="🎯"
                 ;;
 
               DOWNLOAD)
-                symbol="⬇"
+                icon="⬇"
                 ;;
 
               RETRY)
-                symbol="↻"
+                icon="↻"
                 ;;
 
               VERIFY)
-                symbol="✓"
+                icon="✓"
                 ;;
 
               SUCCESS)
-                symbol="✅"
+                icon="✅"
                 ;;
 
               WARN)
-                symbol="⚠"
+                icon="⚠"
                 ;;
 
               FAILED)
-                symbol="❌"
+                icon="❌"
                 ;;
 
               DONE)
-                symbol="◆"
-                ;;
-
-              *)
-                symbol="•"
+                icon="◆"
                 ;;
 
             esac
@@ -1129,10 +1093,10 @@ jobs:
 
             printf \
               '[%s] %-9s #%04d │ %s %s\n' \
-              "$(timestamp)" \
+              "$(now)" \
               "$level" \
-              "$index" \
-              "$symbol" \
+              "$id" \
+              "$icon" \
               "$message"
           }
 
@@ -1150,7 +1114,7 @@ jobs:
 
 
           # ==========================================================
-          # ERROR CLASSIFICATION
+          # ERROR CLASSIFIER
           # ==========================================================
 
           classify_error() {
@@ -1158,7 +1122,6 @@ jobs:
             local logfile="$1"
 
 
-            # CLI/configuration errors should NEVER be retried.
             if grep -qiE \
               'invalid choice:|unrecognized arguments|no such option|usage: spotdl|argument .* error' \
               "$logfile"; then
@@ -1234,55 +1197,19 @@ jobs:
 
 
           # ==========================================================
-          # RAW LOG STREAMER
-          # ==========================================================
-
-          stream_raw_log() {
-
-            local logfile="$1"
-            local index="$2"
-            local component="$3"
-
-
-            if [ "$SHOW_RAW_LOGS" != "true" ]; then
-              return 0
-            fi
-
-
-            echo
-            echo "┌─ RAW ${component} LOG | TRACK #$(printf '%04d' "$index") ─────"
-
-
-            while IFS= read -r line; do
-
-              printf \
-                '│ #%04d │ %s\n' \
-                "$index" \
-                "$line"
-
-            done < "$logfile"
-
-
-            echo "└─ END RAW ${component} LOG ────────────────────────────────"
-            echo
-
-          }
-
-
-          # ==========================================================
           # DETECT ACTUAL SPOTDL PROVIDERS
           # ==========================================================
 
           detect_spotdl_providers() {
 
-            local help
+            local help_text
 
-            help="$(
+            help_text="$(
               spotdl --help 2>&1
             )"
 
 
-            SPOTDL_PROVIDERS=()
+            SPOTDL_PROVIDERS=""
 
 
             local candidates=(
@@ -1302,39 +1229,45 @@ jobs:
 
               if grep -Fq \
                 "$provider" \
-                <<< "$help"; then
+                <<< "$help_text"; then
 
-                SPOTDL_PROVIDERS+=("$provider")
+                if [ -z "$SPOTDL_PROVIDERS" ]; then
+
+                  SPOTDL_PROVIDERS="$provider"
+
+                else
+
+                  SPOTDL_PROVIDERS="${SPOTDL_PROVIDERS} ${provider}"
+
+                fi
 
               fi
 
             done
 
 
-            if [ "${#SPOTDL_PROVIDERS[@]}" -eq 0 ]; then
+            if [ -z "$SPOTDL_PROVIDERS" ]; then
 
-              echo "❌ No usable spotDL providers detected."
+              echo "❌ No supported spotDL audio provider detected."
 
               echo
-              echo "$help"
+              echo "$help_text"
 
               return 1
 
             fi
 
 
-            section "🎵 spotDL PROVIDER CAPABILITIES"
+            section "🎵 SPOTDL PROVIDERS"
 
 
-            echo "Installed spotDL supports:"
+            echo "Detected providers:"
 
 
-            for provider in "${SPOTDL_PROVIDERS[@]}"; do
+            for provider in $SPOTDL_PROVIDERS; do
               echo "  ✓ $provider"
             done
 
-
-            echo
 
             return 0
           }
@@ -1344,27 +1277,22 @@ jobs:
 
 
           # ==========================================================
-          # DISPLAY ENGINE CONFIG
+          # DISPLAY CONFIGURATION
           # ==========================================================
 
           section "🎵 DOWNLOAD ENGINE"
 
 
-          echo "Format         : $FORMAT"
-          echo "Quality        : $QUALITY"
-          echo "Effective rate : $BITRATE"
-          echo "Workers        : $PARALLEL"
-          echo "Retries        : $MAX_RETRIES"
-          echo "VPN            : $VPN_AVAILABLE"
-          echo "PO Token       : $POT_AVAILABLE"
-          echo "Raw logs       : $SHOW_RAW_LOGS"
-          echo "spotDL threads : $SPOTDL_THREADS"
-          echo "YT-DLP fragments: $YTDLP_CONCURRENT_FRAGMENTS"
-
-
-          echo
-          echo "Provider chain:"
-          printf '  %s\n' "${SPOTDL_PROVIDERS[@]}"
+          echo "Output format     : $FORMAT"
+          echo "Requested quality : $QUALITY"
+          echo "Effective bitrate : $BITRATE"
+          echo "Workers           : $PARALLEL"
+          echo "Retries           : $MAX_RETRIES"
+          echo "VPN               : $VPN_AVAILABLE"
+          echo "PO-token provider : $POT_AVAILABLE"
+          echo "Raw logs          : $SHOW_RAW_LOGS"
+          echo "spotDL threads    : $SPOTDL_THREADS"
+          echo "YT-DLP fragments  : $YTDLP_CONCURRENT_FRAGMENTS"
 
 
           # ==========================================================
@@ -1373,21 +1301,30 @@ jobs:
 
           download_spotdl() {
 
-            local index="$1"
+            local id="$1"
             local type="$2"
             local url="$3"
 
 
-            local dir="work/downloads/${index}"
+            local dir="work/downloads/${id}"
+            local main_log="work/logs/${id}-spotdl.log"
 
 
-            mkdir -p "$dir"
-            mkdir -p "${dir}/cache"
+            mkdir -p "$dir/cache"
 
 
-            local main_log
-            main_log="work/logs/${index}-spotdl.log"
+            # --------------------------------------------------------
+            # Split provider string into an array safely.
+            # --------------------------------------------------------
 
+            local -a providers
+
+            read -r -a providers <<< "$SPOTDL_PROVIDERS"
+
+
+            # --------------------------------------------------------
+            # Build command
+            # --------------------------------------------------------
 
             local -a cmd
 
@@ -1398,7 +1335,7 @@ jobs:
               "$url"
 
               --audio
-              "${SPOTDL_PROVIDERS[@]}"
+              "${providers[@]}"
 
               --format
               "$FORMAT"
@@ -1434,12 +1371,9 @@ jobs:
             )
 
 
-            # --------------------------------------------------------
-            # Raw mode
-            # --------------------------------------------------------
-
             if [ "$SHOW_RAW_LOGS" = "true" ]; then
 
+              # DEBUG is opt-in because it can be very noisy.
               cmd+=(
                 --log-level
                 DEBUG
@@ -1449,7 +1383,7 @@ jobs:
 
 
             # --------------------------------------------------------
-            # Spotify credentials
+            # Spotify authentication
             # --------------------------------------------------------
 
             if [ "$USE_CUSTOM_CREDENTIALS" = "true" ] &&
@@ -1469,21 +1403,21 @@ jobs:
 
               log \
                 "AUTH" \
-                "$index" \
-                "Custom Spotify credentials enabled."
+                "$id" \
+                "Custom Spotify API credentials enabled."
 
             else
 
               log \
                 "AUTH" \
-                "$index" \
+                "$id" \
                 "Using spotDL default Spotify client."
 
             fi
 
 
             # --------------------------------------------------------
-            # Cookies
+            # YouTube cookie
             # --------------------------------------------------------
 
             if [ -n "$COOKIE_YTM" ]; then
@@ -1496,7 +1430,7 @@ jobs:
 
               log \
                 "AUTH" \
-                "$index" \
+                "$id" \
                 "YouTube Music cookies enabled."
 
             elif [ -n "$COOKIE_YT" ]; then
@@ -1509,7 +1443,7 @@ jobs:
 
               log \
                 "AUTH" \
-                "$index" \
+                "$id" \
                 "YouTube cookies enabled."
 
             fi
@@ -1517,31 +1451,32 @@ jobs:
 
             # --------------------------------------------------------
             # yt-dlp arguments
+            #
+            # IMPORTANT:
+            # spotDL internally shlex-splits this string, so don't
+            # put another layer of shell quoting around it.
             # --------------------------------------------------------
 
             local ytdlp_args
 
 
-            ytdlp_args=$(
-              cat <<EOF
-          --retries ${YTDLP_RETRIES}
-          --fragment-retries ${YTDLP_FRAGMENT_RETRIES}
-          --extractor-retries ${YTDLP_EXTRACTOR_RETRIES}
-          --file-access-retries ${YTDLP_FILE_ACCESS_RETRIES}
-          --socket-timeout ${YTDLP_SOCKET_TIMEOUT}
-          --concurrent-fragments ${YTDLP_CONCURRENT_FRAGMENTS}
-          --throttled-rate 100K
-          --sleep-requests 1
-          --extractor-args youtube:player-client=mweb
-          --extractor-args youtubepot-bgutilhttp:base_url=http://127.0.0.1:${POT_SERVER_PORT}
-          EOF
-            )
+            ytdlp_args="
+            --retries ${YTDLP_RETRIES}
+            --fragment-retries ${YTDLP_FRAGMENT_RETRIES}
+            --extractor-retries ${YTDLP_EXTRACTOR_RETRIES}
+            --file-access-retries ${YTDLP_FILE_ACCESS_RETRIES}
+            --socket-timeout ${YTDLP_SOCKET_TIMEOUT}
+            --concurrent-fragments ${YTDLP_CONCURRENT_FRAGMENTS}
+            --throttled-rate 100K
+            --sleep-requests 1
+            --extractor-args youtube:player-client=mweb
+            --extractor-args youtubepot-bgutilhttp:base_url=http://127.0.0.1:${POT_SERVER_PORT}
+            "
 
 
             if [ "$SHOW_RAW_LOGS" = "true" ]; then
 
-              ytdlp_args="${ytdlp_args}
-          --verbose"
+              ytdlp_args="${ytdlp_args} --verbose"
 
             fi
 
@@ -1554,15 +1489,19 @@ jobs:
 
             log \
               "PROVIDER" \
-              "$index" \
-              "Fallback chain: ${SPOTDL_PROVIDERS[*]}"
+              "$id" \
+              "Provider chain: ${SPOTDL_PROVIDERS}"
 
 
             log \
               "DOWNLOAD" \
-              "$index" \
-              "Starting Spotify metadata/audio resolution."
+              "$id" \
+              "Starting spotDL."
 
+
+            # --------------------------------------------------------
+            # Attempts
+            # --------------------------------------------------------
 
             local attempt=1
 
@@ -1570,13 +1509,13 @@ jobs:
             while [ "$attempt" -le "$MAX_RETRIES" ]; do
 
               local attempt_log
-              attempt_log="work/logs/${index}-spotdl-attempt-${attempt}.log"
+              attempt_log="work/logs/${id}-spotdl-attempt-${attempt}.log"
 
 
               log \
-                "START" \
-                "$index" \
-                "spotDL attempt ${attempt}/${MAX_RETRIES}"
+                "TRY" \
+                "$id" \
+                "Attempt ${attempt}/${MAX_RETRIES}"
 
 
               local exit_code=0
@@ -1590,6 +1529,7 @@ jobs:
                 stdbuf \
                   -oL \
                   -eL \
+                  timeout 900 \
                   "${cmd[@]}" \
                   2>&1 |
                 tee "$attempt_log" |
@@ -1597,8 +1537,8 @@ jobs:
 
                   printf \
                     '[%s] RAW       #%04d │ %s\n' \
-                    "$(timestamp)" \
-                    "$index" \
+                    "$(now)" \
+                    "$id" \
                     "$line"
 
                 done
@@ -1611,7 +1551,8 @@ jobs:
 
               else
 
-                "${cmd[@]}" \
+                timeout 900 \
+                  "${cmd[@]}" \
                   > "$attempt_log" \
                   2>&1 \
                   || exit_code=$?
@@ -1642,18 +1583,15 @@ jobs:
                    \) |
                  grep -q .; then
 
-
                 log \
                   "VERIFY" \
-                  "$index" \
-                  "spotDL produced an audio file."
-
+                  "$id" \
+                  "Audio file detected."
 
                 log \
                   "SUCCESS" \
-                  "$index" \
-                  "spotDL completed successfully."
-
+                  "$id" \
+                  "spotDL download succeeded."
 
                 return 0
 
@@ -1676,9 +1614,8 @@ jobs:
 
                   log \
                     "FAILED" \
-                    "$index" \
-                    "spotDL CLI/configuration error; stopping retries."
-
+                    "$id" \
+                    "spotDL configuration/CLI error. Retry disabled."
 
                   if [ "$SHOW_RAW_LOGS" != "true" ]; then
 
@@ -1687,10 +1624,9 @@ jobs:
 
                     tail -n 40 "$attempt_log" || true
 
-                    echo "└───────────────────────────────────────────────────────────"
+                    echo "└────────────────────────────────────────────────────────────"
 
                   fi
-
 
                   return 1
 
@@ -1701,8 +1637,8 @@ jobs:
 
                   log \
                     "WARN" \
-                    "$index" \
-                    "No provider returned a usable match."
+                    "$id" \
+                    "No usable provider result."
 
                   return 1
 
@@ -1713,7 +1649,7 @@ jobs:
 
                   log \
                     "WARN" \
-                    "$index" \
+                    "$id" \
                     "Bot/authentication restriction detected."
 
                   return 1
@@ -1725,15 +1661,15 @@ jobs:
 
                   log \
                     "WARN" \
-                    "$index" \
-                    "Requested output format unavailable."
+                    "$id" \
+                    "Requested format unavailable."
 
                   return 1
 
                   ;;
 
 
-                RATE_LIMIT)
+                RATE_LIMIT|NETWORK)
 
                   if [ "$attempt" -lt "$MAX_RETRIES" ]; then
 
@@ -1746,31 +1682,8 @@ jobs:
 
                     log \
                       "RETRY" \
-                      "$index" \
-                      "Rate limited; waiting ${delay}s."
-
-                    sleep "$delay"
-
-                  fi
-
-                  ;;
-
-
-                NETWORK)
-
-                  if [ "$attempt" -lt "$MAX_RETRIES" ]; then
-
-                    local delay
-
-                    delay=$((2 ** attempt))
-
-                    [ "$delay" -gt 30 ] && delay=30
-
-
-                    log \
-                      "RETRY" \
-                      "$index" \
-                      "Network failure; waiting ${delay}s."
+                      "$id" \
+                      "${error_class}; retry in ${delay}s."
 
                     sleep "$delay"
 
@@ -1781,15 +1694,21 @@ jobs:
 
                 FORBIDDEN)
 
-                  log \
-                    "WARN" \
-                    "$index" \
-                    "HTTP 403 / forbidden."
-
-
                   if [ "$attempt" -lt "$MAX_RETRIES" ]; then
 
-                    sleep $((attempt * 2))
+                    local delay
+
+                    delay=$((attempt * 2))
+
+                    [ "$delay" -gt 20 ] && delay=20
+
+
+                    log \
+                      "RETRY" \
+                      "$id" \
+                      "HTTP 403; retry in ${delay}s."
+
+                    sleep "$delay"
 
                   fi
 
@@ -1809,8 +1728,8 @@ jobs:
 
                     log \
                       "RETRY" \
-                      "$index" \
-                      "Unknown failure; waiting ${delay}s."
+                      "$id" \
+                      "Unknown failure; retry in ${delay}s."
 
                     sleep "$delay"
 
@@ -1826,24 +1745,10 @@ jobs:
             done
 
 
-            if [ "$SHOW_RAW_LOGS" != "true" ]; then
-
-              echo
-              echo "┌─ LAST spotDL LOG | TRACK #$(printf '%04d' "$index") ─────────"
-
-
-              tail -n 35 "$main_log" || true
-
-
-              echo "└──────────────────────────────────────────────────────────────"
-
-            fi
-
-
             log \
               "FAILED" \
-              "$index" \
-              "spotDL exhausted its retry budget."
+              "$id" \
+              "spotDL exhausted all attempts."
 
 
             return 1
@@ -1856,13 +1761,13 @@ jobs:
 
           download_direct() {
 
-            local index="$1"
+            local id="$1"
             local type="$2"
             local url="$3"
 
 
-            local dir="work/downloads/${index}"
-            local logfile="work/logs/${index}-direct.log"
+            local dir="work/downloads/${id}"
+            local logfile="work/logs/${id}-direct.log"
 
 
             mkdir -p "$dir"
@@ -1925,10 +1830,7 @@ jobs:
             fi
 
 
-            # --------------------------------------------------------
-            # Cookies
-            # --------------------------------------------------------
-
+            # Cookies.
             if [[ "$url" == *music.youtube.com* ]] &&
                [ -n "$COOKIE_YTM" ]; then
 
@@ -1956,8 +1858,8 @@ jobs:
 
             log \
               "DOWNLOAD" \
-              "$index" \
-              "Direct yt-dlp download started."
+              "$id" \
+              "Starting direct yt-dlp."
 
 
             local exit_code=0
@@ -1971,6 +1873,7 @@ jobs:
               stdbuf \
                 -oL \
                 -eL \
+                timeout 900 \
                 "${cmd[@]}" \
                 2>&1 |
               tee "$logfile" |
@@ -1978,8 +1881,8 @@ jobs:
 
                 printf \
                   '[%s] RAW       #%04d │ %s\n' \
-                  "$(timestamp)" \
-                  "$index" \
+                  "$(now)" \
+                  "$id" \
                   "$line"
 
               done
@@ -1992,7 +1895,8 @@ jobs:
 
             else
 
-              "${cmd[@]}" \
+              timeout 900 \
+                "${cmd[@]}" \
                 > "$logfile" \
                 2>&1 \
                 || exit_code=$?
@@ -2008,15 +1912,19 @@ jobs:
                    -o -iname '*.m4a' \
                    -o -iname '*.opus' \
                    -o -iname '*.aac' \
+                   -o -iname '*.mp3' \
                  \) |
                grep -q .; then
 
+              log \
+                "VERIFY" \
+                "$id" \
+                "Direct media file detected."
 
               log \
                 "SUCCESS" \
-                "$index" \
-                "Direct yt-dlp completed."
-
+                "$id" \
+                "Direct yt-dlp succeeded."
 
               return 0
 
@@ -2028,68 +1936,20 @@ jobs:
             error_class="$(classify_error "$logfile")"
 
 
-            case "$error_class" in
-
-              CONFIGURATION)
-
-                log \
-                  "FAILED" \
-                  "$index" \
-                  "yt-dlp configuration error."
-
-                ;;
-
-
-              BOT_DETECTION)
-
-                log \
-                  "WARN" \
-                  "$index" \
-                  "YouTube bot/auth restriction."
-
-                ;;
-
-
-              RATE_LIMIT)
-
-                log \
-                  "WARN" \
-                  "$index" \
-                  "YouTube rate limit."
-
-                ;;
-
-
-              NETWORK)
-
-                log \
-                  "WARN" \
-                  "$index" \
-                  "Network error."
-
-                ;;
-
-
-              *)
-
-                log \
-                  "WARN" \
-                  "$index" \
-                  "Direct yt-dlp failed: ${error_class}."
-
-                ;;
-
-            esac
+            log \
+              "WARN" \
+              "$id" \
+              "Direct yt-dlp failed: ${error_class}."
 
 
             if [ "$SHOW_RAW_LOGS" != "true" ]; then
 
               echo
-              echo "┌─ LAST yt-dlp LOG | TRACK #$(printf '%04d' "$index") ──────────"
+              echo "┌─ LAST yt-dlp LOG | TRACK #$(printf '%04d' "$id") ──────────"
 
               tail -n 35 "$logfile" || true
 
-              echo "└──────────────────────────────────────────────────────────────"
+              echo "└────────────────────────────────────────────────────────────"
 
             fi
 
@@ -2104,21 +1964,20 @@ jobs:
 
           write_result() {
 
-            local index="$1"
+            local id="$1"
             local type="$2"
             local url="$3"
             local status="$4"
             local provider="$5"
-            local attempts="$6"
-            local reason="$7"
-            local started="$8"
-            local finished="$9"
+            local reason="$6"
+            local started="$7"
+            local finished="$8"
 
 
-            local dir="work/downloads/${index}"
+            local dir="work/downloads/${id}"
 
 
-            mapfile -t output_files < <(
+            mapfile -t files < <(
               find "$dir" \
                 -type f \
                 \( \
@@ -2135,36 +1994,34 @@ jobs:
             )
 
 
-            printf '%s\n' "${output_files[@]}" |
+            printf '%s\n' "${files[@]}" |
               jq -R -s \
                 'split("\n") | map(select(length > 0))' \
               > "${dir}/files.json"
 
 
             jq -n \
-              --arg index "$index" \
+              --arg id "$id" \
               --arg type "$type" \
               --arg url "$url" \
               --arg status "$status" \
               --arg provider "$provider" \
-              --arg attempts "$attempts" \
               --arg reason "$reason" \
               --arg started "$started" \
               --arg finished "$finished" \
               --slurpfile files "${dir}/files.json" \
               '{
-                index: ($index | tonumber),
+                index: ($id | tonumber),
                 input_type: $type,
                 url: $url,
                 status: $status,
                 provider: $provider,
-                attempts: ($attempts | tonumber),
                 reason: $reason,
                 started_at: $started,
                 finished_at: $finished,
                 output_files: $files[0]
               }' \
-              > "work/results/${index}.json"
+              > "work/results/${id}.json"
 
 
             rm -f "${dir}/files.json"
@@ -2172,62 +2029,64 @@ jobs:
 
 
           # ==========================================================
-          # SINGLE URL WORKER
+          # PROCESS ONE INPUT
           # ==========================================================
 
           download_one() {
 
-            local index="$1"
+            local id="$1"
             local type="$2"
             local url="$3"
 
 
-            local started_at
-            started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local started
+
+            started="$(
+              date -u '+%Y-%m-%dT%H:%M:%SZ'
+            )"
 
 
             local status="failed"
             local provider="none"
-            local reason="all download strategies failed"
+            local reason="all strategies failed"
 
 
             echo
             echo "╭──────────────────────────────────────────────────────────────╮"
-            printf '│ 🎵 TRACK #%04d                                              │\n' "$index"
+            printf '│ 🎵 TRACK #%04d                                               │\n' "$id"
             echo "├──────────────────────────────────────────────────────────────┤"
-            printf '│ Type     : %-49s │\n' "$type"
-            printf '│ URL      : %-49s │\n' "$url"
+            printf '│ Type : %-54s │\n' "$type"
+            printf '│ URL  : %-54s │\n' "$url"
             echo "╰──────────────────────────────────────────────────────────────╯"
 
 
             log \
               "START" \
-              "$index" \
+              "$id" \
               "Processing ${type} input."
 
 
             # --------------------------------------------------------
-            # Direct source
+            # Direct URL
             # --------------------------------------------------------
 
             if [[ "$type" == "youtube" ]] ||
                [[ "$type" == "soundcloud" ]]; then
 
-
               log \
                 "SEARCH" \
-                "$index" \
-                "Input is a direct media URL; bypassing metadata search."
+                "$id" \
+                "Direct media URL detected."
 
 
               if download_direct \
-                "$index" \
+                "$id" \
                 "$type" \
                 "$url"; then
 
                 status="success"
                 provider="yt-dlp-direct"
-                reason="direct source download succeeded"
+                reason="direct media download succeeded"
 
               fi
 
@@ -2235,19 +2094,19 @@ jobs:
 
 
             # --------------------------------------------------------
-            # Spotify / fallback engine
+            # spotDL for Spotify and fallback
             # --------------------------------------------------------
 
             if [ "$status" != "success" ]; then
 
               log \
                 "SEARCH" \
-                "$index" \
+                "$id" \
                 "Starting spotDL metadata/provider resolution."
 
 
               if download_spotdl \
-                "$index" \
+                "$id" \
                 "$type" \
                 "$url"; then
 
@@ -2261,83 +2120,73 @@ jobs:
 
 
             # --------------------------------------------------------
-            # Result
+            # Failure handling
             # --------------------------------------------------------
 
-            if [ "$status" = "success" ]; then
-
-              log \
-                "VERIFY" \
-                "$index" \
-                "Audio output detected."
-
-
-              log \
-                "SUCCESS" \
-                "$index" \
-                "Completed via ${provider}."
-
-            else
-
-              reason="all strategies failed"
-
+            if [ "$status" != "success" ]; then
 
               printf \
                 '%s\t%s\t%s\n' \
-                "$index" \
+                "$id" \
                 "$type" \
                 "$url" \
-                > "work/failed/${index}.tsv"
+                > "work/failed/${id}.tsv"
 
 
               printf '%s\n' "$url" \
-                > "work/failed/${index}.url"
+                > "work/failed/${id}.url"
 
 
               log \
                 "FAILED" \
-                "$index" \
+                "$id" \
                 "No download strategy succeeded."
+
+            else
+
+              log \
+                "SUCCESS" \
+                "$id" \
+                "Completed via ${provider}."
 
             fi
 
 
-            local finished_at
+            local finished
 
-            finished_at="$(
+            finished="$(
               date -u '+%Y-%m-%dT%H:%M:%SZ'
             )"
 
 
             write_result \
-              "$index" \
+              "$id" \
               "$type" \
               "$url" \
               "$status" \
               "$provider" \
-              1 \
               "$reason" \
-              "$started_at" \
-              "$finished_at"
+              "$started" \
+              "$finished"
 
 
             log \
               "DONE" \
-              "$index" \
+              "$id" \
               "${status^^}"
-
-
-            echo
 
           }
 
 
+          # ==========================================================
+          # EXPORT WORKER ENVIRONMENT
+          # ==========================================================
+
           export -f \
-            timestamp \
+            now \
             log \
             section \
             classify_error \
-            stream_raw_log \
             detect_spotdl_providers \
             download_spotdl \
             download_direct \
@@ -2349,6 +2198,8 @@ jobs:
             FORMAT \
             QUALITY \
             BITRATE \
+            SPOTDL_PROVIDERS \
+            SPOTDL_THREADS \
             RAW_CLIENT_ID \
             RAW_CLIENT_SECRET \
             USE_CUSTOM_CREDENTIALS \
@@ -2358,18 +2209,14 @@ jobs:
             MAX_RETRIES \
             SHOW_RAW_LOGS \
             POT_SERVER_PORT \
+            POT_AVAILABLE \
+            VPN_AVAILABLE \
             YTDLP_RETRIES \
             YTDLP_FRAGMENT_RETRIES \
             YTDLP_EXTRACTOR_RETRIES \
             YTDLP_FILE_ACCESS_RETRIES \
             YTDLP_SOCKET_TIMEOUT \
-            YTDLP_CONCURRENT_FRAGMENTS \
-            SPOTDL_THREADS
-
-
-          # Provider array needs to be exported separately.
-          declare -p SPOTDL_PROVIDERS \
-            > work/spotdl-providers.decl
+            YTDLP_CONCURRENT_FRAGMENTS
 
 
           # ==========================================================
@@ -2379,13 +2226,11 @@ jobs:
           active=0
 
 
-          while IFS=$'\t' read -r index type url; do
+          while IFS=$'\t' read -r id type url; do
 
             (
-              source work/spotdl-providers.decl
-
               download_one \
-                "$index" \
+                "$id" \
                 "$type" \
                 "$url"
             ) &
@@ -2398,9 +2243,10 @@ jobs:
 
               wait -n || true
 
-              active=$((active - 1)
+              active=$((active - 1))
 
             fi
+
 
           done < work/jobs.tsv
 
@@ -2408,7 +2254,7 @@ jobs:
           wait
 
 
-          section "📊 DOWNLOAD COMPLETE"
+          section "📊 DOWNLOAD SUMMARY"
 
 
           TOTAL="$(
@@ -2444,34 +2290,43 @@ jobs:
 
 
       # ============================================================
-      # CONVERSION + VALIDATION
+      # AUDIO CONVERSION + VALIDATION
       # ============================================================
 
       - name: "🔄 Convert and validate audio"
+        env:
+          TARGET_FORMAT: ${{ inputs.output_format }}
+          INPUT_QUALITY: ${{ inputs.audio_quality }}
         run: |
           set -Eeuo pipefail
 
 
-          TARGET_FMT="${{ inputs.output_format }}"
-          QUALITY="${{ inputs.audio_quality }}"
+          FORMAT="$TARGET_FORMAT"
+          QUALITY="$INPUT_QUALITY"
 
 
           case "$QUALITY" in
+
             320k|256k|192k|128k)
-              FFMPEG_BITRATE="$QUALITY"
+              BITRATE="$QUALITY"
               ;;
+
             HIGH)
-              FFMPEG_BITRATE="320k"
+              BITRATE="320k"
               ;;
+
             LOW)
-              FFMPEG_BITRATE="128k"
+              BITRATE="128k"
               ;;
+
             LOSSLESS|HI_RES_LOSSLESS)
-              FFMPEG_BITRATE="320k"
+              BITRATE="320k"
               ;;
+
             *)
-              FFMPEG_BITRATE="320k"
+              BITRATE="320k"
               ;;
+
           esac
 
 
@@ -2510,16 +2365,21 @@ jobs:
             ext="${ext,,}"
 
 
-            if [ "$ext" = "${TARGET_FMT,,}" ]; then
+            if [ "$ext" = "${FORMAT,,}" ]; then
 
               output="$source"
 
             else
 
-              output="${source%.*}.${TARGET_FMT}"
+              output="${source%.*}.${FORMAT}"
 
 
-              case "$TARGET_FMT" in
+              echo
+              echo "🎵 $(basename "$source")"
+              echo "   → $(basename "$output")"
+
+
+              case "$FORMAT" in
 
                 mp3)
 
@@ -2531,7 +2391,7 @@ jobs:
                     -vn \
                     -map_metadata 0 \
                     -c:a libmp3lame \
-                    -b:a "$FFMPEG_BITRATE" \
+                    -b:a "$BITRATE" \
                     -id3v2_version 3 \
                     -y \
                     "$output"
@@ -2565,7 +2425,7 @@ jobs:
                     -vn \
                     -map_metadata 0 \
                     -c:a aac \
-                    -b:a "$FFMPEG_BITRATE" \
+                    -b:a "$BITRATE" \
                     -movflags +faststart \
                     -y \
                     "$output"
@@ -2583,7 +2443,7 @@ jobs:
                     -vn \
                     -map_metadata 0 \
                     -c:a libvorbis \
-                    -b:a "$FFMPEG_BITRATE" \
+                    -b:a "$BITRATE" \
                     -y \
                     "$output"
 
@@ -2600,7 +2460,7 @@ jobs:
                     -vn \
                     -map_metadata 0 \
                     -c:a libopus \
-                    -b:a "$FFMPEG_BITRATE" \
+                    -b:a "$BITRATE" \
                     -y \
                     "$output"
 
@@ -2627,8 +2487,7 @@ jobs:
 
               if [ ! -s "$output" ]; then
 
-                echo "❌ Conversion failed:"
-                echo "   $source"
+                echo "❌ Conversion failed."
 
                 failed=$((failed + 1))
 
@@ -2646,10 +2505,6 @@ jobs:
             fi
 
 
-            # --------------------------------------------------------
-            # ffprobe
-            # --------------------------------------------------------
-
             if [ ! -s "$output" ]; then
 
               failed=$((failed + 1))
@@ -2666,7 +2521,6 @@ jobs:
               -of json \
               "$output" \
               > /tmp/audio-validation.json; then
-
 
               validated=$((validated + 1))
 
@@ -2686,7 +2540,7 @@ jobs:
 
 
               echo \
-                "✓ $(basename "$output") | ${codec} | ${duration}s"
+                "✓ $(basename "$output") | codec=${codec} | duration=${duration}s"
 
             else
 
@@ -2707,10 +2561,10 @@ jobs:
 
 
       # ============================================================
-      # COLLECT FINAL AUDIO
+      # FINAL AUDIO DIRECTORY
       # ============================================================
 
-      - name: "📚 Build final music directory"
+      - name: "📚 Build final audio directory"
         id: collect
         run: |
           set -Eeuo pipefail
@@ -2732,7 +2586,7 @@ jobs:
             filename="$(basename "$file")"
 
 
-            printf -v numbered \
+            printf -v final_name \
               '%04d-%s' \
               "$count" \
               "$filename"
@@ -2742,8 +2596,7 @@ jobs:
               --reflink=auto \
               -p \
               "$file" \
-              "music/$numbered"
-
+              "music/$final_name"
 
           done < <(
             find work/downloads \
@@ -2775,11 +2628,17 @@ jobs:
 
 
       # ============================================================
-      # MANIFEST / STEP SUMMARY
+      # MANIFEST
       # ============================================================
 
       - name: "📝 Generate manifest and GitHub summary"
-        id: manifest
+        env:
+          INPUT_FORMAT: ${{ inputs.output_format }}
+          INPUT_QUALITY: ${{ inputs.audio_quality }}
+          INPUT_UPLOAD_METHOD: ${{ inputs.upload_method }}
+          INPUT_BUNDLE: ${{ inputs.bundle_all }}
+          INPUT_VPN: ${{ inputs.vpn_enabled }}
+          INPUT_RAW_LOGS: ${{ inputs.raw_logs }}
         run: |
           set -Eeuo pipefail
 
@@ -2790,7 +2649,7 @@ jobs:
               work/results/*.json \
               2>/dev/null \
               || echo 0
-          )"
+          )
 
 
           SUCCESS="$(
@@ -2799,7 +2658,7 @@ jobs:
               work/results/*.json \
               2>/dev/null \
               || echo 0
-          )"
+          )
 
 
           FAILED="$(
@@ -2808,7 +2667,7 @@ jobs:
               work/results/*.json \
               2>/dev/null \
               || echo 0
-          )"
+          )
 
 
           AUDIO_COUNT="$(
@@ -2823,7 +2682,7 @@ jobs:
                 -o -iname '*.wav' \
               \) |
             wc -l
-          )"
+          )
 
 
           AUDIO_BYTES="$(
@@ -2831,7 +2690,7 @@ jobs:
               -type f \
               -printf '%s\n' |
             awk '{s += $1} END {print s + 0}'
-          )"
+          )
 
 
           jq -n \
@@ -2839,15 +2698,14 @@ jobs:
             --arg repository "$GITHUB_REPOSITORY" \
             --arg run_id "$GITHUB_RUN_ID" \
             --arg run_number "$GITHUB_RUN_NUMBER" \
-            --arg sha "$GITHUB_SHA" \
+            --arg commit "$GITHUB_SHA" \
             --arg created "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-            --arg format "${{ inputs.output_format }}" \
-            --arg quality "${{ inputs.audio_quality }}" \
-            --arg upload "${{ inputs.upload_method }}" \
-            --argjson vpn "${{ inputs.vpn_enabled }}" \
-            --argjson raw "${{ inputs.raw_logs }}" \
-            --argjson pot true \
-            --argjson bundle "${{ inputs.bundle_all }}" \
+            --arg format "$INPUT_FORMAT" \
+            --arg quality "$INPUT_QUALITY" \
+            --arg upload "$INPUT_UPLOAD_METHOD" \
+            --argjson bundle "$INPUT_BUNDLE" \
+            --argjson vpn "$INPUT_VPN" \
+            --argjson raw "$INPUT_RAW_LOGS" \
             --argjson total "$TOTAL" \
             --argjson success "$SUCCESS" \
             --argjson failed "$FAILED" \
@@ -2858,18 +2716,18 @@ jobs:
               repository: $repository,
               run_id: $run_id,
               run_number: $run_number,
-              commit: $sha,
+              commit: $commit,
               created_at: $created,
-              output_format: $format,
+              format: $format,
               quality: $quality,
               upload_method: $upload,
+              bundle_all: $bundle,
               vpn_enabled: $vpn,
               raw_logs_enabled: $raw,
-              bgutil_enabled: $pot,
-              bundle_all: $bundle,
-              requested_urls: $total,
-              successful_urls: $success,
-              failed_urls: $failed,
+              po_token_provider: "bgutil",
+              urls_requested: $total,
+              urls_successful: $success,
+              urls_failed: $failed,
               final_audio_files: $audio,
               final_audio_bytes: $bytes
             }' \
@@ -2881,33 +2739,48 @@ jobs:
             music/manifest.json
 
 
+          echo
+          echo "╭──────────────────────────────────────────────────────────────╮"
+          echo "│ 📊 DOWNLOAD REPORT                                         │"
+          echo "╰──────────────────────────────────────────────────────────────╯"
+          echo
+
+
+          echo "Requested       : $TOTAL"
+          echo "Successful      : $SUCCESS"
+          echo "Failed          : $FAILED"
+          echo "Final audio     : $AUDIO_COUNT"
+          echo "Final bytes     : $AUDIO_BYTES"
+          echo "Format          : $INPUT_FORMAT"
+          echo "Quality         : $INPUT_QUALITY"
+          echo "VPN             : $INPUT_VPN"
+          echo "Raw logs        : $INPUT_RAW_LOGS"
+          echo "PO-token        : bgutil"
+
+
           {
             echo "# 🎵 Music Downloader"
             echo
-
             echo "## Configuration"
             echo
-
             echo "| Setting | Value |"
             echo "|---|---|"
-            echo "| Output | \`${{ inputs.output_format }}\` |"
-            echo "| Quality | \`${{ inputs.audio_quality }}\` |"
-            echo "| Upload | \`${{ inputs.upload_method }}\` |"
-            echo "| Bundle | \`${{ inputs.bundle_all }}\` |"
-            echo "| VPN | \`${{ inputs.vpn_enabled }}\` |"
-            echo "| Raw logs | \`${{ inputs.raw_logs }}\` |"
-            echo "| PO-token | `bgutil / latest` |"
+            echo "| Format | \`$INPUT_FORMAT\` |"
+            echo "| Quality | \`$INPUT_QUALITY\` |"
+            echo "| Upload | \`$INPUT_UPLOAD_METHOD\` |"
+            echo "| Bundle | \`$INPUT_BUNDLE\` |"
+            echo "| VPN | \`$INPUT_VPN\` |"
+            echo "| Raw logs | \`$INPUT_RAW_LOGS\` |"
+            echo "| PO-token provider | \`bgutil\` |"
             echo
-
-            echo "## Result"
+            echo "## Results"
             echo
-
             echo "| Metric | Count |"
             echo "|---|---:|"
-            echo "| Requested URLs | ${TOTAL} |"
-            echo "| Successful | ${SUCCESS} |"
-            echo "| Failed | ${FAILED} |"
-            echo "| Final audio files | ${AUDIO_COUNT} |"
+            echo "| Requested URLs | $TOTAL |"
+            echo "| Successful | $SUCCESS |"
+            echo "| Failed | $FAILED |"
+            echo "| Final audio files | $AUDIO_COUNT |"
             echo
 
             if [ "$FAILED" -gt 0 ]; then
@@ -2917,18 +2790,15 @@ jobs:
               echo '```text'
 
               for file in work/failed/*.tsv; do
-
                 [ -f "$file" ] || continue
-
                 cat "$file"
-
               done
 
               echo '```'
 
             else
 
-              echo "## ✅ All requested URLs completed successfully."
+              echo "## ✅ All requested URLs succeeded."
 
             fi
 
@@ -2977,7 +2847,7 @@ jobs:
 
           if [ "${#AUDIO_FILES[@]}" -eq 0 ]; then
 
-            echo "⚠️ No audio files available."
+            echo "⚠️ No audio files to package."
 
             echo "HAS_ASSETS=false" >> "$GITHUB_OUTPUT"
 
@@ -3047,6 +2917,8 @@ jobs:
 
 
                 if [ "$size" -gt 1900000000 ]; then
+
+                  echo "⚠️ Large release archive; splitting."
 
                   rm -f \
                     work/archive/"${zip_name}"*
@@ -3128,10 +3000,7 @@ jobs:
           fi
 
 
-          # ----------------------------------------------------------
-          # Checksums
-          # ----------------------------------------------------------
-
+          # Checksums.
           (
             cd work/archive
 
@@ -3166,7 +3035,7 @@ jobs:
 
 
           echo
-          echo "📦 Packaged assets:"
+          echo "📦 Package contents:"
           ls -lh music/
 
 
@@ -3194,10 +3063,10 @@ jobs:
 
 
       # ============================================================
-      # VPN DISCONNECT
+      # DISCONNECT VPN BEFORE UPLOAD
       # ============================================================
 
-      - name: "🔌 Disconnect VPN before upload"
+      - name: "🔌 Disconnect VPN before uploads"
         if: steps.vpn.outputs.vpn_available == 'true'
         run: |
           set +e
@@ -3223,6 +3092,7 @@ jobs:
           CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+
           DRIVE_FOLDER_NAME: "github-actions"
         run: |
           set -Eeuo pipefail
@@ -3239,13 +3109,17 @@ jobs:
              [ -z "$CLIENT_SECRET" ] ||
              [ -z "$REFRESH_TOKEN" ]; then
 
-            echo "❌ Google Drive OAuth secrets are incomplete."
+            echo "❌ Google Drive secrets are incomplete."
             exit 1
 
           fi
 
 
-          TOKEN_JSON="$(
+          # --------------------------------------------------------
+          # OAuth
+          # --------------------------------------------------------
+
+          TOKEN_RESPONSE="$(
             curl \
               --silent \
               --show-error \
@@ -3265,18 +3139,24 @@ jobs:
           ACCESS_TOKEN="$(
             jq -r \
               '.access_token // empty' \
-              <<< "$TOKEN_JSON"
+              <<< "$TOKEN_RESPONSE"
           )"
 
 
           if [ -z "$ACCESS_TOKEN" ]; then
 
-            echo "❌ Could not obtain Drive access token."
-
+            echo "❌ Could not obtain Google Drive access token."
             exit 1
 
           fi
 
+
+          echo "✅ OAuth token acquired."
+
+
+          # --------------------------------------------------------
+          # Folder
+          # --------------------------------------------------------
 
           QUERY="mimeType='application/vnd.google-apps.folder' and name='${DRIVE_FOLDER_NAME}' and trashed=false"
 
@@ -3305,6 +3185,9 @@ jobs:
 
 
           if [ -z "$FOLDER_ID" ]; then
+
+            echo "📁 Creating Drive folder."
+
 
             BODY="$(
               jq -n \
@@ -3337,10 +3220,17 @@ jobs:
 
 
           if [ -z "$FOLDER_ID" ]; then
-            echo "❌ Could not resolve Drive folder."
+            echo "❌ Failed to resolve Drive folder."
             exit 1
           fi
 
+
+          echo "✅ Folder ready."
+
+
+          # --------------------------------------------------------
+          # Resumable uploader
+          # --------------------------------------------------------
 
           upload_file() {
 
@@ -3381,9 +3271,12 @@ jobs:
               --request POST \
               -D "$headers" \
               -o /dev/null \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
               -H "Authorization: Bearer ${ACCESS_TOKEN}" \
               -H "Content-Type: application/json; charset=UTF-8" \
-              -H "X-Upload-Content-Type: application/zip" \
+              -H "X-Upload-Content-Type: application/octet-stream" \
               -H "X-Upload-Content-Length: ${size}" \
               --data "$metadata" \
               "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"; then
@@ -3415,8 +3308,10 @@ jobs:
 
 
             if [ -z "$session_uri" ]; then
-              echo "❌ Failed to create Drive upload session."
+
+              echo "❌ Failed to initialize Drive upload."
               return 1
+
             fi
 
 
@@ -3426,15 +3321,16 @@ jobs:
             while [ "$offset" -lt "$size" ]; do
 
               local remaining=$((size - offset))
-              local length="$DRIVE_CHUNK_SIZE"
+
+              local chunk_size="$DRIVE_CHUNK_SIZE"
 
 
-              if [ "$remaining" -lt "$length" ]; then
-                length="$remaining"
+              if [ "$remaining" -lt "$chunk_size" ]; then
+                chunk_size="$remaining"
               fi
 
 
-              local end=$((offset + length - 1))
+              local end=$((offset + chunk_size - 1))
 
 
               local chunk
@@ -3446,17 +3342,21 @@ jobs:
                 of="$chunk" \
                 iflag=skip_bytes,count_bytes \
                 skip="$offset" \
-                count="$length" \
+                count="$chunk_size" \
                 status=none
 
 
-              local success="false"
+              local uploaded_chunk="false"
 
 
               for attempt in 1 2 3 4 5; do
 
                 local response
                 response="$(mktemp)"
+
+
+                local response_headers
+                response_headers="$(mktemp)"
 
 
                 local http_code
@@ -3466,12 +3366,13 @@ jobs:
                   curl \
                     --silent \
                     --show-error \
-                    --output "$response" \
-                    --write-out '%{http_code}' \
                     --request PUT \
+                    -D "$response_headers" \
+                    -o "$response" \
+                    --write-out '%{http_code}' \
                     -H "Authorization: Bearer ${ACCESS_TOKEN}" \
                     -H "Content-Type: application/octet-stream" \
-                    -H "Content-Length: ${length}" \
+                    -H "Content-Length: ${chunk_size}" \
                     -H "Content-Range: bytes ${offset}-${end}/${size}" \
                     --data-binary "@${chunk}" \
                     "$session_uri"
@@ -3483,7 +3384,8 @@ jobs:
                   200|201)
 
                     offset="$size"
-                    success="true"
+
+                    uploaded_chunk="true"
 
                     ;;
 
@@ -3491,22 +3393,28 @@ jobs:
                   308)
 
                     range="$(
-                      grep -i '^Range:' "$response" \
-                        2>/dev/null |
-                      tail -n1 |
-                      sed -E \
-                        's/.*bytes=0-([0-9]+).*/\1/I'
+                      awk '
+                        BEGIN { IGNORECASE=1 }
+                        /^Range:/ {
+                          sub(/\r$/, "")
+                          print
+                        }
+                      ' "$response_headers"
                     )"
 
 
-                    if [[ "$range" =~ ^[0-9]+$ ]]; then
-                      offset=$((range + 1))
+                    if [[ "$range" =~ bytes=0-([0-9]+) ]]; then
+
+                      offset=$((BASH_REMATCH[1] + 1))
+
                     else
+
                       offset=$((end + 1))
+
                     fi
 
 
-                    success="true"
+                    uploaded_chunk="true"
 
                     ;;
 
@@ -3517,8 +3425,10 @@ jobs:
 
                     [ "$delay" -gt 30 ] && delay=30
 
+
                     echo \
-                      "   ⚠️ HTTP ${http_code}; retry in ${delay}s."
+                      "   ⚠️ HTTP ${http_code}; retrying in ${delay}s."
+
 
                     sleep "$delay"
 
@@ -3530,11 +3440,17 @@ jobs:
                     echo \
                       "   ❌ Drive upload failed: HTTP ${http_code}"
 
+
                     cat "$response" \
                       2>/dev/null \
                       || true
 
-                    rm -f "$response" "$chunk"
+
+                    rm -f \
+                      "$response" \
+                      "$response_headers" \
+                      "$chunk"
+
 
                     return 1
 
@@ -3543,7 +3459,9 @@ jobs:
                 esac
 
 
-                rm -f "$response"
+                rm -f \
+                  "$response" \
+                  "$response_headers"
 
 
                 if [ "$offset" -ge "$size" ]; then
@@ -3551,7 +3469,7 @@ jobs:
                 fi
 
 
-                if [ "$success" = "true" ]; then
+                if [ "$uploaded_chunk" = "true" ]; then
                   break
                 fi
 
@@ -3562,7 +3480,7 @@ jobs:
 
 
               if [ "$offset" -lt "$size" ] &&
-                 [ "$success" != "true" ]; then
+                 [ "$uploaded_chunk" != "true" ]; then
 
                 echo "❌ Drive chunk failed permanently."
 
@@ -3587,6 +3505,10 @@ jobs:
           }
 
 
+          # --------------------------------------------------------
+          # Upload ZIP assets
+          # --------------------------------------------------------
+
           for file in music/*; do
 
             [ -f "$file" ] || continue
@@ -3605,12 +3527,14 @@ jobs:
           done
 
 
-          [ -f music/manifest.json ] &&
+          if [ -f music/manifest.json ]; then
             upload_file music/manifest.json
+          fi
 
 
-          [ -f music/SHA256SUMS.txt ] &&
+          if [ -f music/SHA256SUMS.txt ]; then
             upload_file music/SHA256SUMS.txt
+          fi
 
 
           echo
@@ -3645,8 +3569,10 @@ jobs:
 
 
           if git diff --cached --quiet; then
+
             echo "ℹ️ Nothing to commit."
             exit 0
+
           fi
 
 
@@ -3663,9 +3589,9 @@ jobs:
               --rebase \
               --autostash \
               origin "$BRANCH" &&
-               git push origin "$BRANCH"; then
+              git push origin "$BRANCH"; then
 
-              echo "✅ Repository upload complete."
+              echo "✅ Repository upload completed."
 
               exit 0
 
@@ -3693,6 +3619,11 @@ jobs:
           inputs.upload_method == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          INPUT_FORMAT: ${{ inputs.output_format }}
+          INPUT_QUALITY: ${{ inputs.audio_quality }}
+          INPUT_VPN: ${{ inputs.vpn_enabled }}
+          INPUT_RAW_LOGS: ${{ inputs.raw_logs }}
         run: |
           set -Eeuo pipefail
 
@@ -3710,17 +3641,17 @@ jobs:
             jq -s \
               'length' \
               work/results/*.json \
-              2>/dev/null ||
-            echo 0
-          )"
+              2>/dev/null \
+              || echo 0
+          )
 
 
           SUCCESS="$(
             jq -s \
               '[.[] | select(.status == "success")] | length' \
               work/results/*.json \
-              2>/dev/null ||
-            echo 0
+              2>/dev/null \
+              || echo 0
           )
 
 
@@ -3728,8 +3659,8 @@ jobs:
             jq -s \
               '[.[] | select(.status != "success")] | length' \
               work/results/*.json \
-              2>/dev/null ||
-            echo 0
+              2>/dev/null \
+              || echo 0
           )
 
 
@@ -3738,20 +3669,19 @@ jobs:
 
           ## Result
 
-          - Requested: ${TOTAL}
+          - Requested URLs: ${TOTAL}
           - Successful: ${SUCCESS}
           - Failed: ${FAILED}
-          - Format: ${{ inputs.output_format }}
-          - Quality: ${{ inputs.audio_quality }}
-          - VPN: ${{ inputs.vpn_enabled }}
-          - Raw logs: ${{ inputs.raw_logs }}
-          - PO-token provider: bgutil / latest
-
-          Generated automatically by GitHub Actions.
+          - Format: ${INPUT_FORMAT}
+          - Quality: ${INPUT_QUALITY}
+          - VPN: ${INPUT_VPN}
+          - Raw logs: ${INPUT_RAW_LOGS}
+          - PO-token provider: bgutil
+          - Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           EOF
 
 
-          mapfile -t ASSETS < <(
+          mapfile -t assets < <(
             find music \
               -maxdepth 1 \
               -type f \
@@ -3774,21 +3704,24 @@ jobs:
           )
 
 
-          if [ "${#ASSETS[@]}" -eq 0 ]; then
+          if [ "${#assets[@]}" -eq 0 ]; then
+
             echo "❌ No release assets found."
             exit 1
+
           fi
 
 
           gh release create \
             "$tag" \
-            "${ASSETS[@]}" \
+            "${assets[@]}" \
             --title "Music Downloader ${suffix}" \
             --notes-file work/release-notes.md \
             --target "${GITHUB_SHA}"
 
 
-          echo "✅ Release created."
+          echo "✅ GitHub Release created:"
+          echo "   $tag"
 
 
       # ============================================================
@@ -3799,6 +3732,10 @@ jobs:
         if: always()
         env:
           FAIL_ON_PARTIAL: ${{ inputs.fail_on_partial }}
+          INPUT_FORMAT: ${{ inputs.output_format }}
+          INPUT_QUALITY: ${{ inputs.audio_quality }}
+          INPUT_VPN: ${{ inputs.vpn_enabled }}
+          INPUT_RAW_LOGS: ${{ inputs.raw_logs }}
         run: |
           set -Eeuo pipefail
 
@@ -3807,8 +3744,8 @@ jobs:
             jq -s \
               'length' \
               work/results/*.json \
-              2>/dev/null ||
-            echo 0
+              2>/dev/null \
+              || echo 0
           )
 
 
@@ -3816,8 +3753,8 @@ jobs:
             jq -s \
               '[.[] | select(.status == "success")] | length' \
               work/results/*.json \
-              2>/dev/null ||
-            echo 0
+              2>/dev/null \
+              || echo 0
           )
 
 
@@ -3825,8 +3762,8 @@ jobs:
             jq -s \
               '[.[] | select(.status != "success")] | length' \
               work/results/*.json \
-              2>/dev/null ||
-            echo 0
+              2>/dev/null \
+              || echo 0
           )
 
 
@@ -3853,18 +3790,18 @@ jobs:
           printf '║ Successful     : %-41s ║\n' "$SUCCESS"
           printf '║ Failed         : %-41s ║\n' "$FAILED"
           printf '║ Audio files    : %-41s ║\n' "$AUDIO"
-          printf '║ Format         : %-41s ║\n' "${{ inputs.output_format }}"
-          printf '║ Quality        : %-41s ║\n' "${{ inputs.audio_quality }}"
-          printf '║ VPN            : %-41s ║\n' "${{ inputs.vpn_enabled }}"
-          printf '║ Raw logs       : %-41s ║\n' "${{ inputs.raw_logs }}"
-          printf '║ PO Token       : %-41s ║\n' "bgutil / latest"
+          printf '║ Format         : %-41s ║\n' "$INPUT_FORMAT"
+          printf '║ Quality        : %-41s ║\n' "$INPUT_QUALITY"
+          printf '║ VPN            : %-41s ║\n' "$INPUT_VPN"
+          printf '║ Raw logs       : %-41s ║\n' "$INPUT_RAW_LOGS"
+          printf '║ PO-token       : %-41s ║\n' "bgutil"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo
 
 
           if [ "$FAILED" -eq 0 ]; then
 
-            echo "✅ All requested URLs succeeded."
+            echo "✅ All requested URLs completed successfully."
 
             exit 0
 
@@ -3873,7 +3810,7 @@ jobs:
 
           if [ "$SUCCESS" -eq 0 ]; then
 
-            echo "❌ No URLs succeeded."
+            echo "❌ No requested URLs completed successfully."
 
             exit 1
 
@@ -3920,7 +3857,7 @@ jobs:
             /tmp/wg0.conf \
             /tmp/youtube-cookies.txt \
             /tmp/youtube-music-cookies.txt \
-            /tmp/bgutil-ping.txt \
+            /tmp/bgutil-ping.json \
             /tmp/audio-validation.json
 
 
