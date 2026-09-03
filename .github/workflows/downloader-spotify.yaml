@@ -366,46 +366,337 @@ jobs:
           printf '%s\n' "$WG_CONFIG" > /tmp/wg0.conf
 
           vpn_user="vpn-download"
-          sudo useradd --create-home --shell /usr/sbin/nologin "$vpn_user" 2>/dev/null || true
+
+          sudo useradd \
+            --create-home \
+            --shell /usr/sbin/nologin \
+            "$vpn_user" \
+            2>/dev/null \
+            || true
+
           vpn_uid="$(id -u "$vpn_user")"
 
-          # IMPORTANT: do not let wg-quick install a system-wide default route.
-          # Only processes running as vpn-download are sent to the WireGuard table.
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔒 Configuring WireGuard for download traffic only"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # ------------------------------------------------------------
+          # Extract the values that wg(8) itself does NOT understand.
+          # We configure these manually below.
+          # ------------------------------------------------------------
+
+          ipv4_addresses="$(
+            awk '
+              BEGIN { IGNORECASE=1 }
+              /^[[:space:]]*Address[[:space:]]*=/ {
+                value=$0
+                sub(/^[^=]*=/, "", value)
+                gsub(/[[:space:]]/, "", value)
+
+                n=split(value, a, ",")
+                for (i=1; i<=n; i++) {
+                  if (a[i] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/)
+                    print a[i]
+                }
+              }
+            ' /tmp/wg0.conf
+          )"
+
+          ipv6_addresses="$(
+            awk '
+              BEGIN { IGNORECASE=1 }
+              /^[[:space:]]*Address[[:space:]]*=/ {
+                value=$0
+                sub(/^[^=]*=/, "", value)
+                gsub(/[[:space:]]/, "", value)
+
+                n=split(value, a, ",")
+                for (i=1; i<=n; i++) {
+                  if (a[i] ~ /:/)
+                    print a[i]
+                }
+              }
+            ' /tmp/wg0.conf
+          )"
+
+          # ------------------------------------------------------------
+          # Create a configuration containing ONLY settings understood
+          # directly by `wg setconf`.
+          #
+          # This deliberately removes:
+          #   Address
+          #   DNS
+          #   Table
+          #   MTU
+          #   PostUp / PostDown / PreUp / PreDown
+          #   SaveConfig
+          # ------------------------------------------------------------
+
           awk '
-            /^[[:space:]]*Table[[:space:]]*=/ {
-              print "Table = off"
-              found=1
-              next
+            BEGIN {
+              IGNORECASE=1
             }
-            /^[[:space:]]*DNS[[:space:]]*=/ { next }
+
+            /^[[:space:]]*Address[[:space:]]*=/   { next }
+            /^[[:space:]]*DNS[[:space:]]*=/       { next }
+            /^[[:space:]]*Table[[:space:]]*=/     { next }
+            /^[[:space:]]*MTU[[:space:]]*=/       { next }
+            /^[[:space:]]*PreUp[[:space:]]*=/     { next }
+            /^[[:space:]]*PreDown[[:space:]]*=/   { next }
+            /^[[:space:]]*PostUp[[:space:]]*=/    { next }
+            /^[[:space:]]*PostDown[[:space:]]*=/  { next }
+            /^[[:space:]]*SaveConfig[[:space:]]*=/ { next }
+
             { print }
-            END {
-              if (!found) print "Table = off"
-            }
-          ' /tmp/wg0.conf > /tmp/wg0-download.conf
+          ' /tmp/wg0.conf > /tmp/wg0-wg.conf
 
-          sudo install -m 600 /tmp/wg0-download.conf /etc/wireguard/wg0.conf
+          echo
+          echo "📄 WireGuard configuration passed to wg:"
+          sed \
+            -E \
+            's/(PrivateKey[[:space:]]*=[[:space:]]*).*/\1[REDACTED]/' \
+            /tmp/wg0-wg.conf
 
-          # Keep the GitHub runner's normal routing table completely untouched.
-          sudo wg-quick up wg0
+          # ------------------------------------------------------------
+          # Remove any stale interface.
+          # ------------------------------------------------------------
 
-          # Route IPv4 only for the dedicated download user.
-          sudo ip route replace default dev wg0 table 51820
-          sudo ip rule add uidrange "${vpn_uid}-${vpn_uid}" lookup 51820 priority 10020 2>/dev/null || true
+          sudo ip link delete wg0 \
+            2>/dev/null \
+            || true
 
-          # Also isolate IPv6 when the WG profile explicitly includes ::/0.
-          if grep -qE 'AllowedIPs[[:space:]]*=.*(^|,)[[:space:]]*::/0([[:space:]]*,|$)' /tmp/wg0.conf; then
-            sudo ip -6 route replace default dev wg0 table 51821
-            sudo ip -6 rule add uidrange "${vpn_uid}-${vpn_uid}" lookup 51821 priority 10021 2>/dev/null || true
+          # ------------------------------------------------------------
+          # Create the WireGuard interface WITHOUT wg-quick.
+          #
+          # Therefore there is no possibility of Table=off reaching
+          # `wg setconf`.
+          # ------------------------------------------------------------
+
+          echo
+          echo "🔧 Creating wg0..."
+
+          sudo ip link add wg0 type wireguard
+
+          echo "🔧 Applying WireGuard configuration..."
+
+          sudo wg setconf \
+            wg0 \
+            /tmp/wg0-wg.conf
+
+          # ------------------------------------------------------------
+          # Configure addresses manually.
+          # ------------------------------------------------------------
+
+          if [ -n "$ipv4_addresses" ]; then
+            while IFS= read -r address; do
+              [ -n "$address" ] || continue
+
+              echo "➕ IPv4 address: $address"
+
+              sudo ip -4 address add \
+                "$address" \
+                dev wg0
+            done <<< "$ipv4_addresses"
           fi
 
-          sudo ip route flush cache 2>/dev/null || true
+          if [ -n "$ipv6_addresses" ]; then
+            while IFS= read -r address; do
+              [ -n "$address" ] || continue
 
-          # The download process writes into work/ while running as vpn-download.
-          sudo chown -R "${vpn_user}:${vpn_user}" work
+              echo "➕ IPv6 address: $address"
 
-          public_ip="$({ sudo -u "$vpn_user" -H curl -4 --silent --show-error --max-time 15 https://api.ipify.org; } || echo "unavailable")"
-          echo "🌐 VPN download-user IPv4: $public_ip"
+              sudo ip -6 address add \
+                "$address" \
+                dev wg0
+            done <<< "$ipv6_addresses"
+          fi
+
+          # ------------------------------------------------------------
+          # Bring interface up.
+          # ------------------------------------------------------------
+
+          sudo ip link set \
+            wg0 \
+            up
+
+          # ------------------------------------------------------------
+          # Detect whether this profile contains IPv4 / IPv6 full tunnel.
+          # ------------------------------------------------------------
+
+          has_ipv4_default="false"
+          has_ipv6_default="false"
+
+          if grep -Eiq \
+            '^[[:space:]]*AllowedIPs[[:space:]]*=.*(^|,)[[:space:]]*0\.0\.0\.0/0([[:space:]]*,|$)' \
+            /tmp/wg0.conf; then
+            has_ipv4_default="true"
+          fi
+
+          if grep -Eiq \
+            '^[[:space:]]*AllowedIPs[[:space:]]*=.*(^|,)[[:space:]]*::/0([[:space:]]*,|$)' \
+            /tmp/wg0.conf; then
+            has_ipv6_default="true"
+          fi
+
+          # ------------------------------------------------------------
+          # Dedicated routing tables.
+          #
+          # 51820 = IPv4 VPN table
+          # 51821 = IPv6 VPN table
+          #
+          # ONLY vpn-download uses these tables.
+          # The GitHub Actions runner stays on the normal main table.
+          # ------------------------------------------------------------
+
+          if [ "$has_ipv4_default" = "true" ]; then
+
+            echo
+            echo "🌐 Configuring IPv4 VPN routing..."
+
+            sudo ip route flush table 51820 \
+              2>/dev/null \
+              || true
+
+            sudo ip route add \
+              default \
+              dev wg0 \
+              table 51820
+
+            sudo ip rule del \
+              uidrange "${vpn_uid}-${vpn_uid}" \
+              table 51820 \
+              2>/dev/null \
+              || true
+
+            sudo ip rule add \
+              uidrange "${vpn_uid}-${vpn_uid}" \
+              lookup 51820 \
+              priority 10020
+
+          fi
+
+          if [ "$has_ipv6_default" = "true" ]; then
+
+            echo
+            echo "🌐 Configuring IPv6 VPN routing..."
+
+            sudo ip -6 route flush table 51821 \
+              2>/dev/null \
+              || true
+
+            sudo ip -6 route add \
+              default \
+              dev wg0 \
+              table 51821
+
+            sudo ip -6 rule del \
+              uidrange "${vpn_uid}-${vpn_uid}" \
+              table 51821 \
+              2>/dev/null \
+              || true
+
+            sudo ip -6 rule add \
+              uidrange "${vpn_uid}-${vpn_uid}" \
+              lookup 51821 \
+              priority 10021
+
+          fi
+
+          # ------------------------------------------------------------
+          # Show resulting configuration.
+          # ------------------------------------------------------------
+
+          echo
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔗 WireGuard status"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          sudo wg show wg0
+
+          echo
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🛣️ VPN routing"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          if [ "$has_ipv4_default" = "true" ]; then
+            echo
+            echo "IPv4 table 51820:"
+            sudo ip route show table 51820
+            echo
+            echo "IPv4 rule:"
+            sudo ip rule show
+          fi
+
+          if [ "$has_ipv6_default" = "true" ]; then
+            echo
+            echo "IPv6 table 51821:"
+            sudo ip -6 route show table 51821
+            echo
+            echo "IPv6 rule:"
+            sudo ip -6 rule show
+          fi
+
+          # ------------------------------------------------------------
+          # Give the VPN downloader ownership of its workspace.
+          # ------------------------------------------------------------
+
+          sudo chown \
+            -R \
+            "${vpn_user}:${vpn_user}" \
+            work
+
+          # ------------------------------------------------------------
+          # Verify that NORMAL runner traffic still uses the normal
+          # connection.
+          # ------------------------------------------------------------
+
+          echo
+          echo "🧪 Testing normal runner connection..."
+
+          runner_ip="$(
+            curl \
+              --4 \
+              --silent \
+              --show-error \
+              --max-time 15 \
+              https://api.ipify.org \
+            || echo "unavailable"
+          )"
+
+          echo "🌐 Runner/public IPv4: $runner_ip"
+
+          # ------------------------------------------------------------
+          # Verify VPN traffic using the dedicated downloader user.
+          # ------------------------------------------------------------
+
+          echo
+          echo "🧪 Testing VPN downloader connection..."
+
+          vpn_ip="$(
+            sudo \
+              -u "$vpn_user" \
+              -H \
+              curl \
+                --4 \
+                --silent \
+                --show-error \
+                --max-time 20 \
+                https://api.ipify.org \
+            || echo "unavailable"
+          )"
+
+          echo "🌐 VPN downloader IPv4: $vpn_ip"
+
+          if [ "$vpn_ip" = "unavailable" ]; then
+            echo "❌ VPN downloader cannot reach the internet."
+            exit 1
+          fi
+
+          echo
+          echo "✅ WireGuard is connected."
+          echo "✅ GitHub runner traffic remains outside the VPN."
+          echo "✅ Download-user traffic is routed through wg0."
+
           echo "vpn_user=$vpn_user" >> "$GITHUB_OUTPUT"
           echo "vpn_uid=$vpn_uid" >> "$GITHUB_OUTPUT"
           echo "vpn_available=true" >> "$GITHUB_OUTPUT"
