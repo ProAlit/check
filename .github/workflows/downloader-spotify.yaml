@@ -517,6 +517,14 @@ jobs:
             date '+%H:%M:%S'
           }
 
+          # Mutex print to prevent parallel terminal scrambling
+          safe_log() {
+            (
+              flock -x 200
+              printf '%b\n' "$1"
+            ) 200>/tmp/terminal.lock
+          }
+
           log() {
             local level="$1"
             local id="$2"
@@ -539,7 +547,12 @@ jobs:
               DONE) icon="◆" ;;
             esac
 
-            printf '[%s] %-9s #%04d │ %s %s\n' "$(now)" "$level" "$id" "$icon" "$message"
+            # Suppress routine internal AUTH noise in the summarized card
+            if [ "$level" = "AUTH" ] && [ "$RAW_LOGS" != "true" ]; then
+              return 0
+            fi
+
+            printf '[%s] %s %s\n' "$(now)" "$icon" "$message" >> "work/logs/${id}-events.log"
           }
 
           has_audio() {
@@ -701,11 +714,9 @@ jobs:
                [ -n "$SPOTIFY_CLIENT_SECRET" ]; then
               export SPOTIPY_CLIENT_ID="$SPOTIFY_CLIENT_ID"
               export SPOTIPY_CLIENT_SECRET="$SPOTIFY_CLIENT_SECRET"
-              log AUTH "$id" "Custom Spotify credentials enabled."
             else
               unset SPOTIPY_CLIENT_ID 2>/dev/null || true
               unset SPOTIPY_CLIENT_SECRET 2>/dev/null || true
-              log AUTH "$id" "Using spotDL default Spotify client."
             fi
 
             local cookie
@@ -713,7 +724,6 @@ jobs:
 
             if [ -n "$cookie" ]; then
               cmd+=(--cookie-file "$cookie")
-              log AUTH "$id" "${provider} cookies enabled."
             fi
 
             local ytdlp_args
@@ -762,17 +772,13 @@ jobs:
             fi
 
             cmd+=(--yt-dlp-args "$ytdlp_args")
-            log PROVIDER "$id" "${provider} | attempt ${attempt}/${RETRIES}"
+            log PROVIDER "$id" "${provider} (attempt ${attempt}/${RETRIES})"
 
             local exit_code=0
             if [ "$RAW_LOGS" = "true" ]; then
               set +e
-              stdbuf -oL -eL timeout 900 "${cmd[@]}" 2>&1 |
-              tee "$logfile" |
-              while IFS= read -r line; do
-                printf '[%s] RAW       #%04d │ %s\n' "$(now)" "$id" "$line"
-              done
-              exit_code="${PIPESTATUS[0]}"
+              timeout 900 "${cmd[@]}" >> "work/logs/${id}-raw.log" 2>&1
+              exit_code=$?
               set -e
             else
               timeout 900 "${cmd[@]}" > "$logfile" 2>&1 || exit_code=$?
@@ -840,12 +846,8 @@ jobs:
             local exit_code=0
             if [ "$RAW_LOGS" = "true" ]; then
               set +e
-              stdbuf -oL -eL timeout 900 "${cmd[@]}" 2>&1 |
-              tee "$logfile" |
-              while IFS= read -r line; do
-                printf '[%s] RAW       #%04d │ %s\n' "$(now)" "$id" "$line"
-              done
-              exit_code="${PIPESTATUS[0]}"
+              timeout 900 "${cmd[@]}" >> "work/logs/${id}-raw.log" 2>&1
+              exit_code=$?
               set -e
             else
               timeout 900 "${cmd[@]}" > "$logfile" 2>&1 || exit_code=$?
@@ -916,7 +918,10 @@ jobs:
 
             local dir="work/downloads/${id}"
             mkdir -p "$dir"
+            : > "work/logs/${id}-events.log"
 
+            local start_sec
+            start_sec="$(date +%s)"
             local started_at
             started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
@@ -924,16 +929,10 @@ jobs:
             local winner="none"
             local reason="all strategies failed"
 
-            echo
-            echo "╭──────────────────────────────────────────────────────────────╮"
-            printf '│ 🎵 INPUT #%04d                                             │\n' "$id"
-            echo "├──────────────────────────────────────────────────────────────┤"
-            printf '│ Type: %-55s │\n' "$type"
-            printf '│ URL : %-55s │\n' "$url"
-            echo "╰──────────────────────────────────────────────────────────────╯"
+            # Single live atomic log line when URL processing starts
+            safe_log "[$(now)] 🚀 #$(printf '%04d' "$id") (${type}) STARTING  │ ${url}"
 
             log START "$id" "Processing ${type} input."
-            log SEARCH "$id" "Starting download resolution."
 
             if [ "$type" = "youtube" ] || [ "$type" = "soundcloud" ]; then
               log SEARCH "$id" "Trying direct yt-dlp."
@@ -1033,6 +1032,8 @@ jobs:
 
             local finished_at
             finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local elapsed=$(( $(date +%s) - start_sec ))
+            local duration="${elapsed}s"
 
             if [ "$status" = "success" ]; then
               log SUCCESS "$id" "Downloaded successfully via ${winner}."
@@ -1043,11 +1044,39 @@ jobs:
 
               printf '%s\t%s\t%s\n' "$id" "$type" "$url" > "work/failed/${id}.tsv"
               printf '%s\n' "$reason" > "work/failed/${id}.reason"
-
               log DONE "$id" "FAILED"
             fi
 
             write_result "$id" "$type" "$url" "$status" "$winner" "$reason" "$started_at" "$finished_at"
+
+            # Print single atomic formatted card upon URL completion
+            (
+              flock -x 200
+              echo
+              echo "┌──────────────────────────────────────────────────────────────────────────────"
+              if [ "$status" = "success" ]; then
+                printf '│ 🎵 INPUT #%04d — ✅ SUCCESS (%s via %s)\n' "$id" "$duration" "$winner"
+              else
+                printf '│ 🎵 INPUT #%04d — ❌ FAILED (%s — %s)\n' "$id" "$duration" "$reason"
+              fi
+              printf '│ URL  : %s\n' "$url"
+              printf '│ Type : %s\n' "$type"
+              echo "│ Events:"
+              if [ -s "work/logs/${id}-events.log" ]; then
+                sed 's/^/│   /' "work/logs/${id}-events.log"
+              else
+                echo "│   (No events recorded)"
+              fi
+              echo "└──────────────────────────────────────────────────────────────────────────────"
+              echo
+
+              if [ "$RAW_LOGS" = "true" ] && [ -f "work/logs/${id}-raw.log" ]; then
+                echo "--- [RAW LOGS FOR #$(printf '%04d' "$id")] ---"
+                cat "work/logs/${id}-raw.log"
+                echo "--- [END RAW LOGS FOR #$(printf '%04d' "$id")] ---"
+                echo
+              fi
+            ) 200>/tmp/terminal.lock
           }
 
           detect_providers
@@ -1060,7 +1089,7 @@ jobs:
           echo "🔄 Transient retries/provider: $RETRIES"
           echo
 
-          # Process URLs in a parallel worker pool without fragile export -f
+          # Parallel worker queue loop
           running=0
           while IFS=$'\t' read -r id type url; do
             process_one "$id" "$type" "$url" &
@@ -1333,496 +1362,4 @@ jobs:
 
           while IFS= read -r -d '' file; do
             audio_found=$((audio_found + 1))
-            cp --reflink=auto -p "$file" work/package/
-          done < <(
-            find music \
-              -maxdepth 1 \
-              -type f \
-              \( \
-                -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' \
-                -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \
-              \) \
-              -print0 |
-            sort -z
-          )
-
-          if [ "$audio_found" -eq 0 ]; then
-            echo "⚠️ No audio files to package."
-            echo "HAS_ASSETS=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$BUNDLE_ALL" = "true" ]; then
-            zip_name="music-${RUN_SUFFIX}.zip"
-
-            if [ "$UPLOAD_METHOD" = "repo" ]; then
-              (
-                cd work/package
-                zip -0 -s 90m -r "../archive/${zip_name}" .
-              )
-            else
-              (
-                cd work/package
-                zip -0 -r "../archive/${zip_name}" .
-              )
-
-              if [ "$UPLOAD_METHOD" = "release" ]; then
-                size="$(stat -c%s "work/archive/${zip_name}")"
-
-                if [ "$size" -gt 1900000000 ]; then
-                  echo "⚠️ Large release ZIP; creating split archive."
-                  rm -f work/archive/"${zip_name}"* 2>/dev/null || true
-
-                  (
-                    cd work/package
-                    zip -0 -s 1900m -r "../archive/${zip_name}" .
-                  )
-                fi
-              fi
-            fi
-
-          else
-            index=0
-
-            while IFS= read -r -d '' file; do
-              index=$((index + 1))
-              base="$(basename "$file")"
-              safe="$(printf '%s' "$base" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
-              zip_name="single-${index}-${safe}-${RUN_SUFFIX}.zip"
-
-              (
-                cd work/package
-                zip -0 "../../work/archive/${zip_name}" "$base"
-              )
-            done < <(
-              find work/package \
-                -maxdepth 1 \
-                -type f \
-                \( \
-                  -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' \
-                  -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \
-                \) \
-                -print0 |
-              sort -z
-            )
-          fi
-
-          rm -f music/*.zip music/*.z[0-9][0-9] 2>/dev/null || true
-
-          find work/archive \
-            -maxdepth 1 \
-            -type f \
-            \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) \
-            -exec cp -p {} music/ \;
-
-          echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
-
-          echo
-          echo "📦 Final package contents:"
-          ls -lh music/
-
-      # ============================================================
-      # 15. DIAGNOSTICS
-      # ============================================================
-
-      - name: "📊 Upload diagnostics"
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: downloader-diagnostics-${{ github.run_number }}
-          path: |
-            work/logs/
-            work/results/
-            work/failed/
-            work/jobs.tsv
-            work/input_urls.txt
-            music/FAILED-DOWNLOADS-*.txt
-          if-no-files-found: warn
-          retention-days: 7
-          compression-level: 6
-
-      # ============================================================
-      # 16. DISCONNECT VPN
-      # ============================================================
-
-      - name: "🔌 Disconnect VPN"
-        if: steps.vpn.outputs.vpn_available == 'true'
-        run: |
-          set +e
-          sudo wg-quick down wg0 >/dev/null 2>&1 || true
-          echo "✅ VPN disconnected."
-
-      # ============================================================
-      # 17. GOOGLE DRIVE
-      # ============================================================
-
-      - name: "☁️ Upload to Google Drive"
-        if: >
-          steps.archive.outputs.HAS_ASSETS == 'true' &&
-          inputs.upload_method == 'drive'
-        env:
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          DRIVE_FOLDER_NAME: "github-actions"
-        run: |
-          set -Eeuo pipefail
-
-          if [ -z "$GOOGLE_CLIENT_ID" ] ||
-             [ -z "$GOOGLE_CLIENT_SECRET" ] ||
-             [ -z "$GOOGLE_REFRESH_TOKEN" ]; then
-            echo "❌ Google Drive credentials are missing."
-            exit 1
-          fi
-
-          token_json="$(
-            curl \
-              --silent \
-              --show-error \
-              --fail \
-              --retry 5 \
-              --retry-delay 2 \
-              --retry-all-errors \
-              --request POST \
-              https://oauth2.googleapis.com/token \
-              --data-urlencode "client_id=${GOOGLE_CLIENT_ID}" \
-              --data-urlencode "client_secret=${GOOGLE_CLIENT_SECRET}" \
-              --data-urlencode "refresh_token=${GOOGLE_REFRESH_TOKEN}" \
-              --data-urlencode "grant_type=refresh_token"
-          )"
-
-          access_token="$(jq -r '.access_token // empty' <<< "$token_json")"
-
-          if [ -z "$access_token" ]; then
-            echo "❌ Could not obtain Drive token."
-            exit 1
-          fi
-
-          query="mimeType='application/vnd.google-apps.folder' and name='${DRIVE_FOLDER_NAME}' and trashed=false"
-
-          folder_response="$(
-            curl \
-              --silent \
-              --show-error \
-              --fail \
-              --retry 5 \
-              --retry-delay 2 \
-              --retry-all-errors \
-              --get \
-              https://www.googleapis.com/drive/v3/files \
-              -H "Authorization: Bearer ${access_token}" \
-              --data-urlencode "q=${query}" \
-              --data-urlencode "fields=files(id,name)"
-          )"
-
-          folder_id="$(jq -r '.files[0].id // empty' <<< "$folder_response")"
-
-          if [ -z "$folder_id" ]; then
-            body="$(
-              jq -n \
-                --arg name "$DRIVE_FOLDER_NAME" \
-                '{
-                  name: $name,
-                  mimeType: "application/vnd.google-apps.folder"
-                }'
-            )"
-
-            folder_id="$(
-              curl \
-                --silent \
-                --show-error \
-                --fail \
-                --retry 5 \
-                --retry-delay 2 \
-                --retry-all-errors \
-                --request POST \
-                https://www.googleapis.com/drive/v3/files \
-                -H "Authorization: Bearer ${access_token}" \
-                -H "Content-Type: application/json" \
-                --data "$body" |
-              jq -r '.id // empty'
-            )"
-          fi
-
-          if [ -z "$folder_id" ]; then
-            echo "❌ Could not resolve Drive folder."
-            exit 1
-          fi
-
-          upload_file() {
-            local file="$1"
-            local name size
-            name="$(basename "$file")"
-            size="$(stat -c%s "$file")"
-
-            echo "⬆️ $name ($size bytes)"
-
-            local headers
-            headers="$(mktemp)"
-
-            local metadata
-            metadata="$(
-              jq -n \
-                --arg name "$name" \
-                --arg folder "$folder_id" \
-                '{
-                  name: $name,
-                  parents: [$folder]
-                }'
-            )"
-
-            if ! curl \
-              --silent \
-              --show-error \
-              --request POST \
-              --retry 5 \
-              --retry-delay 2 \
-              --retry-all-errors \
-              -D "$headers" \
-              -o /dev/null \
-              -H "Authorization: Bearer ${access_token}" \
-              -H "Content-Type: application/json; charset=UTF-8" \
-              -H "X-Upload-Content-Type: application/octet-stream" \
-              -H "X-Upload-Content-Length: ${size}" \
-              --data "$metadata" \
-              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"; then
-              rm -f "$headers"
-              return 1
-            fi
-
-            local session_uri
-            session_uri="$(
-              awk '
-                BEGIN { IGNORECASE=1 }
-                /^location:/ {
-                  sub(/\r$/, "")
-                  sub(/^[^:]*:[[:space:]]*/, "")
-                  print
-                  exit
-                }
-              ' "$headers"
-            )"
-            rm -f "$headers"
-
-            if [ -z "$session_uri" ]; then
-              echo "❌ Could not initialize Drive upload."
-              return 1
-            fi
-
-            local offset=0
-
-            while [ "$offset" -lt "$size" ]; do
-              local remaining=$((size - offset))
-              local length="$DRIVE_CHUNK_SIZE"
-
-              if [ "$remaining" -lt "$length" ]; then
-                length="$remaining"
-              fi
-
-              local end=$((offset + length - 1))
-              local chunk
-              chunk="$(mktemp)"
-
-              dd if="$file" of="$chunk" iflag=skip_bytes,count_bytes \
-                skip="$offset" count="$length" status=none
-
-              local chunk_done="false"
-
-              for attempt in 1 2 3 4 5; do
-                local response response_headers code
-                response="$(mktemp)"
-                response_headers="$(mktemp)"
-
-                code="$(
-                  curl \
-                    --silent \
-                    --show-error \
-                    --request PUT \
-                    -D "$response_headers" \
-                    -o "$response" \
-                    --write-out '%{http_code}' \
-                    -H "Authorization: Bearer ${access_token}" \
-                    -H "Content-Type: application/octet-stream" \
-                    -H "Content-Length: ${length}" \
-                    -H "Content-Range: bytes ${offset}-${end}/${size}" \
-                    --data-binary "@${chunk}" \
-                    "$session_uri"
-                )"
-
-                case "$code" in
-                  200|201)
-                    offset="$size"
-                    chunk_done="true"
-                    ;;
-                  308)
-                    range="$(
-                      awk '
-                        BEGIN { IGNORECASE=1 }
-                        /^Range:/ {
-                          sub(/\r$/, "")
-                          print
-                        }
-                      ' "$response_headers"
-                    )"
-
-                    if [[ "$range" =~ bytes=0-([0-9]+) ]]; then
-                      offset=$((BASH_REMATCH[1] + 1))
-                    else
-                      offset=$((end + 1))
-                    fi
-                    chunk_done="true"
-                    ;;
-                  429|500|502|503|504)
-                    delay=$((2 ** attempt))
-                    [ "$delay" -gt 30 ] && delay=30
-                    echo "⚠️ Drive HTTP $code; retry in ${delay}s."
-                    sleep "$delay"
-                    ;;
-                  *)
-                    echo "❌ Drive upload failed: HTTP $code"
-                    cat "$response" 2>/dev/null || true
-                    rm -f "$response" "$response_headers" "$chunk"
-                    return 1
-                    ;;
-                esac
-
-                rm -f "$response" "$response_headers"
-
-                if [ "$offset" -ge "$size" ] || [ "$chunk_done" = "true" ]; then
-                  break
-                fi
-              done
-
-              rm -f "$chunk"
-
-              if [ "$offset" -lt "$size" ] && [ "$chunk_done" != "true" ]; then
-                echo "❌ Drive chunk upload failed."
-                return 1
-              fi
-
-              percent=$((offset * 100 / size))
-              echo "   Progress: ${percent}%"
-            done
-
-            echo "✅ Uploaded: $name"
-          }
-
-          for file in music/*; do
-            [ -f "$file" ] || continue
-
-            case "$(basename "$file")" in
-              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt)
-                upload_file "$file"
-                ;;
-            esac
-          done
-
-          echo "✅ Google Drive upload complete."
-
-      # ============================================================
-      # 18. REPOSITORY UPLOAD
-      # ============================================================
-
-      - name: "📤 Upload to repository"
-        if: >
-          steps.archive.outputs.HAS_ASSETS == 'true' &&
-          inputs.upload_method == 'repo'
-        env:
-          BRANCH_NAME: ${{ github.ref_name }}
-        run: |
-          set -Eeuo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add music/
-
-          if git diff --cached --quiet; then
-            echo "ℹ️ Nothing to commit."
-            exit 0
-          fi
-
-          git commit -m "Add music downloader output [skip ci]"
-
-          for attempt in 1 2 3 4 5; do
-            echo "Push attempt ${attempt}/5"
-
-            if git pull --rebase --autostash origin "$BRANCH_NAME" &&
-               git push origin "$BRANCH_NAME"; then
-              echo "✅ Repository upload complete."
-              exit 0
-            fi
-
-            if [ "$attempt" -lt 5 ]; then
-              sleep $((attempt * 3))
-            fi
-          done
-
-          echo "❌ Repository push failed."
-          exit 1
-
-      # ============================================================
-      # 19. GITHUB RELEASE
-      # ============================================================
-
-      - name: "🏷️ Create GitHub Release"
-        if: >
-          steps.archive.outputs.HAS_ASSETS == 'true' &&
-          inputs.upload_method == 'release'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FORMAT_INPUT: ${{ inputs.output_format }}
-          QUALITY_INPUT: ${{ inputs.audio_quality }}
-          VPN_INPUT: ${{ inputs.vpn_enabled }}
-        run: |
-          set -Eeuo pipefail
-
-          tag="music-${RUN_SUFFIX}"
-
-          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
-          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
-          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
-
-          {
-            echo "# 🎵 Music Downloader"
-            echo
-            echo "Requested URLs: ${total}"
-            echo "Successful: ${success}"
-            echo "Failed: ${failed}"
-            echo "Format: ${FORMAT_INPUT}"
-            echo "Quality: ${QUALITY_INPUT}"
-            echo "VPN: ${VPN_INPUT}"
-            echo "Provider order: YouTube Music → YouTube → SoundCloud → Bandcamp → Piped"
-            echo "PO-token provider: bgutil"
-          } > work/release-notes.md
-
-          mapfile -t assets < <(
-            find music \
-              -maxdepth 1 \
-              -type f \
-              \( \
-                -name '*.zip' \
-                -o -name '*.z[0-9][0-9]' \
-                -o -name 'FAILED-DOWNLOADS-*.txt' \
-              \) \
-              -print |
-            sort
-          )
-
-          if [ "${#assets[@]}" -eq 0 ]; then
-            echo "❌ No release assets."
-            exit 1
-          fi
-
-          gh release create \
-            "$tag" \
-            "${assets[@]}" \
-            --title "Music Downloader ${RUN_SUFFIX}" \
-            --notes-file work/release-notes.md \
-            --target "$GITHUB_SHA"
-
-          echo "✅ Release created."
-
-      # ============================================================
-      # 20. FINAL STATUS
-      # ====
+            cp --reflink=auto -p
