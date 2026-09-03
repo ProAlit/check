@@ -363,6 +363,7 @@ jobs:
           fi
 
           umask 077
+
           printf '%s\n' "$WG_CONFIG" > /tmp/wg0.conf
 
           vpn_user="vpn-download"
@@ -380,23 +381,25 @@ jobs:
           echo "🔒 Configuring WireGuard for download traffic only"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # ------------------------------------------------------------
-          # Extract the values that wg(8) itself does NOT understand.
-          # We configure these manually below.
-          # ------------------------------------------------------------
+          # ============================================================
+          # EXTRACT INTERFACE ADDRESSES
+          # ============================================================
 
           ipv4_addresses="$(
             awk '
               BEGIN { IGNORECASE=1 }
+
               /^[[:space:]]*Address[[:space:]]*=/ {
                 value=$0
                 sub(/^[^=]*=/, "", value)
                 gsub(/[[:space:]]/, "", value)
 
                 n=split(value, a, ",")
+
                 for (i=1; i<=n; i++) {
-                  if (a[i] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/)
+                  if (a[i] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/) {
                     print a[i]
+                  }
                 }
               }
             ' /tmp/wg0.conf
@@ -405,47 +408,43 @@ jobs:
           ipv6_addresses="$(
             awk '
               BEGIN { IGNORECASE=1 }
+
               /^[[:space:]]*Address[[:space:]]*=/ {
                 value=$0
                 sub(/^[^=]*=/, "", value)
                 gsub(/[[:space:]]/, "", value)
 
                 n=split(value, a, ",")
+
                 for (i=1; i<=n; i++) {
-                  if (a[i] ~ /:/)
+                  if (a[i] ~ /:/) {
                     print a[i]
+                  }
                 }
               }
             ' /tmp/wg0.conf
           )"
 
-          # ------------------------------------------------------------
-          # Create a configuration containing ONLY settings understood
-          # directly by `wg setconf`.
+          # ============================================================
+          # CREATE PURE `wg` CONFIG
           #
-          # This deliberately removes:
-          #   Address
-          #   DNS
-          #   Table
-          #   MTU
-          #   PostUp / PostDown / PreUp / PreDown
-          #   SaveConfig
-          # ------------------------------------------------------------
+          # Remove wg-quick-only directives.
+          # ============================================================
 
           awk '
             BEGIN {
               IGNORECASE=1
             }
 
-            /^[[:space:]]*Address[[:space:]]*=/   { next }
-            /^[[:space:]]*DNS[[:space:]]*=/       { next }
-            /^[[:space:]]*Table[[:space:]]*=/     { next }
-            /^[[:space:]]*MTU[[:space:]]*=/       { next }
-            /^[[:space:]]*PreUp[[:space:]]*=/     { next }
-            /^[[:space:]]*PreDown[[:space:]]*=/   { next }
-            /^[[:space:]]*PostUp[[:space:]]*=/    { next }
-            /^[[:space:]]*PostDown[[:space:]]*=/  { next }
-            /^[[:space:]]*SaveConfig[[:space:]]*=/ { next }
+            /^[[:space:]]*Address[[:space:]]*=/       { next }
+            /^[[:space:]]*DNS[[:space:]]*=/           { next }
+            /^[[:space:]]*Table[[:space:]]*=/         { next }
+            /^[[:space:]]*MTU[[:space:]]*=/           { next }
+            /^[[:space:]]*PreUp[[:space:]]*=/         { next }
+            /^[[:space:]]*PreDown[[:space:]]*=/       { next }
+            /^[[:space:]]*PostUp[[:space:]]*=/        { next }
+            /^[[:space:]]*PostDown[[:space:]]*=/      { next }
+            /^[[:space:]]*SaveConfig[[:space:]]*=/    { next }
 
             { print }
           ' /tmp/wg0.conf > /tmp/wg0-wg.conf
@@ -457,25 +456,51 @@ jobs:
             's/(PrivateKey[[:space:]]*=[[:space:]]*).*/\1[REDACTED]/' \
             /tmp/wg0-wg.conf
 
-          # ------------------------------------------------------------
-          # Remove any stale interface.
-          # ------------------------------------------------------------
+          # ============================================================
+          # DETECT FULL-TUNNEL ROUTES
+          # ============================================================
+
+          has_ipv4_default="false"
+          has_ipv6_default="false"
+
+          if grep -Eiq \
+            '^[[:space:]]*AllowedIPs[[:space:]]*=.*0\.0\.0\.0/0' \
+            /tmp/wg0.conf; then
+
+            has_ipv4_default="true"
+
+          fi
+
+          if grep -Eiq \
+            '^[[:space:]]*AllowedIPs[[:space:]]*=.*::/0' \
+            /tmp/wg0.conf; then
+
+            has_ipv6_default="true"
+
+          fi
+
+          echo
+          echo "Detected IPv4 default route: $has_ipv4_default"
+          echo "Detected IPv6 default route: $has_ipv6_default"
+
+          # ============================================================
+          # REMOVE OLD INTERFACE
+          # ============================================================
 
           sudo ip link delete wg0 \
             2>/dev/null \
             || true
 
-          # ------------------------------------------------------------
-          # Create the WireGuard interface WITHOUT wg-quick.
-          #
-          # Therefore there is no possibility of Table=off reaching
-          # `wg setconf`.
-          # ------------------------------------------------------------
+          # ============================================================
+          # CREATE WIREGUARD INTERFACE
+          # ============================================================
 
           echo
           echo "🔧 Creating wg0..."
 
-          sudo ip link add wg0 type wireguard
+          sudo ip link add \
+            wg0 \
+            type wireguard
 
           echo "🔧 Applying WireGuard configuration..."
 
@@ -483,12 +508,14 @@ jobs:
             wg0 \
             /tmp/wg0-wg.conf
 
-          # ------------------------------------------------------------
-          # Configure addresses manually.
-          # ------------------------------------------------------------
+          # ============================================================
+          # ADD IPv4 ADDRESSES
+          # ============================================================
 
           if [ -n "$ipv4_addresses" ]; then
+
             while IFS= read -r address; do
+
               [ -n "$address" ] || continue
 
               echo "➕ IPv4 address: $address"
@@ -496,11 +523,19 @@ jobs:
               sudo ip -4 address add \
                 "$address" \
                 dev wg0
+
             done <<< "$ipv4_addresses"
+
           fi
 
+          # ============================================================
+          # ADD IPv6 ADDRESSES
+          # ============================================================
+
           if [ -n "$ipv6_addresses" ]; then
+
             while IFS= read -r address; do
+
               [ -n "$address" ] || continue
 
               echo "➕ IPv6 address: $address"
@@ -508,45 +543,25 @@ jobs:
               sudo ip -6 address add \
                 "$address" \
                 dev wg0
+
             done <<< "$ipv6_addresses"
+
           fi
 
-          # ------------------------------------------------------------
-          # Bring interface up.
-          # ------------------------------------------------------------
+          # ============================================================
+          # BRING INTERFACE UP
+          # ============================================================
 
           sudo ip link set \
             wg0 \
             up
 
-          # ------------------------------------------------------------
-          # Detect whether this profile contains IPv4 / IPv6 full tunnel.
-          # ------------------------------------------------------------
-
-          has_ipv4_default="false"
-          has_ipv6_default="false"
-
-          if grep -Eiq \
-            '^[[:space:]]*AllowedIPs[[:space:]]*=.*(^|,)[[:space:]]*0\.0\.0\.0/0([[:space:]]*,|$)' \
-            /tmp/wg0.conf; then
-            has_ipv4_default="true"
-          fi
-
-          if grep -Eiq \
-            '^[[:space:]]*AllowedIPs[[:space:]]*=.*(^|,)[[:space:]]*::/0([[:space:]]*,|$)' \
-            /tmp/wg0.conf; then
-            has_ipv6_default="true"
-          fi
-
-          # ------------------------------------------------------------
-          # Dedicated routing tables.
+          # ============================================================
+          # IPV4 POLICY ROUTING
           #
-          # 51820 = IPv4 VPN table
-          # 51821 = IPv6 VPN table
-          #
-          # ONLY vpn-download uses these tables.
-          # The GitHub Actions runner stays on the normal main table.
-          # ------------------------------------------------------------
+          # Only vpn-download uses table 51820.
+          # GitHub Actions remains on the normal routing table.
+          # ============================================================
 
           if [ "$has_ipv4_default" = "true" ]; then
 
@@ -564,7 +579,8 @@ jobs:
 
             sudo ip rule del \
               uidrange "${vpn_uid}-${vpn_uid}" \
-              table 51820 \
+              lookup 51820 \
+              priority 10020 \
               2>/dev/null \
               || true
 
@@ -574,6 +590,10 @@ jobs:
               priority 10020
 
           fi
+
+          # ============================================================
+          # IPV6 POLICY ROUTING
+          # ============================================================
 
           if [ "$has_ipv6_default" = "true" ]; then
 
@@ -591,7 +611,8 @@ jobs:
 
             sudo ip -6 rule del \
               uidrange "${vpn_uid}-${vpn_uid}" \
-              table 51821 \
+              lookup 51821 \
+              priority 10021 \
               2>/dev/null \
               || true
 
@@ -602,9 +623,9 @@ jobs:
 
           fi
 
-          # ------------------------------------------------------------
-          # Show resulting configuration.
-          # ------------------------------------------------------------
+          # ============================================================
+          # SHOW ROUTING
+          # ============================================================
 
           echo
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -619,43 +640,70 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
           if [ "$has_ipv4_default" = "true" ]; then
+
             echo
             echo "IPv4 table 51820:"
             sudo ip route show table 51820
+
             echo
-            echo "IPv4 rule:"
+            echo "IPv4 policy rules:"
             sudo ip rule show
+
           fi
 
           if [ "$has_ipv6_default" = "true" ]; then
+
             echo
             echo "IPv6 table 51821:"
             sudo ip -6 route show table 51821
+
             echo
-            echo "IPv6 rule:"
+            echo "IPv6 policy rules:"
             sudo ip -6 rule show
+
           fi
 
-          # ------------------------------------------------------------
-          # Give the VPN downloader ownership of its workspace.
-          # ------------------------------------------------------------
+          # ============================================================
+          # WORKSPACE OWNERSHIP
+          # ============================================================
 
           sudo chown \
             -R \
             "${vpn_user}:${vpn_user}" \
             work
 
-          # ------------------------------------------------------------
-          # Verify that NORMAL runner traffic still uses the normal
-          # connection.
-          # ------------------------------------------------------------
+          # ============================================================
+          # ROUTE VERIFICATION
+          # ============================================================
+
+          echo
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🧪 Route verification"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          if [ "$has_ipv4_default" = "true" ]; then
+
+            echo
+            echo "VPN-user IPv4 route to 1.1.1.1:"
+
+            sudo ip route get \
+              1.1.1.1 \
+              uid "$vpn_uid"
+
+          fi
+
+          # ============================================================
+          # NORMAL RUNNER TEST
+          #
+          # IMPORTANT: use -4, NOT --4.
+          # ============================================================
 
           echo
           echo "🧪 Testing normal runner connection..."
 
           runner_ip="$(
             curl \
-              --4 \
+              -4 \
               --silent \
               --show-error \
               --max-time 15 \
@@ -665,9 +713,15 @@ jobs:
 
           echo "🌐 Runner/public IPv4: $runner_ip"
 
-          # ------------------------------------------------------------
-          # Verify VPN traffic using the dedicated downloader user.
-          # ------------------------------------------------------------
+          if [ "$runner_ip" = "unavailable" ]; then
+            echo "⚠️ Normal runner IPv4 test failed."
+          fi
+
+          # ============================================================
+          # VPN-USER TEST
+          #
+          # IMPORTANT: use -4, NOT --4.
+          # ============================================================
 
           echo
           echo "🧪 Testing VPN downloader connection..."
@@ -677,7 +731,7 @@ jobs:
               -u "$vpn_user" \
               -H \
               curl \
-                --4 \
+                -4 \
                 --silent \
                 --show-error \
                 --max-time 20 \
@@ -688,14 +742,20 @@ jobs:
           echo "🌐 VPN downloader IPv4: $vpn_ip"
 
           if [ "$vpn_ip" = "unavailable" ]; then
+            echo
             echo "❌ VPN downloader cannot reach the internet."
+            echo
+            echo "Debugging information:"
+            sudo ip route get 1.1.1.1 uid "$vpn_uid" || true
+            sudo ip route show table 51820 || true
+            sudo wg show wg0 || true
             exit 1
           fi
 
           echo
-          echo "✅ WireGuard is connected."
-          echo "✅ GitHub runner traffic remains outside the VPN."
-          echo "✅ Download-user traffic is routed through wg0."
+          echo "✅ WireGuard connected successfully."
+          echo "✅ GitHub runner traffic remains on the normal route."
+          echo "✅ vpn-download traffic uses WireGuard."
 
           echo "vpn_user=$vpn_user" >> "$GITHUB_OUTPUT"
           echo "vpn_uid=$vpn_uid" >> "$GITHUB_OUTPUT"
