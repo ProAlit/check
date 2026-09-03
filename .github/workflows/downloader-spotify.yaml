@@ -151,7 +151,8 @@ jobs:
             aria2 \
             wireguard-tools \
             openssl \
-            dnsutils
+            dnsutils \
+            python3-venv
 
           echo "✅ System dependencies installed."
 
@@ -178,7 +179,7 @@ jobs:
           deno --version
 
       # ============================================================
-      # 04. PYTHON PACKAGES (INSTALLED SYSTEM-WIDE)
+      # 04. PYTHON ENVIRONMENT & PACKAGES (SHARED /opt/venv)
       # ============================================================
 
       - name: "📦 Install latest downloader packages"
@@ -188,24 +189,22 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          sudo python3 -m pip install \
-            --upgrade \
-            --break-system-packages \
-            --retries 5 \
-            --timeout 60 \
-            pip \
-            setuptools \
-            wheel
+          sudo python3 -m venv /opt/venv
+          sudo chown -R runner:docker /opt/venv
 
-          sudo python3 -m pip install \
-            --upgrade \
-            --break-system-packages \
+          /opt/venv/bin/pip install --upgrade pip
+
+          /opt/venv/bin/pip install \
             --retries 5 \
             --timeout 60 \
             spotdl \
             "yt-dlp[default]" \
             yt-dlp-ejs \
             bgutil-ytdlp-pot-provider
+
+          sudo chmod -R 755 /opt/venv
+
+          echo "/opt/venv/bin" >> "$GITHUB_PATH"
 
       # ============================================================
       # 05. TOOLCHAIN
@@ -214,6 +213,8 @@ jobs:
       - name: "🔎 Show installed versions"
         run: |
           set -Eeuo pipefail
+
+          export PATH="/opt/venv/bin:$PATH"
 
           echo "Python : $(python3 --version 2>&1)"
           echo "spotDL : $(spotdl --version 2>&1 || true)"
@@ -361,7 +362,6 @@ jobs:
           echo "🔒 Configuring WireGuard with reliable IPv4 routing"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # Extract IPv4 address
           ipv4_addresses="$(
             awk '
               BEGIN { IGNORECASE=1 }
@@ -379,7 +379,6 @@ jobs:
             ' /tmp/wg0.conf
           )"
 
-          # Extract DNS server from WG_CONFIG (if specified)
           vpn_dns="$(
             awk '
               BEGIN { IGNORECASE=1 }
@@ -393,7 +392,6 @@ jobs:
             ' /tmp/wg0.conf || true
           )"
 
-          # Strip wg-quick options for pure wg setconf
           awk '
             BEGIN { IGNORECASE=1 }
             /^[[:space:]]*Address[[:space:]]*=/       { next }
@@ -414,10 +412,9 @@ jobs:
           sudo ip link add wg0 type wireguard
           sudo wg setconf wg0 /tmp/wg0-wg.conf
 
-          # Set safe MTU to avoid cloud packet fragmentation/blackholes
+          # Safe MTU to avoid cloud packet fragmentation/blackholing
           sudo ip link set wg0 mtu 1360
 
-          # Add IPv4 Address
           if [ -n "$ipv4_addresses" ]; then
             while IFS= read -r address; do
               [ -n "$address" ] || continue
@@ -426,12 +423,11 @@ jobs:
             done <<< "$ipv4_addresses"
           fi
 
-          # Disable IPv6 on wg0 to prevent broken AAAA resolution over tunnel
+          # Disable IPv6 on wg0 to prevent broken AAAA resolution attempts
           sudo sysctl -w net.ipv6.conf.wg0.disable_ipv6=1 >/dev/null 2>&1 || true
 
           sudo ip link set wg0 up
 
-          # Configure IPv4 Policy Routing
           echo "🌐 Configuring IPv4 VPN routing table 51820..."
           sudo ip route flush table 51820 2>/dev/null || true
           sudo ip route add default dev wg0 table 51820
@@ -439,7 +435,6 @@ jobs:
           sudo ip rule del uidrange "${vpn_uid}-${vpn_uid}" lookup 51820 priority 10020 2>/dev/null || true
           sudo ip rule add uidrange "${vpn_uid}-${vpn_uid}" lookup 51820 priority 10020
 
-          # Configure Reliable DNS Resolvers for both Runner & VPN user
           echo "📡 Configuring DNS servers..."
           sudo rm -f /etc/resolv.conf
           {
@@ -472,7 +467,6 @@ jobs:
             exit 1
           fi
 
-          # Verify Spotify endpoint connectivity via VPN
           echo "🧪 Verifying Spotify connection over VPN..."
           if ! sudo -u "$vpn_user" -H curl -4 -sI --max-time 15 https://open.spotify.com >/dev/null; then
             echo "⚠️ Warning: HTTPS probe to open.spotify.com timed out or was blocked."
@@ -567,6 +561,8 @@ jobs:
 
         run: |
           set -Eeuo pipefail
+
+          export PATH="/opt/venv/bin:$PATH"
 
           FORMAT="$OUTPUT_FORMAT"
           QUALITY="$AUDIO_QUALITY"
@@ -1257,7 +1253,7 @@ jobs:
 
               sudo -u "$VPN_USER" -H env \
                 HOME="/home/${VPN_USER}" \
-                PATH="/usr/local/bin:$PATH" \
+                PATH="/opt/venv/bin:/usr/local/bin:$PATH" \
                 FORMAT="$FORMAT" \
                 QUALITY="$QUALITY" \
                 BITRATE="$BITRATE" \
@@ -1359,10 +1355,11 @@ jobs:
                 -o -iname '*.webm' \
                 -o -iname '*.aac' \
               \) \
-              -print0
+              -print0 2>/dev/null || true
           )
 
           for source in "${files[@]}"; do
+            [ -f "$source" ] || continue
             ext="${source##*.}"
             ext="${ext,,}"
 
@@ -1518,7 +1515,7 @@ jobs:
                 -iname '*.opus' -o \
                 -iname '*.wav' \
               \) \
-              -print0 |
+              -print0 2>/dev/null |
             sort -z
           )
 
@@ -1560,8 +1557,12 @@ jobs:
           total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
           success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
           failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
-          audio_count="$(find music -maxdepth 1 -type f \
-            \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \) | wc -l)"
+
+          audio_count=0
+          if [ -d music ]; then
+            audio_count="$(find music -maxdepth 1 -type f \
+              \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \) | wc -l)"
+          fi
 
           {
             echo "# 🎵 Music Downloader"
@@ -1612,22 +1613,24 @@ jobs:
           mkdir -p work/archive work/package
 
           audio_found=0
-          while IFS= read -r -d '' file; do
-            audio_found=$((audio_found + 1))
-            cp --reflink=auto -p "$file" work/package/
-          done < <(
-            find music -maxdepth 1 -type f \
-              \( \
-                -iname '*.mp3' -o \
-                -iname '*.flac' -o \
-                -iname '*.m4a' -o \
-                -iname '*.ogg' -o \
-                -iname '*.opus' -o \
-                -iname '*.wav' \
-              \) \
-              -print0 |
-            sort -z
-          )
+          if [ -d music ]; then
+            while IFS= read -r -d '' file; do
+              audio_found=$((audio_found + 1))
+              cp --reflink=auto -p "$file" work/package/
+            done < <(
+              find music -maxdepth 1 -type f \
+                \( \
+                  -iname '*.mp3' -o \
+                  -iname '*.flac' -o \
+                  -iname '*.m4a' -o \
+                  -iname '*.ogg' -o \
+                  -iname '*.opus' -o \
+                  -iname '*.wav' \
+                \) \
+                -print0 |
+              sort -z
+            )
+          fi
 
           if [ "$audio_found" -eq 0 ]; then
             echo "⚠️ No audio files to package."
@@ -2140,8 +2143,24 @@ jobs:
           total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
           success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
           failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
-          audio_count="$(find music -maxdepth 1 -type f \
-            \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \) | wc -l)"
+
+          audio_count=0
+          if [ -d music ]; then
+            audio_count="$(
+              find music \
+                -maxdepth 1 \
+                -type f \
+                \( \
+                  -iname '*.mp3' \
+                  -o -iname '*.flac' \
+                  -o -iname '*.m4a' \
+                  -o -iname '*.ogg' \
+                  -o -iname '*.opus' \
+                  -o -iname '*.wav' \
+                \) |
+              wc -l
+            )"
+          fi
 
           echo
           echo "╔══════════════════════════════════════════════════════════════╗"
