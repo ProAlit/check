@@ -99,9 +99,29 @@ on:
           - Safari-18.0:Ios-18.0
           - Safari-18.4:Ios-18.4
           - Safari-26.0:Ios-26.0
+          - Chrome-99:Android-12
           - Chrome-131:Android-14
+          - Tor-14.5:Macos-14
+          - Edge-99:Windows-10
           - Edge-101:Windows-10
+          - Firefox-133:Macos-14
           - Firefox-135:Macos-14
+          - Safari-15.3:Macos-14
+          - Safari-15.5:Macos-14
+          - Safari-17.0:Macos-14
+          - Safari-18.0:Macos-15
+          - Safari-18.4:Macos-15
+          - Safari-26.0:Macos-26
+          - Chrome-99:Windows-10
+          - Chrome-100:Windows-10
+          - Chrome-101:Windows-10
+          - Chrome-104:Windows-10
+          - Chrome-107:Windows-10
+          - Chrome-110:Windows-10
+          - Chrome-116:Windows-10
+          - Chrome-119:Macos-14
+          - Chrome-120:Macos-14
+          - Chrome-123:Macos-14
           - Chrome-124:Macos-14
           - Chrome-131:Macos-14
         default: None
