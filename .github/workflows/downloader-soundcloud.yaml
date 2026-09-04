@@ -4,13 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: >
-          Enter one or more SoundCloud URLs (track, set, playlist).
-          Separate by commas, spaces, or newlines.
+        description: "☁️ SoundCloud URLs (tracks, sets, playlists – separate by comma, space, or newline)"
         required: true
         type: string
+
       output_format:
-        description: "Output Format"
+        description: "🎧 Output audio format"
         required: true
         type: choice
         options:
@@ -21,413 +20,1241 @@ on:
           - m4a
           - wav
         default: mp3
+
       audio_quality:
-        description: "Audio Quality"
+        description: "🎚️ Audio bitrate / quality"
         required: true
         type: choice
         options:
-          - 128k
-          - 192k
-          - 256k
           - 320k
+          - 256k
+          - 192k
+          - 128k
         default: 320k
+
       upload_method:
-        description: 'Upload destination'
+        description: "☁️ Upload destination"
         required: true
         type: choice
         options:
-          - repo
-          - release
-          - drive
-        default: repo
-      vpn_enabled:
-        description: 'Route downloads through WireGuard VPN (requires secret WG_CONFIG)'
+          - drive         # Google Drive (folder: github-actions)
+          - repo          # Push to repository (split 90MB)
+          - release       # GitHub Release (split 1900MB)
+        default: drive
+
+      bundle_all:
+        description: "📦 Bundle all downloaded tracks into a single ZIP archive?"
+        required: true
         type: boolean
         default: false
+
+      vpn_enabled:
+        description: "🔒 Route downloads through VPN?"
+        required: true
+        type: boolean
+        default: false
+
+      vpn_type:
+        description: "🛡️ VPN Protocol (if VPN enabled)"
+        required: true
+        type: choice
+        options:
+          - wireguard
+          - openvpn
+        default: wireguard
+
       concurrent_downloads:
-        description: 'Number of URLs to download at the same time'
+        description: "⚡ Concurrent download workers"
+        required: true
         type: number
-        default: 4
-        required: false
+        default: 3
+
+      retry_count:
+        description: "🔄 Retries per URL"
+        required: true
+        type: number
+        default: 2
+
+      raw_logs:
+        description: "🧪 Show raw verbose logs in console?"
+        required: true
+        type: boolean
+        default: false
+
+      fail_on_partial:
+        description: "❌ Fail workflow if any URL fails?"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: soundcloud-downloader-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_PARALLEL: "3"
+  DEFAULT_RETRIES: "2"
+  DRIVE_CHUNK_SIZE: "16777216" # 16 MB Chunks
+  PIP_BREAK_SYSTEM_PACKAGES: "1"
+
 jobs:
-  music-download:
+  soundcloud-download:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Checkout Repository
+      # ============================================================
+      # 01. CHECKOUT
+      # ============================================================
+      - name: "📥 Checkout repository"
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: true
 
-      - name: Install Dependencies
-        shell: bash
+      # ============================================================
+      # 02. SYSTEM DEPENDENCIES
+      # ============================================================
+      - name: "🛠️ Install system dependencies"
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          set -e
-          echo "::group::System packages"
+          set -Eeuo pipefail
+
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg curl jq zip python3 python3-pip
-          echo "::endgroup::"
+          sudo apt-get install -y -qq \
+            ffmpeg \
+            curl \
+            jq \
+            zip \
+            unzip \
+            wireguard-tools \
+            openvpn \
+            openvpn-systemd-resolved \
+            openssl \
+            python3 \
+            python3-pip \
+            python-is-python3
 
-          echo "::group::Python tools"
-          pip3 install --quiet --upgrade pip
-          pip3 install --quiet --upgrade yt-dlp
-          echo "::endgroup::"
+          echo "✅ System dependencies installed."
 
-          echo "::group::Versions"
-          ffmpeg -version 2>&1 | head -n1
-          python3 --version
-          yt-dlp --version
-          echo "::endgroup::"
-
-      - name: Create Music Folder
-        run: mkdir -p music
-
-      - name: Parse and Filter SoundCloud URLs
-        id: parse
-        shell: bash
+      # ============================================================
+      # 03. PYTHON & YT-DLP TOOLCHAIN
+      # ============================================================
+      - name: "📦 Install latest yt-dlp & mutagen"
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
         run: |
-          RAW="${{ github.event.inputs.urls }}"
-          URLS=$(echo "$RAW" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+          set -Eeuo pipefail
 
-          if [ -z "$URLS" ]; then
-            echo "::error::No URLs provided."
+          python3 -m pip install --upgrade --break-system-packages pip setuptools wheel
+          python3 -m pip install --upgrade --break-system-packages \
+            "yt-dlp[default]" \
+            mutagen \
+            curl_cffi \
+            requests
+
+          echo "✅ Audio extraction toolchain ready."
+
+      # ============================================================
+      # 04. TOOLCHAIN VERIFICATION
+      # ============================================================
+      - name: "🔎 Show toolchain versions"
+        run: |
+          set -Eeuo pipefail
+
+          echo "Python : $(python3 --version 2>&1)"
+          echo "yt-dlp : $(yt-dlp --version 2>&1)"
+          echo "FFmpeg : $(ffmpeg -version | sed -n '1p')"
+
+      # ============================================================
+      # 05. WORKSPACE & IDENTIFIER
+      # ============================================================
+      - name: "📁 Initialize workspace"
+        run: |
+          set -Eeuo pipefail
+
+          RUN_SUFFIX="$(openssl rand -hex 4 | cut -c1-5)"
+          echo "RUN_SUFFIX=${RUN_SUFFIX}" >> "$GITHUB_ENV"
+          echo "🆔 Generated identifier: ${RUN_SUFFIX}"
+
+          rm -rf work output
+          mkdir -p \
+            work/downloads \
+            work/logs \
+            work/results \
+            work/failed \
+            work/archive \
+            work/package \
+            output
+
+          echo "✅ Workspace initialized."
+
+      # ============================================================
+      # 06. PARSE URLs (OCTAL BUG FIXED)
+      # ============================================================
+      - name: "🔗 Parse and validate URLs"
+        env:
+          RAW_URLS: ${{ inputs.urls }}
+        run: |
+          set -Eeuo pipefail
+
+          : > work/input_urls.txt
+          : > work/jobs.tsv
+
+          # Clean and separate input URLs
+          printf '%s\n' "$RAW_URLS" |
+            tr ',' '\n' |
+            sed 's/\r//g' |
+            awk '{for (i = 1; i <= NF; i++) print $i}' |
+            sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+            awk 'NF' |
+            sort -u > work/input_urls.txt
+
+          if [ ! -s work/input_urls.txt ]; then
+            echo "❌ No URLs supplied."
             exit 1
           fi
 
-          rm -f soundcloud_urls.txt
-
-          for url in $URLS; do
-            if [[ "$url" == *soundcloud.com* ]]; then
-              echo "$url" >> soundcloud_urls.txt
+          index=0
+          while IFS= read -r url; do
+            if [[ "$url" =~ ^https?://([a-zA-Z0-9_-]+\.)?soundcloud\.com/ ]]; then
+              index=$((index + 1))
+              # Output plain integer ID to guarantee no octal interpretation errors
+              printf '%d\t%s\n' "$index" "$url" >> work/jobs.tsv
             else
-              echo "::warning::Skipping non-SoundCloud URL: $url"
+              echo "⚠️ Unsupported non-SoundCloud URL skipped: $url"
             fi
-          done
+          done < work/input_urls.txt
 
-          echo "::group::SoundCloud URLs to download"
-          cat soundcloud_urls.txt 2>/dev/null || echo "(none)"
-          echo "::endgroup::"
-
-          if [ -s soundcloud_urls.txt ]; then
-            echo "HAS_SOUNDCLOUD=true" >> $GITHUB_OUTPUT
-          else
-            echo "::error::No valid SoundCloud URLs found."
-            echo "HAS_SOUNDCLOUD=false" >> $GITHUB_OUTPUT
+          if [ ! -s work/jobs.tsv ]; then
+            echo "❌ No valid SoundCloud URLs found."
             exit 1
           fi
 
-      - name: '🔒 Set up WireGuard VPN (if enabled)'
-        id: vpn
-        shell: bash
-        run: |
-          VPN_ENABLED="${{ inputs.vpn_enabled }}"
-          echo "VPN_ENABLED=$VPN_ENABLED"
+          echo "Accepted URLs: $(wc -l < work/jobs.tsv)"
+          cat work/jobs.tsv
 
-          if [ "$VPN_ENABLED" = "true" ]; then
-            if [ -z "${{ secrets.WG_CONFIG }}" ]; then
-              echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
-              echo "vpn_available=false" >> $GITHUB_OUTPUT
+      # ============================================================
+      # 07. VPN CONFIGURATION (WIREGUARD & OPENVPN)
+      # ============================================================
+      - name: "🔒 Configure VPN (WireGuard / OpenVPN)"
+        id: vpn
+        env:
+          VPN_ENABLED: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+          OVPN_CONFIG: ${{ secrets.OVPN_CONFIG }}
+          OVPN_AUTH: ${{ secrets.OVPN_AUTH }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ "$VPN_ENABLED" != "true" ]; then
+            echo "🚫 VPN disabled by input."
+            echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "🛡️ Configuring VPN protocol: ${VPN_TYPE}"
+
+          if [ "$VPN_TYPE" = "wireguard" ]; then
+            if [ -z "$WG_CONFIG" ]; then
+              echo "⚠️ WireGuard requested but WG_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
-            echo "→ Installing WireGuard tools..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get install -y -qq wireguard-tools
+            umask 077
+            printf '%s\n' "$WG_CONFIG" > /tmp/wg0.conf
+            sudo install -m 600 /tmp/wg0.conf /etc/wireguard/wg0.conf
 
-            echo "→ Writing WireGuard config..."
-            cat <<'EOF' > /tmp/wg0.conf
-          ${{ secrets.WG_CONFIG }}
-          EOF
-            sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
-            sudo chmod 600 /etc/wireguard/wg0.conf
-
-            echo "→ Bringing up wg0..."
             if sudo wg-quick up wg0; then
-              echo "✅ WireGuard VPN connected."
-              echo "vpn_available=true" >> $GITHUB_OUTPUT
+              echo "✅ WireGuard connected."
+              public_ip="$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org || echo "unavailable")"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
             else
-              echo "⚠️ Failed to bring up WireGuard – VPN disabled."
-              sudo wg-quick down wg0 2>/dev/null || true
-              echo "vpn_available=false" >> $GITHUB_OUTPUT
+              echo "❌ WireGuard failed."
+              sudo wg-quick down wg0 >/dev/null 2>&1 || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
             fi
-          else
-            echo "vpn_available=false" >> $GITHUB_OUTPUT
+
+          elif [ "$VPN_TYPE" = "openvpn" ]; then
+            if [ -z "$OVPN_CONFIG" ]; then
+              echo "⚠️ OpenVPN requested but OVPN_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ ! -c /dev/net/tun ]; then
+              sudo mkdir -p /dev/net
+              sudo mknod /dev/net/tun c 10 200
+              sudo chmod 600 /dev/net/tun
+            fi
+
+            umask 077
+            printf '%s\n' "$OVPN_CONFIG" > /tmp/client.ovpn
+
+            if [ -n "$OVPN_AUTH" ]; then
+              printf '%s\n' "$OVPN_AUTH" > /tmp/ovpn-auth.txt
+              chmod 600 /tmp/ovpn-auth.txt
+              echo "auth-user-pass /tmp/ovpn-auth.txt" >> /tmp/client.ovpn
+            fi
+
+            echo "🚀 Starting OpenVPN daemon..."
+            sudo openvpn --config /tmp/client.ovpn --daemon --log /tmp/openvpn.log
+
+            echo "⏳ Waiting for OpenVPN tunnel interface..."
+            ready="false"
+            for attempt in $(seq 1 30); do
+              if ip link show dev tun0 >/dev/null 2>&1 || ip link show dev tun1 >/dev/null 2>&1; then
+                ready="true"
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$ready" = "true" ]; then
+              echo "✅ OpenVPN connected."
+              sleep 2
+              public_ip="$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org || echo "unavailable")"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ OpenVPN failed to connect."
+              cat /tmp/openvpn.log 2>/dev/null || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
-      - name: Download SoundCloud (parallel + VPN)
-        if: steps.parse.outputs.HAS_SOUNDCLOUD == 'true'
-        shell: bash
+      # ============================================================
+      # 08. DOWNLOAD ENGINE (SOUNDCLOUD VIA YT-DLP)
+      # ============================================================
+      - name: "⬇️ Download SoundCloud tracks"
+        env:
+          OUTPUT_FORMAT: ${{ inputs.output_format }}
+          AUDIO_QUALITY: ${{ inputs.audio_quality }}
+          CONCURRENT_WORKERS: ${{ inputs.concurrent_downloads }}
+          RETRY_COUNT: ${{ inputs.retry_count }}
+          RAW_LOGS: ${{ inputs.raw_logs }}
+          VPN_AVAILABLE: ${{ steps.vpn.outputs.vpn_available }}
         run: |
-          set -x
-          FORMAT="${{ github.event.inputs.output_format }}"
-          QUALITY="${{ github.event.inputs.audio_quality }}"
-          VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
-          CONCURRENT="${{ inputs.concurrent_downloads }}"
+          set -Eeuo pipefail
 
-          FAILED="failed_urls.txt"
-          rm -f "$FAILED"
-          FAILED_LOCK="/tmp/sc_failed.lock"
+          FORMAT="$OUTPUT_FORMAT"
+          QUALITY="$AUDIO_QUALITY"
+          WORKERS="$CONCURRENT_WORKERS"
+          RETRIES="$RETRY_COUNT"
 
-          echo "::group::SoundCloud download config"
-          echo "Format        : $FORMAT"
-          echo "Quality       : $QUALITY"
-          echo "VPN available : $VPN_AVAILABLE"
-          echo "Parallel jobs : $CONCURRENT"
-          echo "::endgroup::"
+          if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then WORKERS="$DEFAULT_PARALLEL"; fi
+          if ! [[ "$RETRIES" =~ ^[1-9][0-9]*$ ]]; then RETRIES="$DEFAULT_RETRIES"; fi
 
-          download_one() {
-            local url="$1"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "▶ Downloading: $url"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          now() { date '+%H:%M:%S'; }
 
-            if yt-dlp \
-              -x \
-              --audio-format "$FORMAT" \
-              --audio-quality "$QUALITY" \
-              --embed-thumbnail \
-              --embed-metadata \
-              -o "music/%(artist)s - %(title)s.%(ext)s" \
-              "$url"; then
-              echo "✅ Success: $url"
+          format_duration() {
+            local secs="$1"
+            if [ "$secs" -ge 3600 ]; then
+              printf '%dh %dm %ds' $((secs / 3600)) $(( (secs % 3600) / 60 )) $((secs % 60))
+            elif [ "$secs" -ge 60 ]; then
+              printf '%dm %ds' $((secs / 60)) $((secs % 60))
             else
-              echo "❌ Failed: $url"
-              flock "$FAILED_LOCK" bash -c "echo \"$url\" >> \"$FAILED\""
-              return 1
+              printf '%ds' "$secs"
             fi
           }
 
-          export -f download_one
-          export FORMAT QUALITY FAILED FAILED_LOCK
-
-          echo "→ Starting parallel downloads (max $CONCURRENT concurrent)"
-          cat soundcloud_urls.txt | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"'
-
-          echo "::group::Download summary"
-          ls -lh music/ 2>/dev/null || echo "No files yet"
-          if [ -s "$FAILED" ]; then
-            echo "::warning::Failed URLs:"
-            cat "$FAILED"
-          else
-            echo "All downloads succeeded."
-          fi
-          echo "::endgroup::"
-          set +x
-
-      - name: Collect Failed URLs
-        if: always()
-        shell: bash
-        run: |
-          if [ -f failed_urls.txt ] && [ -s failed_urls.txt ]; then
-            echo "::warning::Some downloads failed. Adding failed_downloads.txt to archive."
-            cp failed_urls.txt music/failed_downloads.txt
-          else
-            echo "No failed downloads – no fail log needed."
-          fi
-
-      - name: Validate Download
-        shell: bash
-        run: |
-          SONG_COUNT=$(find music -type f ! -name 'failed_downloads.txt' | wc -l)
-          if [ "$SONG_COUNT" -eq 0 ]; then
-            echo "::error::No audio files were downloaded. Exiting."
-            exit 1
-          fi
-          echo "Total songs downloaded: $SONG_COUNT"
-          ls -lh music/
-
-      - name: '🔌 Disconnect VPN for uploads'
-        if: steps.vpn.outputs.vpn_available == 'true'
-        run: |
-          echo "→ Bringing down WireGuard to use runner's native internet for uploads"
-          sudo wg-quick down wg0
-
-      - name: Archive Music Folder
-        id: archive
-        shell: bash
-        run: |
-          UPLOAD_METHOD="${{ inputs.upload_method }}"
-
-          if [ "$UPLOAD_METHOD" = "repo" ]; then
-            METHOD="split_push"
-          else
-            METHOD="release"
-          fi
-
-          RANDOM_STR=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_lowercase + string.digits, k=5)))")
-          BASE_NAME="soundcloud-${RANDOM_STR}"
-          ZIP_NAME="${BASE_NAME}.zip"
-
-          echo "Upload method: $METHOD"
-
-          rm -rf music_archive
-          mkdir -p music_archive
-
-          cd music || exit 1
-
-          if [ "$METHOD" = "release" ]; then
-            echo "Creating unsplit ZIP (will split only if > 1950 MiB)"
-            zip -r "../music_archive/${ZIP_NAME}" .
-            FULLZIP="../music_archive/${ZIP_NAME}"
-            SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-            if [ "$SIZE" -gt 2044723200 ]; then
-              echo "ZIP larger than 1950 MiB, splitting into 1950M parts"
-              rm "$FULLZIP"
-              zip -r -s 1950m "../music_archive/${ZIP_NAME}" .
+          format_bytes() {
+            local bytes="$1"
+            if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then
+              echo "0 B"
+              return
             fi
-          else
-            echo "Creating split ZIP (99 MB parts)"
-            zip -r -s 99m "../music_archive/${ZIP_NAME}" .
-          fi
-          cd ..
+            numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || awk -v b="$bytes" 'BEGIN {
+              split("B KB MB GB TB", units, " ");
+              i=1;
+              while(b>=1024 && i<5) { b/=1024; i++ }
+              printf "%.2f %s", b, units[i]
+            }'
+          }
 
-          rm -rf music/*
-          mv music_archive/* music/
-          rmdir music_archive 2>/dev/null || true
+          safe_log() {
+            (
+              flock -x 200
+              printf '%b\n' "$1"
+            ) 200>/tmp/terminal.lock
+          }
 
-          ls -lh music/
-          ls -1 music > music_assets.txt
-          echo "Assets list:"
-          cat music_assets.txt
+          log_timing() {
+            local id="$1"
+            local message="$2"
+            printf '[%s] %s\n' "$(now)" "$message" >> "work/logs/${id}-timing.log"
+          }
 
-      - name: "Upload to Google Drive"
-        if: inputs.upload_method == 'drive'
-        env:
-          CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-        run: |
-          ACCESS_TOKEN=$(curl -s -X POST https://oauth2.googleapis.com/token \
-            -d client_id="$CLIENT_ID" \
-            -d client_secret="$CLIENT_SECRET" \
-            -d refresh_token="$REFRESH_TOKEN" \
-            -d grant_type=refresh_token | jq -r '.access_token')
-          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "❌ Failed to obtain access token"
-            exit 1
-          fi
+          has_audio() {
+            local dir="$1"
+            find "$dir" -type f \( \
+              -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' \
+              -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \
+              -o -iname '*.aac' \
+            \) 2>/dev/null | grep -q .
+          }
 
-          FOLDER_NAME="github-actions"
-          QUERY="mimeType='application/vnd.google-apps.folder' and name='$FOLDER_NAME' and trashed=false"
-          FOLDER_ID=$(curl -s -G \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            --data-urlencode "q=$QUERY" \
-            --data-urlencode "fields=files(id)" \
-            "https://www.googleapis.com/drive/v3/files" | jq -r '.files[0].id // ""')
-          if [ -z "$FOLDER_ID" ]; then
-            echo "→ Creating folder '$FOLDER_NAME'"
-            FOLDER_ID=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"name\":\"$FOLDER_NAME\", \"mimeType\":\"application/vnd.google-apps.folder\"}" \
-              "https://www.googleapis.com/drive/v3/files?fields=id" | jq -r '.id')
-            if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
-              echo "❌ Failed to create folder"
-              exit 1
-            fi
-          fi
-          echo "✅ Folder ID: $FOLDER_ID"
+          run_soundcloud_download() {
+            local id="$1" url="$2" attempt="$3"
+            local dir="work/downloads/${id}"
+            local logfile="work/logs/${id}-attempt-${attempt}.log"
 
-          for file in music/*; do
-            [ -f "$file" ] || continue
-            fname=$(basename "$file")
-            size=$(stat -c%s "$file")
-            echo "→ Uploading $fname ($size bytes)..."
+            mkdir -p "$dir"
 
-            SESSION_URI=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json; charset=UTF-8" \
-              -H "X-Upload-Content-Type: application/zip" \
-              -d "{\"name\":\"$fname\", \"parents\":[\"$FOLDER_ID\"]}" \
-              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable" \
-              -D - | tr -d '\r' | grep -i '^location:' | sed 's/^location: //i' | tr -d ' ')
-            if [ -z "$SESSION_URI" ]; then
-              echo "❌ Failed to initiate upload session for $fname, skipping"
-              continue
-            fi
+            local -a cmd=(
+              yt-dlp
+              --ignore-config
+              --newline
+              --continue
+              --no-overwrites
+              --retries 5
+              --fragment-retries 5
+              --socket-timeout 30
+              -x
+              --audio-format "$FORMAT"
+              --audio-quality "$QUALITY"
+              --embed-thumbnail
+              --embed-metadata
+              -o "${dir}/%(artist,uploader)s - %(title)s.%(ext)s"
+              "$url"
+            )
 
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Length: $size" \
-              -H "Content-Range: bytes 0-$((size-1))/$size" \
-              --data-binary "@$file" \
-              "$SESSION_URI")
-            if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
-              echo "✅ Uploaded $fname"
+            local exit_code=0
+            if [ "$RAW_LOGS" = "true" ]; then
+              set +e
+              timeout 1200 "${cmd[@]}" >> "work/logs/${id}-raw.log" 2>&1
+              exit_code=$?
+              set -e
             else
-              echo "❌ Upload failed with HTTP $HTTP_CODE"
+              set +e
+              timeout 1200 "${cmd[@]}" > "$logfile" 2>&1
+              exit_code=$?
+              set -e
             fi
+
+            if [ "$exit_code" -eq 0 ] && has_audio "$dir"; then
+              return 0
+            fi
+            return 1
+          }
+
+          process_one() {
+            local id_raw="$1"
+            local url="$2"
+
+            # Parse base 10 integer to bypass bash octal evaluation errors
+            local id=$((10#$id_raw))
+            local id_fmt
+            id_fmt="$(printf '%04d' "$id")"
+
+            local dir="work/downloads/${id}"
+            mkdir -p "$dir"
+            : > "work/logs/${id}-timing.log"
+
+            local start_sec="$(date +%s)"
+            local started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local status="failed"
+            local reason="exhausted"
+            local items_count=0
+            local total_size=0
+            local summary_name="N/A"
+            local speed_str="0 B/s"
+
+            safe_log "[$(now)] 🚀 #${id_fmt} (soundcloud) STARTING  │ ${url} [${FORMAT} @ ${QUALITY}]"
+
+            for attempt in $(seq 1 "$RETRIES"); do
+              local attempt_start="$(date +%s)"
+              log_timing "$id" "⚡ stream extraction attempt ${attempt}/${RETRIES}"
+
+              if run_soundcloud_download "$id" "$url" "$attempt"; then
+                local attempt_elapsed=$(( $(date +%s) - attempt_start ))
+                status="success"
+                reason="completed"
+                log_timing "$id" "🏁 Download succeeded ── took $(format_duration "$attempt_elapsed") ── ✅ SUCCESS"
+                break
+              else
+                local attempt_elapsed=$(( $(date +%s) - attempt_start ))
+                log_timing "$id" "✖ Attempt ${attempt} failed ── took $(format_duration "$attempt_elapsed") ── ⚠ RETRYING"
+                sleep $((attempt * 3))
+              fi
+            done
+
+            mapfile -t prod_files < <(find "$dir" -type f \( \
+              -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' \
+              -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \
+              -o -iname '*.aac' \
+            \) 2>/dev/null)
+
+            items_count="${#prod_files[@]}"
+
+            if [ "$items_count" -gt 0 ]; then
+              summary_name="$(basename "${prod_files[0]}")"
+              if [ "$items_count" -gt 1 ]; then
+                summary_name="${summary_name} (+ $((items_count - 1)) more)"
+              fi
+
+              for f in "${prod_files[@]}"; do
+                local sz="$(stat -c%s "$f" 2>/dev/null || echo 0)"
+                total_size=$((total_size + sz))
+              done
+            fi
+
+            local finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local total_elapsed=$(( $(date +%s) - start_sec ))
+            local total_duration="$(format_duration "$total_elapsed")"
+
+            if [ "$total_elapsed" -gt 0 ] && [ "$total_size" -gt 0 ]; then
+              local spd_bps=$(( total_size / total_elapsed ))
+              speed_str="$(format_bytes "$spd_bps")/s"
+            fi
+
+            if [ "$status" != "success" ]; then
+              printf '%s\t%s\n' "$id" "$url" > "work/failed/${id}.tsv"
+              printf '%s\n' "SoundCloud extraction failed after retries" > "work/failed/${id}.reason"
+            fi
+
+            jq -n \
+              --arg id "$id" \
+              --arg url "$url" \
+              --arg status "$status" \
+              --arg title "$summary_name" \
+              --arg count "$items_count" \
+              --arg size "$total_size" \
+              --arg format "$FORMAT" \
+              --arg quality "$QUALITY" \
+              --arg duration "$total_duration" \
+              --arg speed "$speed_str" \
+              --arg started "$started_at" \
+              --arg finished "$finished_at" \
+              '{
+                index: ($id | tonumber),
+                url: $url,
+                status: $status,
+                filename: $title,
+                items_count: ($count | tonumber),
+                size_bytes: ($size | tonumber),
+                format: $format,
+                quality: $quality,
+                duration: $duration,
+                speed: $speed,
+                started_at: $started,
+                finished_at: $finished
+              }' > "work/results/${id}.json"
+
+            (
+              flock -x 200
+              echo
+              echo "┌──────────────────────────────────────────────────────────────────────────────"
+              if [ "$status" = "success" ]; then
+                printf '│ ☁️ SOUNDCLOUD #%s — ✅ SUCCESS (Total: %s — %s — %s)\n' \
+                  "$id_fmt" "$total_duration" "$(format_bytes "$total_size")" "$speed_str"
+                printf '│ Track : %s [%d file(s)]\n' "$summary_name" "$items_count"
+              else
+                printf '│ ☁️ SOUNDCLOUD #%s — ❌ FAILED (Total: %s)\n' "$id_fmt" "$total_duration"
+              fi
+              printf '│ URL   : %s\n' "$url"
+              printf '│ Mode  : Audio (%s @ %s)\n' "$FORMAT" "$QUALITY"
+              echo "│ Steps & Provider Timing:"
+              if [ -s "work/logs/${id}-timing.log" ]; then
+                sed 's/^/│   /' "work/logs/${id}-timing.log"
+              else
+                echo "│   (No step timing recorded)"
+              fi
+              echo "└──────────────────────────────────────────────────────────────────────────────"
+              echo
+
+              if [ "$RAW_LOGS" = "true" ] && [ -f "work/logs/${id}-raw.log" ]; then
+                echo "--- [RAW LOGS FOR #${id_fmt}] ---"
+                cat "work/logs/${id}-raw.log"
+                echo "--- [END RAW LOGS FOR #${id_fmt}] ---"
+                echo
+              fi
+            ) 200>/tmp/terminal.lock
+          }
+
+          echo "🚀 Concurrency Workers: $WORKERS"
+          echo "🔄 Max Retries: $RETRIES"
+          echo
+
+          running=0
+          while IFS=$'\t' read -r id url; do
+            process_one "$id" "$url" &
+            running=$((running + 1))
+
+            if [ "$running" -ge "$WORKERS" ]; then
+              wait -n 2>/dev/null || true
+              running=$((running - 1))
+            fi
+          done < work/jobs.tsv
+
+          wait || true
+
+          echo
+          echo "Download round summary:"
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+
+          echo "Requested : $total"
+          echo "Successful: $success"
+          echo "Failed    : $failed"
+
+      # ============================================================
+      # 09. COLLECT FINAL FILES
+      # ============================================================
+      - name: "📚 Collect final files"
+        id: collect
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf output
+          mkdir -p output
+
+          count=0
+          total_bytes=0
+
+          while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            dest="output/$base"
+
+            if [ -e "$dest" ]; then
+              count=$((count + 1))
+              ext="${base##*.}"
+              name="${base%.*}"
+              dest="output/${name}_${count}.${ext}"
+            else
+              count=$((count + 1))
+            fi
+
+            cp --reflink=auto -p "$file" "$dest"
+            size="$(stat -c%s "$dest")"
+            total_bytes=$((total_bytes + size))
+          done < <(
+            find work/downloads -mindepth 2 -maxdepth 2 -type f \( \
+              -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' \
+              -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' \
+              -o -iname '*.aac' \
+            \) -print0 | sort -z
+          )
+
+          failed_report="output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt"
+          : > "$failed_report"
+          failed_count=0
+
+          for result in work/results/*.json; do
+            [ -f "$result" ] || continue
+            status="$(jq -r '.status' "$result")"
+            [ "$status" = "success" ] && continue
+
+            url="$(jq -r '.url' "$result")"
+            failed_count=$((failed_count + 1))
+            echo "$url" >> "$failed_report"
           done
 
-      - name: Upload to repository (split_push method)
-        if: ${{ inputs.upload_method == 'repo' }}
-        env:
-          BRANCH: ${{ github.ref_name }}
+          if [ "$failed_count" -eq 0 ]; then
+            rm -f "$failed_report"
+          fi
+
+          echo "FINAL_FILE_COUNT=$count" >> "$GITHUB_OUTPUT"
+          echo "TOTAL_BYTES=$total_bytes" >> "$GITHUB_OUTPUT"
+          echo "FAILED_COUNT=$failed_count" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Final collected audio: $count ($total_bytes bytes)"
+          echo "Failed URLs          : $failed_count"
+
+      # ============================================================
+      # 10. DISCONNECT VPN (BEFORE UPLOADS)
+      # ============================================================
+      - name: "🔌 Disconnect VPN for uploads"
         run: |
+          set +e
+          sudo killall openvpn >/dev/null 2>&1 || true
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+          echo "✅ VPN disconnected. Runner native gigabit bandwidth active for uploads."
+
+      # ============================================================
+      # 11. PACKAGE ASSETS (ZIP / SPLIT)
+      # ============================================================
+      - name: "📦 Package output"
+        id: archive
+        env:
+          BUNDLE_ALL: ${{ inputs.bundle_all }}
+          UPLOAD_METHOD: ${{ inputs.upload_method }}
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf work/archive work/package
+          mkdir -p work/archive work/package
+
+          files_found=0
+          while IFS= read -r -d '' file; do
+            files_found=$((files_found + 1))
+            cp --reflink=auto -p "$file" work/package/
+          done < <(find output -maxdepth 1 -type f ! -name 'FAILED-DOWNLOADS-*' -print0 | sort -z)
+
+          if [ "$files_found" -eq 0 ]; then
+            echo "⚠️ No audio files to package."
+            echo "HAS_ASSETS=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          is_disk_full() {
+            local msg="$1"
+            [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
+          }
+
+          if [ "$BUNDLE_ALL" = "true" ]; then
+            zip_name="soundcloud_bundle_${RUN_SUFFIX}.zip"
+            echo "📦 Bundling all files into: $zip_name"
+
+            set +e
+            if [ "$UPLOAD_METHOD" = "repo" ]; then
+              zip_err="$( (cd work/package && zip -0 -s 90m -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            elif [ "$UPLOAD_METHOD" = "release" ]; then
+              zip_err="$( (cd work/package && zip -0 -s 1900m -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            else
+              zip_err="$( (cd work/package && zip -0 -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            fi
+            set -e
+
+            if [ "$zip_code" -ne 0 ]; then
+              if is_disk_full "$zip_err" && [ "$UPLOAD_METHOD" = "drive" ]; then
+                echo "⚠️ Disk full during bundling. Uploading raw media directly to Google Drive."
+                cp -p work/package/* work/archive/
+              else
+                echo "❌ Zipping failed: $zip_err"
+                exit 1
+              fi
+            fi
+
+          else
+            index=0
+            while IFS= read -r -d '' file; do
+              index=$((index + 1))
+              base="$(basename "$file")"
+              safe="$(printf '%s' "$base" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
+              zip_name="single-${index}-${safe}-${RUN_SUFFIX}.zip"
+
+              set +e
+              if [ "$UPLOAD_METHOD" = "repo" ]; then
+                (cd work/package && zip -0 -s 90m "../../work/archive/${zip_name}" "$base")
+              elif [ "$UPLOAD_METHOD" = "release" ]; then
+                (cd work/package && zip -0 -s 1900m "../../work/archive/${zip_name}" "$base")
+              else
+                (cd work/package && zip -0 "../../work/archive/${zip_name}" "$base")
+              fi
+              set -e
+            done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
+          fi
+
+          find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+
+          echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
+          echo
+          echo "📦 Final package contents in output/:"
+          ls -lh output/
+
+      # ============================================================
+      # 12. GITHUB STEP SUMMARY
+      # ============================================================
+      - name: "📊 Write GitHub summary"
+        env:
+          FORMAT_INPUT: ${{ inputs.output_format }}
+          QUALITY_INPUT: ${{ inputs.audio_quality }}
+          UPLOAD_INPUT: ${{ inputs.upload_method }}
+          BUNDLE_INPUT: ${{ inputs.bundle_all }}
+          VPN_INPUT: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
+        run: |
+          set -Eeuo pipefail
+
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          file_count="${{ steps.collect.outputs.FINAL_FILE_COUNT || 0 }}"
+          total_bytes="${{ steps.collect.outputs.TOTAL_BYTES || 0 }}"
+          formatted_bytes="$(numfmt --to=iec-i --suffix=B "$total_bytes" 2>/dev/null || echo "$total_bytes bytes")"
+
+          {
+            echo "# ☁️ SoundCloud Downloader"
+            echo
+            echo "## Configuration"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Output Format | \`$FORMAT_INPUT\` |"
+            echo "| Audio Quality | \`$QUALITY_INPUT\` |"
+            echo "| Upload Destination | \`$UPLOAD_INPUT\` |"
+            echo "| Bundle into Single ZIP | \`$BUNDLE_INPUT\` |"
+            echo "| VPN Enabled | \`$VPN_INPUT\` ($VPN_TYPE) |"
+            echo
+            echo "## Result"
+            echo
+            echo "| Metric | Count / Size |"
+            echo "|---|---:|"
+            echo "| Requested URLs | $total |"
+            echo "| Successful | $success |"
+            echo "| Failed | $failed |"
+            echo "| Downloaded Tracks | $file_count |"
+            echo "| Total Payload Size | $formatted_bytes |"
+            echo
+            echo "## Download Breakdown"
+            echo '| # | Status | Track / Set Summary | Format | Size | Speed | Duration |'
+            echo '|---|---|---|---|---|---|---|'
+            for res in work/results/*.json; do
+              [ -f "$res" ] || continue
+              idx="$(jq -r '.index' "$res")"
+              st="$(jq -r '.status' "$res")"
+              fn="$(jq -r '.filename // "N/A"' "$res")"
+              fmt="$(jq -r '.format' "$res")"
+              sz="$(jq -r '.size_bytes' "$res")"
+              spd="$(jq -r '.speed' "$res")"
+              dur="$(jq -r '.duration' "$res")"
+              sz_fmt="$(numfmt --to=iec-i --suffix=B "$sz" 2>/dev/null || echo "$sz B")"
+              [ "$st" = "success" ] && icon="✅" || icon="❌"
+              echo "| $idx | $icon $st | \`$fn\` | $fmt | $sz_fmt | $spd | $dur |"
+            done
+            echo
+            if [ -f "output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt" ]; then
+              echo "### ⚠️ Failed URLs"
+              echo '```text'
+              cat "output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ============================================================
+      # 13. DIAGNOSTICS
+      # ============================================================
+      - name: "📊 Upload diagnostics"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloader-diagnostics-${{ github.run_number }}
+          path: |
+            work/logs/
+            work/results/
+            work/failed/
+            work/jobs.tsv
+            output/FAILED-DOWNLOADS-*.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
+      # ============================================================
+      # 14. GOOGLE DRIVE UPLOAD (RESUMABLE CHUNKS)
+      # ============================================================
+      - name: "☁️ Upload to Google Drive"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'drive'
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_FOLDER_NAME: "github-actions"
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "$GOOGLE_CLIENT_ID" ] ||
+             [ -z "$GOOGLE_CLIENT_SECRET" ] ||
+             [ -z "$GOOGLE_REFRESH_TOKEN" ]; then
+            echo "❌ Google Drive credentials are missing in secrets."
+            exit 1
+          fi
+
+          token_json="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --request POST \
+              https://oauth2.googleapis.com/token \
+              --data-urlencode "client_id=${GOOGLE_CLIENT_ID}" \
+              --data-urlencode "client_secret=${GOOGLE_CLIENT_SECRET}" \
+              --data-urlencode "refresh_token=${GOOGLE_REFRESH_TOKEN}" \
+              --data-urlencode "grant_type=refresh_token"
+          )"
+
+          access_token="$(jq -r '.access_token // empty' <<< "$token_json")"
+
+          if [ -z "$access_token" ]; then
+            echo "❌ Could not obtain Google Drive access token."
+            exit 1
+          fi
+
+          query="mimeType='application/vnd.google-apps.folder' and name='${DRIVE_FOLDER_NAME}' and trashed=false"
+
+          folder_response="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --get \
+              https://www.googleapis.com/drive/v3/files \
+              -H "Authorization: Bearer ${access_token}" \
+              --data-urlencode "q=${query}" \
+              --data-urlencode "fields=files(id,name)"
+          )"
+
+          folder_id="$(jq -r '.files[0].id // empty' <<< "$folder_response")"
+
+          if [ -z "$folder_id" ]; then
+            body="$(
+              jq -n \
+                --arg name "$DRIVE_FOLDER_NAME" \
+                '{
+                  name: $name,
+                  mimeType: "application/vnd.google-apps.folder"
+                }'
+            )"
+
+            folder_id="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --retry 5 \
+                --retry-delay 2 \
+                --retry-all-errors \
+                --request POST \
+                https://www.googleapis.com/drive/v3/files \
+                -H "Authorization: Bearer ${access_token}" \
+                -H "Content-Type: application/json" \
+                --data "$body" |
+              jq -r '.id // empty'
+            )"
+          fi
+
+          if [ -z "$folder_id" ]; then
+            echo "❌ Could not locate or create Drive folder."
+            exit 1
+          fi
+
+          upload_file() {
+            local file="$1"
+            local name size
+            name="$(basename "$file")"
+            size="$(stat -c%s "$file")"
+
+            echo "⬆️ Uploading: $name ($size bytes)"
+
+            local headers="$(mktemp)"
+            local metadata="$(
+              jq -n \
+                --arg name "$name" \
+                --arg folder "$folder_id" \
+                '{
+                  name: $name,
+                  parents: [$folder]
+                }'
+            )"
+
+            if ! curl \
+              --silent \
+              --show-error \
+              --request POST \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              -D "$headers" \
+              -o /dev/null \
+              -H "Authorization: Bearer ${access_token}" \
+              -H "Content-Type: application/json; charset=UTF-8" \
+              -H "X-Upload-Content-Type: application/octet-stream" \
+              -H "X-Upload-Content-Length: ${size}" \
+              --data "$metadata" \
+              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"; then
+              rm -f "$headers"
+              return 1
+            fi
+
+            local session_uri="$(
+              awk '
+                BEGIN { IGNORECASE=1 }
+                /^location:/ {
+                  sub(/\r$/, "")
+                  sub(/^[^:]*:[[:space:]]*/, "")
+                  print
+                  exit
+                }
+              ' "$headers"
+            )"
+            rm -f "$headers"
+
+            if [ -z "$session_uri" ]; then
+              echo "❌ Could not initialize resumable Drive session."
+              return 1
+            fi
+
+            local offset=0
+            while [ "$offset" -lt "$size" ]; do
+              local remaining=$((size - offset))
+              local length="$DRIVE_CHUNK_SIZE"
+              [ "$remaining" -lt "$length" ] && length="$remaining"
+
+              local end=$((offset + length - 1))
+              local chunk="$(mktemp)"
+
+              dd if="$file" of="$chunk" iflag=skip_bytes,count_bytes \
+                skip="$offset" count="$length" status=none
+
+              local chunk_done="false"
+              for attempt in 1 2 3 4 5; do
+                local response="$(mktemp)"
+                local response_headers="$(mktemp)"
+
+                local code="$(
+                  curl \
+                    --silent \
+                    --show-error \
+                    --request PUT \
+                    -D "$response_headers" \
+                    -o "$response" \
+                    --write-out '%{http_code}' \
+                    -H "Authorization: Bearer ${access_token}" \
+                    -H "Content-Type: application/octet-stream" \
+                    -H "Content-Length: ${length}" \
+                    -H "Content-Range: bytes ${offset}-${end}/${size}" \
+                    --data-binary "@${chunk}" \
+                    "$session_uri"
+                )"
+
+                case "$code" in
+                  200|201)
+                    offset="$size"
+                    chunk_done="true"
+                    ;;
+                  308)
+                    local range="$(
+                      awk '
+                        BEGIN { IGNORECASE=1 }
+                        /^Range:/ { sub(/\r$/, ""); print }
+                      ' "$response_headers"
+                    )"
+
+                    if [[ "$range" =~ bytes=0-([0-9]+) ]]; then
+                      offset=$((BASH_REMATCH[1] + 1))
+                    else
+                      offset=$((end + 1))
+                    fi
+                    chunk_done="true"
+                    ;;
+                  429|500|502|503|504)
+                    local delay=$((2 ** attempt))
+                    [ "$delay" -gt 30 ] && delay=30
+                    echo "⚠️ Drive HTTP $code; retrying in ${delay}s..."
+                    sleep "$delay"
+                    ;;
+                  *)
+                    echo "❌ Drive upload chunk error: HTTP $code"
+                    cat "$response" 2>/dev/null || true
+                    rm -f "$response" "$response_headers" "$chunk"
+                    return 1
+                    ;;
+                esac
+
+                rm -f "$response" "$response_headers"
+                [ "$offset" -ge "$size" ] || [ "$chunk_done" = "true" ] && break
+              done
+
+              rm -f "$chunk"
+              if [ "$offset" -lt "$size" ] && [ "$chunk_done" != "true" ]; then
+                echo "❌ Resumable upload chunk failed."
+                return 1
+              fi
+
+              local percent=$((offset * 100 / size))
+              echo "   Progress: ${percent}% (${offset}/${size} bytes)"
+            done
+
+            echo "✅ Uploaded: $name"
+          }
+
+          for file in output/*; do
+            [ -f "$file" ] || continue
+            case "$(basename "$file")" in
+              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt|*.*)
+                upload_file "$file"
+                ;;
+            esac
+          done
+
+          echo "✅ Google Drive upload complete."
+
+      # ============================================================
+      # 15. REPOSITORY UPLOAD
+      # ============================================================
+      - name: "📤 Upload to repository"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'repo'
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config http.postBuffer 524288000
 
-          if [ -z "$(ls -A music/)" ]; then
-            echo "No zip to upload."
+          git add output/
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ Nothing to commit."
             exit 0
           fi
 
-          git add music/
-          COMMIT_MSG="Add: $(ls -1 music/ | tr '\n' ' ' | sed 's/ *$//') [skip ci]"
-          git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
+          git commit -m "Add downloaded SoundCloud media [skip ci]"
 
-          RETRIES=5
-          for i in $(seq 1 $RETRIES); do
-            echo "Push attempt $i..."
-            git pull --rebase --autostash origin "$BRANCH"
-            if git push origin "$BRANCH"; then
-              echo "Push succeeded."
-              break
-            else
-              [ $i -lt $RETRIES ] && sleep 3 || exit 1
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt ${attempt}/5..."
+            if git pull --rebase --autostash origin "$BRANCH_NAME" &&
+               git push origin "$BRANCH_NAME"; then
+              echo "✅ Repository push succeeded."
+              exit 0
             fi
+            sleep $((attempt * 3))
           done
 
-      - name: Create Release and upload assets (release method)
-        if: ${{ inputs.upload_method == 'release' }}
+          echo "❌ Repository push failed."
+          exit 1
+
+      # ============================================================
+      # 16. GITHUB RELEASE
+      # ============================================================
+      - name: "🏷️ Create GitHub Release"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VPN_INPUT: ${{ inputs.vpn_enabled }}
         run: |
-          if [ ! -s music_assets.txt ]; then
-            echo "No assets to release."
-            exit 0
+          set -Eeuo pipefail
+
+          tag="soundcloud-${RUN_SUFFIX}"
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+
+          {
+            echo "# ☁️ SoundCloud Downloader Release"
+            echo
+            echo "Requested URLs: ${total}"
+            echo "Successful: ${success}"
+            echo "Failed: ${failed}"
+            echo "VPN Protected: ${VPN_INPUT}"
+          } > work/release-notes.md
+
+          mapfile -t assets < <(
+            find output \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name '*.zip' \
+                -o -name '*.z[0-9][0-9]' \
+                -o -name 'FAILED-DOWNLOADS-*.txt' \
+              \) \
+              -print |
+            sort
+          )
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "❌ No release assets found."
+            exit 1
           fi
 
-          RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
-          TAG="soundcloud-downloader-${RAND5}"
-          echo "Creating release tag: $TAG"
+          gh release create \
+            "$tag" \
+            "${assets[@]}" \
+            --title "SoundCloud Download ${RUN_SUFFIX}" \
+            --notes-file work/release-notes.md \
+            --target "$GITHUB_SHA"
 
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
+          echo "✅ Release created."
 
-          git tag "$TAG" -m "SoundCloud download release"
-          git push origin "$TAG"
-
-          ASSET_ARGS=""
-          while IFS= read -r file; do
-            ASSET_ARGS="$ASSET_ARGS music/$file"
-          done < music_assets.txt
-
-          gh release create "$TAG" $ASSET_ARGS \
-            --title "soundcloud-downloader-${RAND5}" \
-            --notes "Automated release from SoundCloud Download workflow." \
-            --target "${{ github.ref_name }}"
-
-          echo "Release '$TAG' created with assets."
-
-      - name: Cleanup
+      # ============================================================
+      # 17. FINAL STATUS
+      # ============================================================
+      - name: "✅ Final status"
         if: always()
-        shell: bash
+        env:
+          FAIL_ON_PARTIAL: ${{ inputs.fail_on_partial }}
         run: |
-          rm -rf music release_files soundcloud_urls.txt failed_urls.txt music_assets.txt *.zip 2>/dev/null || true
+          set -Eeuo pipefail
+
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          file_count="${{ steps.collect.outputs.FINAL_FILE_COUNT || 0 }}"
+
+          echo
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║                   ☁️ FINAL RESULT                          ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          printf '║ Requested URLs : %-43s ║\n' "$total"
+          printf '║ Successful     : %-43s ║\n' "$success"
+          printf '║ Failed         : %-43s ║\n' "$failed"
+          printf '║ Audio Saved    : %-43s ║\n' "$file_count"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo
+
+          if [ "$success" -eq 0 ]; then
+            echo "❌ No URLs completed successfully."
+            exit 1
+          fi
+
+          if [ "$failed" -gt 0 ] && [ "$FAIL_ON_PARTIAL" = "true" ]; then
+            echo "❌ Partial failures encountered with fail_on_partial=true."
+            exit 1
+          fi
+
+          if [ "$failed" -gt 0 ]; then
+            echo "⚠️ Partial downloads accepted."
+          else
+            echo "✅ All downloads completed successfully."
+          fi
+
+      # ============================================================
+      # 18. CLEANUP
+      # ============================================================
+      - name: "🧹 Cleanup"
+        if: always()
+        run: |
+          set +e
+
+          sudo killall openvpn >/dev/null 2>&1 || true
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+
+          rm -f \
+            /tmp/wg0.conf \
+            /tmp/client.ovpn \
+            /tmp/ovpn-auth.txt \
+            /tmp/openvpn.log \
+            /tmp/terminal.lock 2>/dev/null || true
+
+          echo "✅ Cleanup complete."
