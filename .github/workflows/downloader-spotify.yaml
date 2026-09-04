@@ -26,7 +26,7 @@ on:
           - youtube-music
           - youtube
           - soundcloud
-        default: piped
+        default: youtube-music
 
       output_format:
         description: "🎧 Output format"
@@ -97,7 +97,7 @@ on:
         description: "📺 Fallback: YouTube / YouTube Music?"
         required: true
         type: boolean
-        default: false
+        default: true
 
       fallback_bandcamp:
         description: "🎸 Fallback: Bandcamp?"
@@ -139,7 +139,7 @@ on:
         description: "❌ Fail workflow if any URL fails?"
         required: true
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
