@@ -61,7 +61,7 @@ on:
         description: "❌ Fail workflow if any URL fails?"
         required: true
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
