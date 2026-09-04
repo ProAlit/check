@@ -4,184 +4,1339 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'Twitter/X URLs or "username l N" – separate by comma, space, or newline'
+        description: '🐦 Twitter/X URLs or "username l N" (separate by comma, space, or newline)'
         required: true
+        type: string
+
+      upload_method:
+        description: "☁️ Upload destination"
+        required: true
+        type: choice
+        options:
+          - drive         # Google Drive (folder: github-actions)
+          - repo          # Push to repository (split 90MB)
+          - release       # GitHub Release (split 1900MB)
+        default: drive
+
+      bundle_all:
+        description: "📦 Bundle all downloaded items into a single ZIP archive?"
+        required: true
+        type: boolean
+        default: false
+
+      vpn_enabled:
+        description: "🔒 Route downloads through VPN?"
+        required: true
+        type: boolean
+        default: false
+
+      vpn_type:
+        description: "🛡️ VPN Protocol (if VPN enabled)"
+        required: true
+        type: choice
+        options:
+          - wireguard
+          - openvpn
+        default: wireguard
+
+      concurrent_downloads:
+        description: "⚡ Concurrent download workers"
+        required: true
+        type: number
+        default: 3
+
+      retry_count:
+        description: "🔄 Retries per URL"
+        required: true
+        type: number
+        default: 2
+
+      raw_logs:
+        description: "🧪 Show raw verbose logs in console?"
+        required: true
+        type: boolean
+        default: false
+
+      fail_on_partial:
+        description: "❌ Fail workflow if any URL fails?"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: x-downloader-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_PARALLEL: "3"
+  DEFAULT_RETRIES: "2"
+  DRIVE_CHUNK_SIZE: "16777216" # 16 MB Chunks
+  PIP_BREAK_SYSTEM_PACKAGES: "1"
 
 jobs:
-  actions:
+  x-download:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: bash
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      # ============================================================
+      # 01. CHECKOUT
+      # ============================================================
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
         with:
+          fetch-depth: 1
           persist-credentials: true
 
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: Parse input – build final URL list
-        id: parse
+      # ============================================================
+      # 02. SYSTEM DEPENDENCIES
+      # ============================================================
+      - name: "🛠️ Install system dependencies"
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          INPUT="${{ github.event.inputs.urls }}"
-          CLEANED=$(echo "$INPUT" | tr -d '"'\')
-          URLS=$(echo "$CLEANED" | grep -oP 'https?://(www\.)?(twitter|x)\.com/[^/]+/status/[^\s,;]+' | sort -u)
-          echo "$URLS" > urls_raw.txt
+          set -Eeuo pipefail
 
-          USER_LIMITS=$(echo "$CLEANED" | grep -oP '[A-Za-z0-9_]+[[:space:]]+[Ll][[:space:]]+[0-9]+' || true)
-          COOKIE_ARG=""
-          [ -f "twitter-cookies.txt" ] && COOKIE_ARG="--cookies twitter-cookies.txt"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ffmpeg \
+            curl \
+            jq \
+            zip \
+            unzip \
+            wireguard-tools \
+            openvpn \
+            openvpn-systemd-resolved \
+            openssl \
+            python3 \
+            python3-pip \
+            python-is-python3
+
+          echo "✅ System dependencies installed."
+
+      # ============================================================
+      # 03. PYTHON & EXTRACTION TOOLCHAIN
+      # ============================================================
+      - name: "📦 Install gallery-dl & yt-dlp"
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
+        run: |
+          set -Eeuo pipefail
+
+          python3 -m pip install --upgrade --break-system-packages pip setuptools wheel
+          python3 -m pip install --upgrade --break-system-packages \
+            gallery-dl \
+            "yt-dlp[default]" \
+            curl_cffi \
+            requests
+
+          echo "✅ Extraction toolchain installed."
+
+      # ============================================================
+      # 04. TOOLCHAIN VERIFICATION
+      # ============================================================
+      - name: "🔎 Show toolchain versions"
+        run: |
+          set -Eeuo pipefail
+
+          echo "Python     : $(python3 --version 2>&1)"
+          echo "gallery-dl : $(gallery-dl --version 2>&1)"
+          echo "yt-dlp     : $(yt-dlp --version 2>&1)"
+          echo "FFmpeg     : $(ffmpeg -version | sed -n '1p')"
+
+      # ============================================================
+      # 05. WORKSPACE & IDENTIFIER
+      # ============================================================
+      - name: "📁 Initialize workspace"
+        run: |
+          set -Eeuo pipefail
+
+          RUN_SUFFIX="$(openssl rand -hex 4 | cut -c1-5)"
+          echo "RUN_SUFFIX=${RUN_SUFFIX}" >> "$GITHUB_ENV"
+          echo "🆔 Generated identifier: ${RUN_SUFFIX}"
+
+          rm -rf work output
+          mkdir -p \
+            work/downloads \
+            work/logs \
+            work/results \
+            work/failed \
+            work/archive \
+            work/package \
+            output
+
+          echo "✅ Workspace initialized."
+
+      # ============================================================
+      # 06. PREPARE COOKIES
+      # ============================================================
+      - name: "🔐 Prepare Twitter / X cookies"
+        env:
+          TWITTER_COOKIES: ${{ secrets.TWITTER_COOKIES }}
+          X_COOKIES: ${{ secrets.X_COOKIES }}
+        run: |
+          set -Eeuo pipefail
+
+          COOKIES_DATA="${TWITTER_COOKIES:-$X_COOKIES}"
+
+          if [ -n "$COOKIES_DATA" ]; then
+            printf '%s\n' "$COOKIES_DATA" > /tmp/twitter-cookies.txt
+            chmod 600 /tmp/twitter-cookies.txt
+            echo "COOKIES_FILE=/tmp/twitter-cookies.txt" >> "$GITHUB_ENV"
+            echo "✅ Twitter/X cookies loaded."
+          else
+            echo "COOKIES_FILE=" >> "$GITHUB_ENV"
+            echo "ℹ️ No TWITTER_COOKIES or X_COOKIES secret found (proceeding without authentication)."
+          fi
+
+      # ============================================================
+      # 07. PARSE URLs & RESOLVE PROFILES (OCTAL BUG FIXED)
+      # ============================================================
+      - name: "🔗 Parse URLs and resolve user handles"
+        env:
+          RAW_INPUT: ${{ inputs.urls }}
+        run: |
+          set -Eeuo pipefail
+
+          : > work/raw_links.txt
+          : > work/jobs.tsv
+
+          CLEANED=$(printf '%s\n' "$RAW_INPUT" | tr -d '"' | tr -d "'")
+
+          # 1. Direct tweet / status URLs
+          printf '%s\n' "$CLEANED" |
+            grep -oP 'https?://(www\.)?(twitter|x)\.com/[^/]+/status/[^\s,;]+' |
+            sort -u >> work/raw_links.txt || true
+
+          # 2. Parse "username l N" expressions
+          USER_LIMITS=$(printf '%s\n' "$CLEANED" | grep -oP '[A-Za-z0-9_]+[[:space:]]+[Ll][[:space:]]+[0-9]+' || true)
 
           if [ -n "$USER_LIMITS" ]; then
-            echo "User limits found:"
+            echo "→ Processing account shortcuts:"
             echo "$USER_LIMITS"
+
+            COOKIE_ARG=""
+            [ -n "${COOKIES_FILE:-}" ] && [ -f "${COOKIES_FILE:-}" ] && COOKIE_ARG="--cookies $COOKIES_FILE"
+
             while IFS= read -r line; do
+              [ -z "$line" ] && continue
               USER=$(echo "$line" | awk '{print $1}')
               COUNT=$(echo "$line" | awk '{print $3}')
-              echo "::group::Fetching latest $COUNT tweets from @$USER"
+
+              echo "  🔍 Fetching latest $COUNT tweets from @$USER..."
               yt-dlp --flat-playlist --playlist-end "$COUNT" \
                      --print "%(url)s" \
                      $COOKIE_ARG \
-                     "https://x.com/$USER" 2>/dev/null \
-                     > "user_${USER}_urls.txt" || true
-              cat "user_${USER}_urls.txt" >> urls_raw.txt
-              echo "::endgroup::"
+                     "https://x.com/$USER" 2>/dev/null >> work/raw_links.txt || true
             done <<< "$USER_LIMITS"
           fi
 
-          sort -u urls_raw.txt -o urls.txt
-          TOTAL=$(wc -l < urls.txt)
-          echo "Total tweet URLs to process: $TOTAL"
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "ERROR: No Twitter URLs or valid usernames found."
+          sort -u work/raw_links.txt -o work/input_urls.txt
+
+          if [ ! -s work/input_urls.txt ]; then
+            echo "❌ No valid Twitter/X URLs or handles found."
             exit 1
           fi
 
-      - name: Write cookies from secrets
-        run: |
-          if [ -n "$TWITTER_COOKIES" ]; then
-            echo "$TWITTER_COOKIES" > twitter-cookies.txt
-            echo "Twitter cookies written."
-          else
-            echo "No TWITTER_COOKIES secret found – proceeding without login."
-          fi
-        env:
-          TWITTER_COOKIES: ${{ secrets.TWITTER_COOKIES }}
-
-      - name: Restore cached tools
-        uses: actions/cache@v4
-        id: tool-cache
-        with:
-          path: |
-            ~/.cache/pip
-          key: fetch-tools-${{ runner.os }}-v3
-
-      - name: Install tools
-        run: |
-          pip install gallery-dl yt-dlp
-          if ! command -v jq &> /dev/null || ! command -v ffmpeg &> /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq jq ffmpeg
-          fi
-
-      - name: Download attached media + JSON
-        id: download
-        run: |
-          mkdir -p twitter_downloads
-          GALLERY_DL_ARGS="--write-info-json"
-          if [ -f "twitter-cookies.txt" ]; then
-            GALLERY_DL_ARGS="$GALLERY_DL_ARGS --cookies twitter-cookies.txt"
-          fi
-          # 👇 force folder name to be the @ screen name (not display name)
-          gallery-dl $GALLERY_DL_ARGS \
-                     --input-file urls.txt \
-                     -d "twitter_downloads" \
-                     -o "directory=twitter/{author[name]}" \
-                     --verbose
-
-      - name: Convert JSON to text (.txt) with date, device, content
-        run: |
+          index=0
           while IFS= read -r url; do
             [ -z "$url" ] && continue
-            USER=$(echo "$url" | grep -oP '(?:twitter|x)\.com/\K[^/]+')
-            TWEET_ID=$(echo "$url" | grep -oP 'status/(\d+)' | cut -d/ -f2)
-            [ -z "$USER" ] && USER="unknown"
-            [ -z "$TWEET_ID" ] && TWEET_ID="unknown"
+            index=$((index + 1))
+            # Store plain integer ID to guarantee no octal interpretation errors
+            printf '%d\t%s\n' "$index" "$url" >> work/jobs.tsv
+          done < work/input_urls.txt
 
-            # Now USER matches the folder name because gallery-dl uses author[name] (= screen name)
-            USER_DIR="twitter_downloads/twitter/$USER"
-            INFO_JSON="$USER_DIR/$TWEET_ID.json"
-            mkdir -p "$USER_DIR"
+          echo "Accepted URLs: $(wc -l < work/jobs.tsv)"
+          cat work/jobs.tsv
 
-            if [ -f "$INFO_JSON" ]; then
-              DATE=$(jq -r '.date // "unknown date"' "$INFO_JSON")
-              DEVICE=$(jq -r '.source // "web"' "$INFO_JSON")
-              CONTENT=$(jq -r '.full_text // .text // .content // empty' "$INFO_JSON")
-
-              if [ -n "$CONTENT" ]; then
-                printf "[%s] (%s)\n%s\n" "$DATE" "$DEVICE" "$CONTENT" > "$USER_DIR/$TWEET_ID.txt"
-              else
-                printf "[%s] (%s)\n(empty tweet body)\n" "$DATE" "$DEVICE" > "$USER_DIR/$TWEET_ID.txt"
-              fi
-              rm -f "$INFO_JSON"
-            else
-              echo "No media for tweet $TWEET_ID, fetching via oEmbed."
-              EMBED_URL="https://publish.twitter.com/oembed?url=$url"
-              EMBED_JSON=$(curl -s "$EMBED_URL")
-              TEXT=$(echo "$EMBED_JSON" | jq -r '.title // empty' | sed 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g')
-              if [ -n "$TEXT" ]; then
-                printf "(retrieved via oEmbed)\n%s\n" "$TEXT" > "$USER_DIR/$TWEET_ID.txt"
-              else
-                echo "(unavailable or private)" > "$USER_DIR/$TWEET_ID.txt"
-              fi
-            fi
-          done < urls.txt
-
-      - name: Create ZIP archive (username folders at root)
-        id: zip
-        run: |
-          mv twitter_downloads/twitter/* twitter_downloads/ 2>/dev/null || true
-          rmdir twitter_downloads/twitter 2>/dev/null || true
-          mkdir -p twitter
-          RANDSTR=$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | head -c 8)
-          ZIP_NAME="twitter-contents-${RANDSTR}.zip"
-          cd twitter_downloads
-          zip -s 99m -r "../twitter/${ZIP_NAME}" .
-          cd ..
-          echo "Created archive parts:"
-          ls -lh twitter/
-
-      - name: Upload to 'twitter' folder
+      # ============================================================
+      # 08. VPN CONFIGURATION (WIREGUARD & OPENVPN)
+      # ============================================================
+      - name: "🔒 Configure VPN (WireGuard / OpenVPN)"
+        id: vpn
         env:
-          BRANCH: ${{ github.ref_name }}
+          VPN_ENABLED: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+          OVPN_CONFIG: ${{ secrets.OVPN_CONFIG }}
+          OVPN_AUTH: ${{ secrets.OVPN_AUTH }}
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git config http.postBuffer 524288000
-          if [ ! -d "twitter" ] || [ -z "$(ls -A twitter)" ]; then
-            echo "Nothing to upload."
+          set -Eeuo pipefail
+
+          if [ "$VPN_ENABLED" != "true" ]; then
+            echo "🚫 VPN disabled by input."
+            echo "vpn_available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git add twitter/
-          git commit -m "Add Twitter batch download [skip ci]" || echo "Nothing to commit"
-          RETRIES=5
-          for i in $(seq 1 $RETRIES); do
-            echo "Push attempt $i..."
-            git pull --rebase --autostash origin "$BRANCH"
-            if git push origin "$BRANCH"; then
-              echo "Push succeeded."
-              break
+
+          echo "🛡️ Configuring VPN protocol: ${VPN_TYPE}"
+
+          if [ "$VPN_TYPE" = "wireguard" ]; then
+            if [ -z "$WG_CONFIG" ]; then
+              echo "⚠️ WireGuard requested but WG_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            umask 077
+            printf '%s\n' "$WG_CONFIG" > /tmp/wg0.conf
+            sudo install -m 600 /tmp/wg0.conf /etc/wireguard/wg0.conf
+
+            if sudo wg-quick up wg0; then
+              echo "✅ WireGuard connected."
+              public_ip="$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org || echo "unavailable")"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
             else
-              if [ $i -lt $RETRIES ]; then
-                echo "Push rejected, retrying in 3 seconds..."
-                sleep 3
+              echo "❌ WireGuard failed."
+              sudo wg-quick down wg0 >/dev/null 2>&1 || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            fi
+
+          elif [ "$VPN_TYPE" = "openvpn" ]; then
+            if [ -z "$OVPN_CONFIG" ]; then
+              echo "⚠️ OpenVPN requested but OVPN_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ ! -c /dev/net/tun ]; then
+              sudo mkdir -p /dev/net
+              sudo mknod /dev/net/tun c 10 200
+              sudo chmod 600 /dev/net/tun
+            fi
+
+            umask 077
+            printf '%s\n' "$OVPN_CONFIG" > /tmp/client.ovpn
+
+            if [ -n "$OVPN_AUTH" ]; then
+              printf '%s\n' "$OVPN_AUTH" > /tmp/ovpn-auth.txt
+              chmod 600 /tmp/ovpn-auth.txt
+              echo "auth-user-pass /tmp/ovpn-auth.txt" >> /tmp/client.ovpn
+            fi
+
+            echo "🚀 Starting OpenVPN daemon..."
+            sudo openvpn --config /tmp/client.ovpn --daemon --log /tmp/openvpn.log
+
+            echo "⏳ Waiting for OpenVPN tunnel interface..."
+            ready="false"
+            for attempt in $(seq 1 30); do
+              if ip link show dev tun0 >/dev/null 2>&1 || ip link show dev tun1 >/dev/null 2>&1; then
+                ready="true"
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$ready" = "true" ]; then
+              echo "✅ OpenVPN connected."
+              sleep 2
+              public_ip="$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org || echo "unavailable")"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ OpenVPN failed to connect."
+              cat /tmp/openvpn.log 2>/dev/null || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      # ============================================================
+      # 09. DOWNLOAD ENGINE (GALLERY-DL + YT-DLP + TEXT PARSER)
+      # ============================================================
+      - name: "⬇️ Download Twitter / X content"
+        env:
+          CONCURRENT_WORKERS: ${{ inputs.concurrent_downloads }}
+          RETRY_COUNT: ${{ inputs.retry_count }}
+          RAW_LOGS: ${{ inputs.raw_logs }}
+          COOKIES_FILE: ${{ env.COOKIES_FILE }}
+          VPN_AVAILABLE: ${{ steps.vpn.outputs.vpn_available }}
+        run: |
+          set -Eeuo pipefail
+
+          WORKERS="$CONCURRENT_WORKERS"
+          RETRIES="$RETRY_COUNT"
+
+          if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then WORKERS="$DEFAULT_PARALLEL"; fi
+          if ! [[ "$RETRIES" =~ ^[1-9][0-9]*$ ]]; then RETRIES="$DEFAULT_RETRIES"; fi
+
+          now() { date '+%H:%M:%S'; }
+
+          format_duration() {
+            local secs="$1"
+            if [ "$secs" -ge 3600 ]; then
+              printf '%dh %dm %ds' $((secs / 3600)) $(( (secs % 3600) / 60 )) $((secs % 60))
+            elif [ "$secs" -ge 60 ]; then
+              printf '%dm %ds' $((secs / 60)) $((secs % 60))
+            else
+              printf '%ds' "$secs"
+            fi
+          }
+
+          format_bytes() {
+            local bytes="$1"
+            if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then
+              echo "0 B"
+              return
+            fi
+            numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || awk -v b="$bytes" 'BEGIN {
+              split("B KB MB GB TB", units, " ");
+              i=1;
+              while(b>=1024 && i<5) { b/=1024; i++ }
+              printf "%.2f %s", b, units[i]
+            }'
+          }
+
+          safe_log() {
+            (
+              flock -x 200
+              printf '%b\n' "$1"
+            ) 200>/tmp/terminal.lock
+          }
+
+          log_timing() {
+            local id="$1"
+            local message="$2"
+            printf '[%s] %s\n' "$(now)" "$message" >> "work/logs/${id}-timing.log"
+          }
+
+          has_content() {
+            local dir="$1"
+            find "$dir" -type f 2>/dev/null | grep -q .
+          }
+
+          run_gallery_dl() {
+            local id="$1" url="$2"
+            local dir="work/downloads/${id}"
+            local logfile="work/logs/${id}-gallery-dl.log"
+
+            local -a cmd=(
+              gallery-dl
+              --write-info-json
+              --no-part
+              --retries 3
+              --directory "$dir"
+              -o "directory={author[name]}"
+            )
+
+            if [ -n "$COOKIES_FILE" ] && [ -f "$COOKIES_FILE" ]; then
+              cmd+=(--cookies "$COOKIES_FILE")
+            fi
+
+            cmd+=("$url")
+
+            local exit_code=0
+            if [ "$RAW_LOGS" = "true" ]; then
+              set +e
+              timeout 600 "${cmd[@]}" >> "work/logs/${id}-raw.log" 2>&1
+              exit_code=$?
+              set -e
+            else
+              set +e
+              timeout 600 "${cmd[@]}" > "$logfile" 2>&1
+              exit_code=$?
+              set -e
+            fi
+
+            if [ "$exit_code" -eq 0 ] && has_content "$dir"; then
+              return 0
+            fi
+            return 1
+          }
+
+          run_ytdlp_fallback() {
+            local id="$1" url="$2"
+            local dir="work/downloads/${id}"
+            local logfile="work/logs/${id}-ytdlp.log"
+
+            local -a cmd=(
+              yt-dlp
+              --ignore-config
+              --newline
+              --continue
+              --no-overwrites
+              --retries 3
+              --socket-timeout 30
+              -o "${dir}/%(uploader,uploader_id)s/%(id)s.%(ext)s"
+            )
+
+            if [ -n "$COOKIES_FILE" ] && [ -f "$COOKIES_FILE" ]; then
+              cmd+=(--cookies "$COOKIES_FILE")
+            fi
+
+            cmd+=("$url")
+
+            local exit_code=0
+            if [ "$RAW_LOGS" = "true" ]; then
+              set +e
+              timeout 600 "${cmd[@]}" >> "work/logs/${id}-raw.log" 2>&1
+              exit_code=$?
+              set -e
+            else
+              set +e
+              timeout 600 "${cmd[@]}" > "$logfile" 2>&1
+              exit_code=$?
+              set -e
+            fi
+
+            if [ "$exit_code" -eq 0 ] && has_content "$dir"; then
+              return 0
+            fi
+            return 1
+          }
+
+          process_one() {
+            local id_raw="$1"
+            local url="$2"
+
+            # Parse base 10 integer to bypass bash octal evaluation errors
+            local id=$((10#$id_raw))
+            local id_fmt
+            id_fmt="$(printf '%04d' "$id")"
+
+            local dir="work/downloads/${id}"
+            mkdir -p "$dir"
+            : > "work/logs/${id}-timing.log"
+
+            local start_sec="$(date +%s)"
+            local started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local status="failed"
+            local winner="none"
+            local reason="exhausted"
+            local items_count=0
+            local total_size=0
+            local speed_str="0 B/s"
+
+            local author="$(echo "$url" | grep -oP '(?:twitter|x)\.com/\K[^/]+' || echo "unknown")"
+            local tweet_id="$(echo "$url" | grep -oP 'status/(\d+)' | cut -d/ -f2 || echo "$id")"
+
+            safe_log "[$(now)] 🚀 #${id_fmt} (x/twitter) STARTING  │ @${author} (tweet: ${tweet_id})"
+
+            for attempt in $(seq 1 "$RETRIES"); do
+              local attempt_start="$(date +%s)"
+
+              # 1. Primary Strategy: gallery-dl
+              log_timing "$id" "⚡ gallery-dl extraction attempt ${attempt}/${RETRIES}"
+              if run_gallery_dl "$id" "$url"; then
+                local attempt_elapsed=$(( $(date +%s) - attempt_start ))
+                status="success"
+                winner="gallery-dl"
+                reason="completed"
+                log_timing "$id" "🏁 gallery-dl succeeded ── took $(format_duration "$attempt_elapsed") ── ✅ SUCCESS"
+                break
               else
-                echo "Push failed after $RETRIES attempts."
+                local attempt_elapsed=$(( $(date +%s) - attempt_start ))
+                log_timing "$id" "⚡ gallery-dl failed ── took $(format_duration "$attempt_elapsed") ── ✖ Trying yt-dlp fallback"
+
+                # 2. Fallback Strategy: yt-dlp
+                local ytdlp_start="$(date +%s)"
+                if run_ytdlp_fallback "$id" "$url"; then
+                  local ytdlp_elapsed=$(( $(date +%s) - ytdlp_start ))
+                  status="success"
+                  winner="yt-dlp (fallback)"
+                  reason="completed"
+                  log_timing "$id" "🏁 yt-dlp fallback succeeded ── took $(format_duration "$ytdlp_elapsed") ── ✅ SUCCESS"
+                  break
+                else
+                  local ytdlp_elapsed=$(( $(date +%s) - ytdlp_start ))
+                  log_timing "$id" "✖ yt-dlp fallback failed ── took $(format_duration "$ytdlp_elapsed")"
+                fi
+              fi
+
+              if [ "$attempt" -lt "$RETRIES" ]; then
+                sleep $((attempt * 3))
+              fi
+            done
+
+            # Metadata to Text Conversion & oEmbed Fallback
+            local target_user_dir="${dir}/${author}"
+            mkdir -p "$target_user_dir"
+            local info_json="$(find "$dir" -type f -name '*.json' | head -1 || echo '')"
+
+            if [ -n "$info_json" ] && [ -f "$info_json" ]; then
+              local date_val="$(jq -r '.date // "unknown date"' "$info_json")"
+              local device_val="$(jq -r '.source // "web"' "$info_json")"
+              local content_val="$(jq -r '.full_text // .text // .content // empty' "$info_json")"
+
+              if [ -n "$content_val" ]; then
+                printf '[%s] (%s)\n%s\n' "$date_val" "$device_val" "$content_val" > "${target_user_dir}/${tweet_id}.txt"
+              else
+                printf '[%s] (%s)\n(empty tweet body)\n' "$date_val" "$device_val" > "${target_user_dir}/${tweet_id}.txt"
+              fi
+              rm -f "$info_json"
+            else
+              # Text-only or oEmbed fallback
+              local embed_url="https://publish.twitter.com/oembed?url=${url}"
+              local embed_json="$(curl -s --max-time 10 "$embed_url" 2>/dev/null || echo '')"
+              local tweet_text="$(echo "$embed_json" | jq -r '.title // empty' 2>/dev/null | sed 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g' || echo '')"
+
+              if [ -n "$tweet_text" ]; then
+                printf '(retrieved via oEmbed)\n%s\n' "$tweet_text" > "${target_user_dir}/${tweet_id}.txt"
+                status="success"
+                [ "$winner" = "none" ] && winner="oEmbed (text-only)"
+              fi
+            fi
+
+            mapfile -t files < <(find "$dir" -type f 2>/dev/null)
+            items_count="${#files[@]}"
+
+            for f in "${files[@]}"; do
+              local sz="$(stat -c%s "$f" 2>/dev/null || echo 0)"
+              total_size=$((total_size + sz))
+            done
+
+            local finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local total_elapsed=$(( $(date +%s) - start_sec ))
+            local total_duration="$(format_duration "$total_elapsed")"
+
+            if [ "$total_elapsed" -gt 0 ] && [ "$total_size" -gt 0 ]; then
+              local spd_bps=$(( total_size / total_elapsed ))
+              speed_str="$(format_bytes "$spd_bps")/s"
+            fi
+
+            if [ "$status" != "success" ]; then
+              printf '%s\t%s\n' "$id" "$url" > "work/failed/${id}.tsv"
+              printf '%s\n' "Tweet extraction failed after retries" > "work/failed/${id}.reason"
+            fi
+
+            jq -n \
+              --arg id "$id" \
+              --arg url "$url" \
+              --arg author "$author" \
+              --arg tweet_id "$tweet_id" \
+              --arg status "$status" \
+              --arg provider "$winner" \
+              --arg count "$items_count" \
+              --arg size "$total_size" \
+              --arg duration "$total_duration" \
+              --arg speed "$speed_str" \
+              --arg started "$started_at" \
+              --arg finished "$finished_at" \
+              '{
+                index: ($id | tonumber),
+                url: $url,
+                author: $author,
+                tweet_id: $tweet_id,
+                status: $status,
+                provider: $provider,
+                items_count: ($count | tonumber),
+                size_bytes: ($size | tonumber),
+                duration: $duration,
+                speed: $speed,
+                started_at: $started,
+                finished_at: $finished
+              }' > "work/results/${id}.json"
+
+            (
+              flock -x 200
+              echo
+              echo "┌──────────────────────────────────────────────────────────────────────────────"
+              if [ "$status" = "success" ]; then
+                printf '│ 🐦 X / TWITTER #%s — ✅ SUCCESS (Total: %s via %s)\n' \
+                  "$id_fmt" "$total_duration" "$winner"
+                printf '│ Handle : @%s (tweet: %s)\n' "$author" "$tweet_id"
+                printf '│ Items  : %d file(s) (%s — %s)\n' "$items_count" "$(format_bytes "$total_size")" "$speed_str"
+              else
+                printf '│ 🐦 X / TWITTER #%s — ❌ FAILED (Total: %s)\n' "$id_fmt" "$total_duration"
+                printf '│ Handle : @%s (tweet: %s)\n' "$author" "$tweet_id"
+              fi
+              printf '│ URL    : %s\n' "$url"
+              echo "│ Steps & Provider Timing:"
+              if [ -s "work/logs/${id}-timing.log" ]; then
+                sed 's/^/│   /' "work/logs/${id}-timing.log"
+              else
+                echo "│   (No step timing recorded)"
+              fi
+              echo "└──────────────────────────────────────────────────────────────────────────────"
+              echo
+
+              if [ "$RAW_LOGS" = "true" ] && [ -f "work/logs/${id}-raw.log" ]; then
+                echo "--- [RAW LOGS FOR #${id_fmt}] ---"
+                cat "work/logs/${id}-raw.log"
+                echo "--- [END RAW LOGS FOR #${id_fmt}] ---"
+                echo
+              fi
+            ) 200>/tmp/terminal.lock
+          }
+
+          echo "🚀 Concurrency Workers: $WORKERS"
+          echo "🔄 Max Retries: $RETRIES"
+          echo
+
+          running=0
+          while IFS=$'\t' read -r id url; do
+            process_one "$id" "$url" &
+            running=$((running + 1))
+
+            if [ "$running" -ge "$WORKERS" ]; then
+              wait -n 2>/dev/null || true
+              running=$((running - 1))
+            fi
+          done < work/jobs.tsv
+
+          wait || true
+
+          echo
+          echo "Download round summary:"
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+
+          echo "Requested : $total"
+          echo "Successful: $success"
+          echo "Failed    : $failed"
+
+      # ============================================================
+      # 10. COLLECT FINAL FILES
+      # ============================================================
+      - name: "📚 Collect final files"
+        id: collect
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf output
+          mkdir -p output
+
+          count=0
+          total_bytes=0
+
+          while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            user_dir="$(basename "$(dirname "$file")")"
+
+            mkdir -p "output/${user_dir}"
+            dest="output/${user_dir}/$base"
+
+            if [ -e "$dest" ]; then
+              count=$((count + 1))
+              ext="${base##*.}"
+              name="${base%.*}"
+              dest="output/${user_dir}/${name}_${count}.${ext}"
+            else
+              count=$((count + 1))
+            fi
+
+            cp --reflink=auto -p "$file" "$dest"
+            size="$(stat -c%s "$dest")"
+            total_bytes=$((total_bytes + size))
+          done < <(
+            find work/downloads -mindepth 3 -type f ! -name '*.json' -print0 | sort -z
+          )
+
+          failed_report="output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt"
+          : > "$failed_report"
+          failed_count=0
+
+          for result in work/results/*.json; do
+            [ -f "$result" ] || continue
+            status="$(jq -r '.status' "$result")"
+            [ "$status" = "success" ] && continue
+
+            url="$(jq -r '.url' "$result")"
+            failed_count=$((failed_count + 1))
+            echo "$url" >> "$failed_report"
+          done
+
+          if [ "$failed_count" -eq 0 ]; then
+            rm -f "$failed_report"
+          fi
+
+          echo "FINAL_FILE_COUNT=$count" >> "$GITHUB_OUTPUT"
+          echo "TOTAL_BYTES=$total_bytes" >> "$GITHUB_OUTPUT"
+          echo "FAILED_COUNT=$failed_count" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Final collected items: $count ($total_bytes bytes)"
+          echo "Failed URLs          : $failed_count"
+
+      # ============================================================
+      # 11. DISCONNECT VPN (BEFORE UPLOADS)
+      # ============================================================
+      - name: "🔌 Disconnect VPN for uploads"
+        run: |
+          set +e
+          sudo killall openvpn >/dev/null 2>&1 || true
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+          echo "✅ VPN disconnected. Runner native gigabit bandwidth active for uploads."
+
+      # ============================================================
+      # 12. PACKAGE ASSETS (ZIP / SPLIT)
+      # ============================================================
+      - name: "📦 Package output"
+        id: archive
+        env:
+          BUNDLE_ALL: ${{ inputs.bundle_all }}
+          UPLOAD_METHOD: ${{ inputs.upload_method }}
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf work/archive work/package
+          mkdir -p work/archive work/package
+
+          files_found=0
+          while IFS= read -r -d '' file; do
+            files_found=$((files_found + 1))
+            user_dir="$(basename "$(dirname "$file")")"
+            mkdir -p "work/package/${user_dir}"
+            cp --reflink=auto -p "$file" "work/package/${user_dir}/"
+          done < <(find output -mindepth 2 -type f ! -name 'FAILED-DOWNLOADS-*' -print0 | sort -z)
+
+          if [ "$files_found" -eq 0 ]; then
+            echo "⚠️ No files to package."
+            echo "HAS_ASSETS=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          is_disk_full() {
+            local msg="$1"
+            [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
+          }
+
+          if [ "$BUNDLE_ALL" = "true" ]; then
+            zip_name="twitter_bundle_${RUN_SUFFIX}.zip"
+            echo "📦 Bundling all files into: $zip_name"
+
+            set +e
+            if [ "$UPLOAD_METHOD" = "repo" ]; then
+              zip_err="$( (cd work/package && zip -0 -s 90m -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            elif [ "$UPLOAD_METHOD" = "release" ]; then
+              zip_err="$( (cd work/package && zip -0 -s 1900m -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            else
+              zip_err="$( (cd work/package && zip -0 -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            fi
+            set -e
+
+            if [ "$zip_code" -ne 0 ]; then
+              if is_disk_full "$zip_err" && [ "$UPLOAD_METHOD" = "drive" ]; then
+                echo "⚠️ Disk full during bundling. Uploading raw media directly to Google Drive."
+                cp -p -r work/package/* work/archive/
+              else
+                echo "❌ Zipping failed: $zip_err"
                 exit 1
               fi
             fi
+
+          else
+            index=0
+            for udir in work/package/*; do
+              [ -d "$udir" ] || continue
+              index=$((index + 1))
+              u_name="$(basename "$udir")"
+              safe="$(printf '%s' "$u_name" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
+              zip_name="single-${index}-${safe}-${RUN_SUFFIX}.zip"
+
+              set +e
+              if [ "$UPLOAD_METHOD" = "repo" ]; then
+                (cd work/package && zip -0 -s 90m -r "../../work/archive/${zip_name}" "$u_name")
+              elif [ "$UPLOAD_METHOD" = "release" ]; then
+                (cd work/package && zip -0 -s 1900m -r "../../work/archive/${zip_name}" "$u_name")
+              else
+                (cd work/package && zip -0 -r "../../work/archive/${zip_name}" "$u_name")
+              fi
+              set -e
+            done
+          fi
+
+          find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+
+          echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
+          echo
+          echo "📦 Final package contents in output/:"
+          ls -lh output/
+
+      # ============================================================
+      # 13. GITHUB STEP SUMMARY
+      # ============================================================
+      - name: "📊 Write GitHub summary"
+        env:
+          UPLOAD_INPUT: ${{ inputs.upload_method }}
+          BUNDLE_INPUT: ${{ inputs.bundle_all }}
+          VPN_INPUT: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
+        run: |
+          set -Eeuo pipefail
+
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          file_count="${{ steps.collect.outputs.FINAL_FILE_COUNT || 0 }}"
+          total_bytes="${{ steps.collect.outputs.TOTAL_BYTES || 0 }}"
+          formatted_bytes="$(numfmt --to=iec-i --suffix=B "$total_bytes" 2>/dev/null || echo "$total_bytes bytes")"
+
+          {
+            echo "# 🐦 Twitter / X Downloader"
+            echo
+            echo "## Configuration"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Upload Destination | \`$UPLOAD_INPUT\` |"
+            echo "| Bundle into Single ZIP | \`$BUNDLE_INPUT\` |"
+            echo "| VPN Enabled | \`$VPN_INPUT\` ($VPN_TYPE) |"
+            echo
+            echo "## Result"
+            echo
+            echo "| Metric | Count / Size |"
+            echo "|---|---:|"
+            echo "| Requested URLs | $total |"
+            echo "| Successful | $success |"
+            echo "| Failed | $failed |"
+            echo "| Downloaded Items | $file_count |"
+            echo "| Total Payload Size | $formatted_bytes |"
+            echo
+            echo "## Download Breakdown"
+            echo '| # | Status | Account | Tweet ID | Items | Size | Duration |'
+            echo '|---|---|---|---|---|---|---|'
+            for res in work/results/*.json; do
+              [ -f "$res" ] || continue
+              idx="$(jq -r '.index' "$res")"
+              st="$(jq -r '.status' "$res")"
+              aut="$(jq -r '.author' "$res")"
+              tid="$(jq -r '.tweet_id' "$res")"
+              cnt="$(jq -r '.items_count' "$res")"
+              sz="$(jq -r '.size_bytes' "$res")"
+              dur="$(jq -r '.duration' "$res")"
+              sz_fmt="$(numfmt --to=iec-i --suffix=B "$sz" 2>/dev/null || echo "$sz B")"
+              [ "$st" = "success" ] && icon="✅" || icon="❌"
+              echo "| $idx | $icon $st | @$aut | \`$tid\` | $cnt | $sz_fmt | $dur |"
+            done
+            echo
+            if [ -f "output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt" ]; then
+              echo "### ⚠️ Failed URLs"
+              echo '```text'
+              cat "output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ============================================================
+      # 14. DIAGNOSTICS
+      # ============================================================
+      - name: "📊 Upload diagnostics"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloader-diagnostics-${{ github.run_number }}
+          path: |
+            work/logs/
+            work/results/
+            work/failed/
+            work/jobs.tsv
+            output/FAILED-DOWNLOADS-*.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
+      # ============================================================
+      # 15. GOOGLE DRIVE UPLOAD (RESUMABLE CHUNKS)
+      # ============================================================
+      - name: "☁️ Upload to Google Drive"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'drive'
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_FOLDER_NAME: "github-actions"
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "$GOOGLE_CLIENT_ID" ] ||
+             [ -z "$GOOGLE_CLIENT_SECRET" ] ||
+             [ -z "$GOOGLE_REFRESH_TOKEN" ]; then
+            echo "❌ Google Drive credentials are missing in secrets."
+            exit 1
+          fi
+
+          token_json="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --request POST \
+              https://oauth2.googleapis.com/token \
+              --data-urlencode "client_id=${GOOGLE_CLIENT_ID}" \
+              --data-urlencode "client_secret=${GOOGLE_CLIENT_SECRET}" \
+              --data-urlencode "refresh_token=${GOOGLE_REFRESH_TOKEN}" \
+              --data-urlencode "grant_type=refresh_token"
+          )"
+
+          access_token="$(jq -r '.access_token // empty' <<< "$token_json")"
+
+          if [ -z "$access_token" ]; then
+            echo "❌ Could not obtain Google Drive access token."
+            exit 1
+          fi
+
+          query="mimeType='application/vnd.google-apps.folder' and name='${DRIVE_FOLDER_NAME}' and trashed=false"
+
+          folder_response="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --get \
+              https://www.googleapis.com/drive/v3/files \
+              -H "Authorization: Bearer ${access_token}" \
+              --data-urlencode "q=${query}" \
+              --data-urlencode "fields=files(id,name)"
+          )"
+
+          folder_id="$(jq -r '.files[0].id // empty' <<< "$folder_response")"
+
+          if [ -z "$folder_id" ]; then
+            body="$(
+              jq -n \
+                --arg name "$DRIVE_FOLDER_NAME" \
+                '{
+                  name: $name,
+                  mimeType: "application/vnd.google-apps.folder"
+                }'
+            )"
+
+            folder_id="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --retry 5 \
+                --retry-delay 2 \
+                --retry-all-errors \
+                --request POST \
+                https://www.googleapis.com/drive/v3/files \
+                -H "Authorization: Bearer ${access_token}" \
+                -H "Content-Type: application/json" \
+                --data "$body" |
+              jq -r '.id // empty'
+            )"
+          fi
+
+          if [ -z "$folder_id" ]; then
+            echo "❌ Could not locate or create Drive folder."
+            exit 1
+          fi
+
+          upload_file() {
+            local file="$1"
+            local name size
+            name="$(basename "$file")"
+            size="$(stat -c%s "$file")"
+
+            echo "⬆️ Uploading: $name ($size bytes)"
+
+            local headers="$(mktemp)"
+            local metadata="$(
+              jq -n \
+                --arg name "$name" \
+                --arg folder "$folder_id" \
+                '{
+                  name: $name,
+                  parents: [$folder]
+                }'
+            )"
+
+            if ! curl \
+              --silent \
+              --show-error \
+              --request POST \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              -D "$headers" \
+              -o /dev/null \
+              -H "Authorization: Bearer ${access_token}" \
+              -H "Content-Type: application/json; charset=UTF-8" \
+              -H "X-Upload-Content-Type: application/octet-stream" \
+              -H "X-Upload-Content-Length: ${size}" \
+              --data "$metadata" \
+              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"; then
+              rm -f "$headers"
+              return 1
+            fi
+
+            local session_uri="$(
+              awk '
+                BEGIN { IGNORECASE=1 }
+                /^location:/ {
+                  sub(/\r$/, "")
+                  sub(/^[^:]*:[[:space:]]*/, "")
+                  print
+                  exit
+                }
+              ' "$headers"
+            )"
+            rm -f "$headers"
+
+            if [ -z "$session_uri" ]; then
+              echo "❌ Could not initialize resumable Drive session."
+              return 1
+            fi
+
+            local offset=0
+            while [ "$offset" -lt "$size" ]; do
+              local remaining=$((size - offset))
+              local length="$DRIVE_CHUNK_SIZE"
+              [ "$remaining" -lt "$length" ] && length="$remaining"
+
+              local end=$((offset + length - 1))
+              local chunk="$(mktemp)"
+
+              dd if="$file" of="$chunk" iflag=skip_bytes,count_bytes \
+                skip="$offset" count="$length" status=none
+
+              local chunk_done="false"
+              for attempt in 1 2 3 4 5; do
+                local response="$(mktemp)"
+                local response_headers="$(mktemp)"
+
+                local code="$(
+                  curl \
+                    --silent \
+                    --show-error \
+                    --request PUT \
+                    -D "$response_headers" \
+                    -o "$response" \
+                    --write-out '%{http_code}' \
+                    -H "Authorization: Bearer ${access_token}" \
+                    -H "Content-Type: application/octet-stream" \
+                    -H "Content-Length: ${length}" \
+                    -H "Content-Range: bytes ${offset}-${end}/${size}" \
+                    --data-binary "@${chunk}" \
+                    "$session_uri"
+                )"
+
+                case "$code" in
+                  200|201)
+                    offset="$size"
+                    chunk_done="true"
+                    ;;
+                  308)
+                    local range="$(
+                      awk '
+                        BEGIN { IGNORECASE=1 }
+                        /^Range:/ { sub(/\r$/, ""); print }
+                      ' "$response_headers"
+                    )"
+
+                    if [[ "$range" =~ bytes=0-([0-9]+) ]]; then
+                      offset=$((BASH_REMATCH[1] + 1))
+                    else
+                      offset=$((end + 1))
+                    fi
+                    chunk_done="true"
+                    ;;
+                  429|500|502|503|504)
+                    local delay=$((2 ** attempt))
+                    [ "$delay" -gt 30 ] && delay=30
+                    echo "⚠️ Drive HTTP $code; retrying in ${delay}s..."
+                    sleep "$delay"
+                    ;;
+                  *)
+                    echo "❌ Drive upload chunk error: HTTP $code"
+                    cat "$response" 2>/dev/null || true
+                    rm -f "$response" "$response_headers" "$chunk"
+                    return 1
+                    ;;
+                esac
+
+                rm -f "$response" "$response_headers"
+                [ "$offset" -ge "$size" ] || [ "$chunk_done" = "true" ] && break
+              done
+
+              rm -f "$chunk"
+              if [ "$offset" -lt "$size" ] && [ "$chunk_done" != "true" ]; then
+                echo "❌ Resumable upload chunk failed."
+                return 1
+              fi
+
+              local percent=$((offset * 100 / size))
+              echo "   Progress: ${percent}% (${offset}/${size} bytes)"
+            done
+
+            echo "✅ Uploaded: $name"
+          }
+
+          for file in output/*; do
+            [ -f "$file" ] || continue
+            case "$(basename "$file")" in
+              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt|*.*)
+                upload_file "$file"
+                ;;
+            esac
           done
-          echo "All files uploaded to the 'twitter' folder."
+
+          echo "✅ Google Drive upload complete."
+
+      # ============================================================
+      # 16. REPOSITORY UPLOAD
+      # ============================================================
+      - name: "📤 Upload to repository"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'repo'
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+
+          git add output/
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ Nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "Add downloaded Twitter/X media [skip ci]"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt ${attempt}/5..."
+            if git pull --rebase --autostash origin "$BRANCH_NAME" &&
+               git push origin "$BRANCH_NAME"; then
+              echo "✅ Repository push succeeded."
+              exit 0
+            fi
+            sleep $((attempt * 3))
+          done
+
+          echo "❌ Repository push failed."
+          exit 1
+
+      # ============================================================
+      # 17. GITHUB RELEASE
+      # ============================================================
+      - name: "🏷️ Create GitHub Release"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VPN_INPUT: ${{ inputs.vpn_enabled }}
+        run: |
+          set -Eeuo pipefail
+
+          tag="twitter-${RUN_SUFFIX}"
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+
+          {
+            echo "# 🐦 Twitter / X Downloader Release"
+            echo
+            echo "Requested URLs: ${total}"
+            echo "Successful: ${success}"
+            echo "Failed: ${failed}"
+            echo "VPN Protected: ${VPN_INPUT}"
+          } > work/release-notes.md
+
+          mapfile -t assets < <(
+            find output \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name '*.zip' \
+                -o -name '*.z[0-9][0-9]' \
+                -o -name 'FAILED-DOWNLOADS-*.txt' \
+              \) \
+              -print |
+            sort
+          )
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "❌ No release assets found."
+            exit 1
+          fi
+
+          gh release create \
+            "$tag" \
+            "${assets[@]}" \
+            --title "Twitter Download ${RUN_SUFFIX}" \
+            --notes-file work/release-notes.md \
+            --target "$GITHUB_SHA"
+
+          echo "✅ Release created."
+
+      # ============================================================
+      # 18. FINAL STATUS
+      # ============================================================
+      - name: "✅ Final status"
+        if: always()
+        env:
+          FAIL_ON_PARTIAL: ${{ inputs.fail_on_partial }}
+        run: |
+          set -Eeuo pipefail
+
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          file_count="${{ steps.collect.outputs.FINAL_FILE_COUNT || 0 }}"
+
+          echo
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║                   🐦 FINAL RESULT                          ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          printf '║ Requested URLs : %-43s ║\n' "$total"
+          printf '║ Successful     : %-43s ║\n' "$success"
+          printf '║ Failed         : %-43s ║\n' "$failed"
+          printf '║ Items Saved    : %-43s ║\n' "$file_count"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo
+
+          if [ "$success" -eq 0 ]; then
+            echo "❌ No URLs completed successfully."
+            exit 1
+          fi
+
+          if [ "$failed" -gt 0 ] && [ "$FAIL_ON_PARTIAL" = "true" ]; then
+            echo "❌ Partial failures encountered with fail_on_partial=true."
+            exit 1
+          fi
+
+          if [ "$failed" -gt 0 ]; then
+            echo "⚠️ Partial downloads accepted."
+          else
+            echo "✅ All downloads completed successfully."
+          fi
+
+      # ============================================================
+      # 19. CLEANUP
+      # ============================================================
+      - name: "🧹 Cleanup"
+        if: always()
+        run: |
+          set +e
+
+          sudo killall openvpn >/dev/null 2>&1 || true
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+
+          rm -f \
+            /tmp/wg0.conf \
+            /tmp/client.ovpn \
+            /tmp/ovpn-auth.txt \
+            /tmp/openvpn.log \
+            /tmp/twitter-cookies.txt \
+            /tmp/terminal.lock 2>/dev/null || true
+
+          echo "✅ Cleanup complete."
