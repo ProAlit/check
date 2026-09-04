@@ -5,387 +5,1281 @@ on:
     inputs:
       app:
         description: >-
-          One or more Google Play URLs / package names.
-          Separate by commas, spaces, or newlines.
-          Examples:
-            URL:  https://play.google.com/store/apps/details?id=org.telegram.messenger&hl=en
-            Package name:  com.google.android.youtube
+          One or more Google Play URLs or package names (separate by commas, spaces, or newlines).
+          Example: https://play.google.com/store/apps/details?id=org.telegram.messenger or com.spotify.music
         required: true
         type: string
+
       architecture:
-        description: Target device architecture
+        description: "📱 Target device architecture"
         required: true
         type: choice
-        default: 'arm64'
+        default: "arm64"
         options:
           - arm64
           - armv7
+
       merge_splits:
-        description: Bundle all split APKs into one installable APK
-        required: false
+        description: "🧩 Bundle split APKs into a single installable standalone APK?"
+        required: true
         type: boolean
         default: true
-      bundle_all:
-        description: 'Bundle all downloaded files into a single ZIP archive before splitting'
-        type: boolean
-        default: false
+
       upload_method:
-        description: 'Upload destination'
+        description: "☁️ Upload destination"
         required: true
         type: choice
         options:
-          - repo
-          - release
-          - drive
-        default: repo
+          - drive         # Google Drive (folder: github-actions)
+          - repo          # Push to repository (split 90MB)
+          - release       # GitHub Release (split 1900MB)
+        default: drive
+
+      bundle_all:
+        description: "📦 Bundle all downloaded APKs into a single ZIP archive?"
+        required: true
+        type: boolean
+        default: false
+
+      vpn_enabled:
+        description: "🔒 Route downloads through VPN?"
+        required: true
+        type: boolean
+        default: false
+
+      vpn_type:
+        description: "🛡️ VPN Protocol (if VPN enabled)"
+        required: true
+        type: choice
+        options:
+          - wireguard
+          - openvpn
+        default: wireguard
+
+      concurrent_downloads:
+        description: "⚡ Concurrent download workers (keep at 2 to avoid Play Store bans)"
+        required: true
+        type: number
+        default: 2
+
+      retry_count:
+        description: "🔄 Retries per package"
+        required: true
+        type: number
+        default: 2
+
+      raw_logs:
+        description: "🧪 Show raw verbose logs in console?"
+        required: true
+        type: boolean
+        default: false
+
+      fail_on_partial:
+        description: "❌ Fail workflow if any package fails?"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: gplay-downloader-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_PARALLEL: "2"
+  DEFAULT_RETRIES: "2"
+  DRIVE_CHUNK_SIZE: "16777216" # 16 MB Chunks
+  PIP_BREAK_SYSTEM_PACKAGES: "1"
+
 jobs:
-  actions:
+  google-play-download:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      # ============================================================
+      # 01. CHECKOUT
+      # ============================================================
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
         with:
+          fetch-depth: 1
           persist-credentials: true
 
-      - name: Parse multiple inputs
-        id: parse
+      # ============================================================
+      # 02. SYSTEM DEPENDENCIES
+      # ============================================================
+      - name: "🛠️ Install system dependencies"
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          INPUT="${{ inputs.app }}"
-          MODIFIED=$(echo "$INPUT" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
-          if [ -z "$MODIFIED" ]; then
-            echo "Error: No input provided." >&2
-            exit 1
-          fi
+          set -Eeuo pipefail
 
-          PACKAGES='[]'
-          for token in $MODIFIED; do
-            if echo "$token" | grep -qE '^https?://'; then
-              PACKAGE=$(echo "$token" | grep -oP '(?<=id=)[^&]*')
-              if [ -z "$PACKAGE" ]; then
-                echo "Warning: Could not extract package name from $token – skipping"
-                continue
-              fi
-            else
-              PACKAGE="$token"
-            fi
-            PACKAGES=$(echo "$PACKAGES" | jq -c ". + [\"$PACKAGE\"]")
-          done
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            openjdk-17-jre-headless \
+            apksigner \
+            python3 \
+            python3-venv \
+            python3-pip \
+            python-is-python3 \
+            curl \
+            git \
+            zip \
+            unzip \
+            jq \
+            wireguard-tools \
+            openvpn \
+            openvpn-systemd-resolved \
+            openssl
 
-          COUNT=$(echo "$PACKAGES" | jq length)
-          if [ "$COUNT" -eq 0 ]; then
-            echo "Error: No valid package names found." >&2
-            exit 1
-          fi
+          echo "✅ System dependencies installed."
 
-          echo "Parsed $COUNT package(s):"
-          echo "$PACKAGES" | jq -r '.[]'
-          echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-
-      - name: Install system dependencies
+      # ============================================================
+      # 03. INSTALL & AUTHENTICATE GPLAY TOOL
+      # ============================================================
+      - name: "📦 Install & authenticate gplay-apk-downloader"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y -qq openjdk-17-jre-headless apksigner python3 python3-venv python3-pip curl git zip jq
+          set -Eeuo pipefail
 
-      - name: Clone gplay-apk-downloader
-        run: |
-          git clone https://github.com/alltechdev/gplay-apk-downloader.git
+          rm -rf gplay-apk-downloader
+          git clone --depth 1 https://github.com/alltechdev/gplay-apk-downloader.git gplay-apk-downloader
           cd gplay-apk-downloader
+          chmod +x setup.sh gplay
           ./setup.sh
-
-      - name: Authenticate with Google Play
-        run: |
-          cd gplay-apk-downloader
           echo "y" | ./gplay auth
-          echo "Authentication completed."
 
-      - name: Download all APKs
-        id: download
+          echo "✅ gplay-apk-downloader configured."
+
+      # ============================================================
+      # 04. TOOLCHAIN VERIFICATION
+      # ============================================================
+      - name: "🔎 Show toolchain versions"
         run: |
-          PACKAGES='${{ steps.parse.outputs.packages }}'
-          ARCH="${{ inputs.architecture }}"
-          MERGE="${{ inputs.merge_splits }}"
-          MAIN_DOWNLOAD_DIR="$RUNNER_TEMP/apk_downloads"
-          rm -rf "$MAIN_DOWNLOAD_DIR"
-          mkdir -p "$MAIN_DOWNLOAD_DIR"
+          set -Eeuo pipefail
 
-          COUNT=$(echo "$PACKAGES" | jq length)
-          for ((i=0; i<COUNT; i++)); do
-            PKG=$(echo "$PACKAGES" | jq -r ".[$i]")
-            echo "==========================================="
-            echo "Downloading ($((i+1))/$COUNT): $PKG"
+          echo "Java      : $(java -version 2>&1 | head -n1)"
+          echo "apksigner : $(apksigner --version 2>&1 || echo 'apksigner ready')"
+          echo "Python    : $(python3 --version 2>&1)"
+          echo "gplay CLI : $(cd gplay-apk-downloader && ./gplay --help | head -n2 || echo 'gplay ready')"
 
-            SUBDIR="$MAIN_DOWNLOAD_DIR/$PKG"
-            mkdir -p "$SUBDIR"
-
-            CMD="./gplay download $PKG -a $ARCH -o $SUBDIR"
-            if [ "$MERGE" = "true" ]; then
-              CMD="$CMD -m"
-            fi
-
-            (cd gplay-apk-downloader && $CMD)
-            if [ $? -ne 0 ] || [ -z "$(ls -A "$SUBDIR" 2>/dev/null)" ]; then
-              echo "Warning: No files downloaded for $PKG – skipping"
-              rm -rf "$SUBDIR"
-            else
-              echo "Done: $(ls -1 "$SUBDIR" | wc -l) file(s)"
-            fi
-          done
-
-          if [ -z "$(find "$MAIN_DOWNLOAD_DIR" -type f 2>/dev/null)" ]; then
-            echo "Error: No files downloaded for any package." >&2
-            exit 1
-          fi
-
-          echo "main_download_dir=$MAIN_DOWNLOAD_DIR" >> $GITHUB_OUTPUT
-
-      - name: Archive files
-        id: archive
+      # ============================================================
+      # 05. WORKSPACE & IDENTIFIER
+      # ============================================================
+      - name: "📁 Initialize workspace"
         run: |
-          MAIN_DIR="${{ steps.download.outputs.main_download_dir }}"
-          UPLOAD_DIR="${{ github.workspace }}/google-play"
-          rm -rf "$UPLOAD_DIR"
-          mkdir -p "$UPLOAD_DIR"
+          set -Eeuo pipefail
 
-          BUNDLE_ALL="${{ inputs.bundle_all }}"
-          UPLOAD_METHOD="${{ inputs.upload_method }}"
+          RUN_SUFFIX="$(openssl rand -hex 4 | cut -c1-5)"
+          echo "RUN_SUFFIX=${RUN_SUFFIX}" >> "$GITHUB_ENV"
+          echo "🆔 Generated identifier: ${RUN_SUFFIX}"
 
-          if [ "$UPLOAD_METHOD" = "repo" ]; then
-            METHOD="split_push"
-          else
-            METHOD="release"
-          fi
+          rm -rf work output
+          mkdir -p \
+            work/downloads \
+            work/logs \
+            work/results \
+            work/failed \
+            work/archive \
+            work/package \
+            output
 
-          if [ "$BUNDLE_ALL" = "true" ]; then
-            BUNDLE_TMP="$RUNNER_TEMP/bundle_tmp"
-            mkdir -p "$BUNDLE_TMP"
+          echo "✅ Workspace initialized."
 
-            find "$MAIN_DIR" -type f | while read -r f; do
-              fname=$(basename "$f")
-              TARGET="$BUNDLE_TMP/$fname"
-              if [ -e "$TARGET" ]; then
-                base="${fname%.*}"
-                ext="${fname##*.}"
-                if [ "$base" = "$ext" ]; then
-                  base="$fname"
-                  ext=""
-                else
-                  ext=".$ext"
-                fi
-                counter=1
-                while [ -e "$BUNDLE_TMP/${base}_${counter}${ext}" ]; do
-                  counter=$((counter + 1))
-                done
-                TARGET="$BUNDLE_TMP/${base}_${counter}${ext}"
-              fi
-              cp "$f" "$TARGET"
-            done
-
-            if [ -z "$(ls -A "$BUNDLE_TMP" 2>/dev/null)" ]; then
-              echo "No files to bundle."
-              rm -rf "$BUNDLE_TMP" "$MAIN_DIR"
-              exit 1
-            fi
-
-            RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
-            BUNDLE_ZIP="google-play_bundle_${RAND5}.zip"
-            echo "📦 Creating bundle ZIP: $BUNDLE_ZIP"
-
-            if [ "$METHOD" = "release" ]; then
-              (cd "$BUNDLE_TMP" && zip -r "../${UPLOAD_DIR}/${BUNDLE_ZIP}" *)
-              FULLZIP="${UPLOAD_DIR}/${BUNDLE_ZIP}"
-              SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-              if [ "$SIZE" -gt 2044723200 ]; then
-                echo "Bundle ZIP larger than 1950 MiB, splitting"
-                rm "$FULLZIP"
-                (cd "$BUNDLE_TMP" && zip -r -s 1950m "../${UPLOAD_DIR}/${BUNDLE_ZIP}" *)
-              fi
-            else
-              (cd "$BUNDLE_TMP" && zip -r -s 99m "../${UPLOAD_DIR}/${BUNDLE_ZIP}" *)
-            fi
-            rm -rf "$BUNDLE_TMP"
-          else
-            RNDSTR=$(tr -dc 'a-z' </dev/urandom | head -c5)
-            find "$MAIN_DIR" -type f -print0 > /tmp/apk_files.txt
-            while IFS= read -r -d '' f; do
-              base=$(basename "$f")
-              echo "→ Archiving $base"
-              if [ "$METHOD" = "release" ]; then
-                zip -j "$UPLOAD_DIR/${base}_${RNDSTR}.zip" "$f"
-                FULLZIP="${UPLOAD_DIR}/${base}_${RNDSTR}.zip"
-                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLZIP"
-                  zip -j -s 1950m "$UPLOAD_DIR/${base}_${RNDSTR}.zip" "$f"
-                fi
-              else
-                zip -j -s 99m "$UPLOAD_DIR/${base}_${RNDSTR}.zip" "$f"
-              fi
-            done < /tmp/apk_files.txt
-          fi
-
-          rm -rf "$MAIN_DIR"
-
-          if [ -z "$(ls -A "$UPLOAD_DIR" 2>/dev/null)" ]; then
-            echo "Error: No files were archived."
-            exit 1
-          fi
-
-          ls -1 "$UPLOAD_DIR" > "${UPLOAD_DIR}_assets.txt"
-          echo "Assets to upload:"
-          cat "${UPLOAD_DIR}_assets.txt"
-
-      - name: "Upload to Google Drive"
-        if: inputs.upload_method == 'drive'
+      # ============================================================
+      # 06. PARSE PACKAGES & URLs (OCTAL BUG FIXED)
+      # ============================================================
+      - name: "🔗 Parse package names and URLs"
         env:
-          CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          RAW_INPUT: ${{ inputs.app }}
         run: |
-          ACCESS_TOKEN=$(curl -s -X POST https://oauth2.googleapis.com/token \
-            -d client_id="$CLIENT_ID" \
-            -d client_secret="$CLIENT_SECRET" \
-            -d refresh_token="$REFRESH_TOKEN" \
-            -d grant_type=refresh_token | jq -r '.access_token')
-          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "❌ Failed to obtain access token"
+          set -Eeuo pipefail
+
+          : > work/input_pkgs.txt
+          : > work/jobs.tsv
+
+          # Clean and separate input tokens
+          tokens=$(printf '%s\n' "$RAW_INPUT" | tr ',' '\n' | tr ' ' '\n' | sed 's/\r//g' | awk 'NF')
+
+          while IFS= read -r token; do
+            [ -z "$token" ] && continue
+
+            pkg=""
+            if [[ "$token" =~ id=([^&]+) ]]; then
+              pkg="${BASH_REMATCH[1]}"
+            elif [[ "$token" =~ ^https?://play\.google\.com/store/apps/details\? ]]; then
+              pkg=$(echo "$token" | grep -oP '(?<=id=)[^&]*' || true)
+            elif [[ "$token" =~ ^[a-zA-Z0-9._]+$ ]]; then
+              pkg="$token"
+            fi
+
+            if [ -n "$pkg" ]; then
+              echo "$pkg" >> work/input_pkgs.txt
+            else
+              echo "⚠️ Unsupported or invalid package token skipped: $token"
+            fi
+          done <<< "$tokens"
+
+          sort -u work/input_pkgs.txt -o work/input_pkgs.txt
+
+          if [ ! -s work/input_pkgs.txt ]; then
+            echo "❌ No valid package names or Google Play URLs found."
             exit 1
           fi
 
-          FOLDER_NAME="github-actions"
-          QUERY="mimeType='application/vnd.google-apps.folder' and name='$FOLDER_NAME' and trashed=false"
-          FOLDER_ID=$(curl -s -G \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            --data-urlencode "q=$QUERY" \
-            --data-urlencode "fields=files(id)" \
-            "https://www.googleapis.com/drive/v3/files" | jq -r '.files[0].id // ""')
-          if [ -z "$FOLDER_ID" ]; then
-            echo "→ Creating folder '$FOLDER_NAME'"
-            FOLDER_ID=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"name\":\"$FOLDER_NAME\", \"mimeType\":\"application/vnd.google-apps.folder\"}" \
-              "https://www.googleapis.com/drive/v3/files?fields=id" | jq -r '.id')
-            if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
-              echo "❌ Failed to create folder"
-              exit 1
-            fi
-          fi
-          echo "✅ Folder ID: $FOLDER_ID"
+          index=0
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+            index=$((index + 1))
+            # Store plain integer ID to guarantee no octal interpretation errors
+            printf '%d\t%s\n' "$index" "$pkg" >> work/jobs.tsv
+          done < work/input_pkgs.txt
 
-          OUTPUT_DIR="google-play"
-          for file in "$OUTPUT_DIR"/*; do
-            [ -f "$file" ] || continue
-            fname=$(basename "$file")
-            size=$(stat -c%s "$file")
-            echo "→ Uploading $fname ($size bytes)..."
-            SESSION_URI=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json; charset=UTF-8" \
-              -H "X-Upload-Content-Type: application/zip" \
-              -d "{\"name\":\"$fname\", \"parents\":[\"$FOLDER_ID\"]}" \
-              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable" \
-              -D - | tr -d '\r' | grep -i '^location:' | sed 's/^location: //i' | tr -d ' ')
-            if [ -z "$SESSION_URI" ]; then
-              echo "❌ Failed to initiate upload session for $fname, skipping"
-              continue
-            fi
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Length: $size" \
-              -H "Content-Range: bytes 0-$((size-1))/$size" \
-              --data-binary "@$file" \
-              "$SESSION_URI")
-            if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
-              echo "✅ Uploaded $fname"
-            else
-              echo "❌ Upload failed with HTTP $HTTP_CODE"
-            fi
-          done
+          echo "Accepted Packages: $(wc -l < work/jobs.tsv)"
+          cat work/jobs.tsv
 
-      - name: Upload to repository (split_push method)
-        if: ${{ inputs.upload_method == 'repo' }}
+      # ============================================================
+      # 07. VPN CONFIGURATION (WIREGUARD & OPENVPN)
+      # ============================================================
+      - name: "🔒 Configure VPN (WireGuard / OpenVPN)"
+        id: vpn
         env:
-          BRANCH: ${{ github.ref_name }}
+          VPN_ENABLED: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+          OVPN_CONFIG: ${{ secrets.OVPN_CONFIG }}
+          OVPN_AUTH: ${{ secrets.OVPN_AUTH }}
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git config http.postBuffer 524288000
+          set -Eeuo pipefail
 
-          if [ -z "$(ls -A google-play/ 2>/dev/null)" ]; then
-            echo "No files to upload."
+          if [ "$VPN_ENABLED" != "true" ]; then
+            echo "🚫 VPN disabled by input."
+            echo "vpn_available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          git add google-play/
-          PACKAGES='${{ steps.parse.outputs.packages }}'
-          FIRST_NAMES=$(echo "$PACKAGES" | jq -r '.[0:2][]' | paste -sd ' ')
-          COMMIT_MSG="Download $FIRST_NAMES"
-          COUNT=$(echo "$PACKAGES" | jq length)
-          if [ "$COUNT" -gt 2 ]; then
-            COMMIT_MSG="$COMMIT_MSG and $((COUNT-2)) more"
-          fi
-          COMMIT_MSG="$COMMIT_MSG (${{ inputs.architecture }}) [skip ci]"
-          git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
+          echo "🛡️ Configuring VPN protocol: ${VPN_TYPE}"
 
-          RETRIES=5
-          for i in $(seq 1 $RETRIES); do
-            echo "Push attempt $i..."
-            git pull --rebase --autostash origin "$BRANCH"
-            if git push origin "$BRANCH"; then
-              echo "Push succeeded."
-              break
+          if [ "$VPN_TYPE" = "wireguard" ]; then
+            if [ -z "$WG_CONFIG" ]; then
+              echo "⚠️ WireGuard requested but WG_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            umask 077
+            printf '%s\n' "$WG_CONFIG" > /tmp/wg0.conf
+            sudo install -m 600 /tmp/wg0.conf /etc/wireguard/wg0.conf
+
+            if sudo wg-quick up wg0; then
+              echo "✅ WireGuard connected."
+              public_ip="$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org || echo "unavailable")"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
             else
-              if [ $i -lt $RETRIES ]; then
-                echo "Push rejected, retrying in 3 seconds..."
-                sleep 3
+              echo "❌ WireGuard failed."
+              sudo wg-quick down wg0 >/dev/null 2>&1 || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            fi
+
+          elif [ "$VPN_TYPE" = "openvpn" ]; then
+            if [ -z "$OVPN_CONFIG" ]; then
+              echo "⚠️ OpenVPN requested but OVPN_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ ! -c /dev/net/tun ]; then
+              sudo mkdir -p /dev/net
+              sudo mknod /dev/net/tun c 10 200
+              sudo chmod 600 /dev/net/tun
+            fi
+
+            umask 077
+            printf '%s\n' "$OVPN_CONFIG" > /tmp/client.ovpn
+
+            if [ -n "$OVPN_AUTH" ]; then
+              printf '%s\n' "$OVPN_AUTH" > /tmp/ovpn-auth.txt
+              chmod 600 /tmp/ovpn-auth.txt
+              echo "auth-user-pass /tmp/ovpn-auth.txt" >> /tmp/client.ovpn
+            fi
+
+            echo "🚀 Starting OpenVPN daemon..."
+            sudo openvpn --config /tmp/client.ovpn --daemon --log /tmp/openvpn.log
+
+            echo "⏳ Waiting for OpenVPN tunnel interface..."
+            ready="false"
+            for attempt in $(seq 1 30); do
+              if ip link show dev tun0 >/dev/null 2>&1 || ip link show dev tun1 >/dev/null 2>&1; then
+                ready="true"
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$ready" = "true" ]; then
+              echo "✅ OpenVPN connected."
+              sleep 2
+              public_ip="$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org || echo "unavailable")"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ OpenVPN failed to connect."
+              cat /tmp/openvpn.log 2>/dev/null || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      # ============================================================
+      # 08. DOWNLOAD ENGINE (GPLAY CONCURRENT QUEUE)
+      # ============================================================
+      - name: "⬇️ Download Google Play APKs"
+        env:
+          ARCH: ${{ inputs.architecture }}
+          MERGE_SPLITS: ${{ inputs.merge_splits }}
+          CONCURRENT_WORKERS: ${{ inputs.concurrent_downloads }}
+          RETRY_COUNT: ${{ inputs.retry_count }}
+          RAW_LOGS: ${{ inputs.raw_logs }}
+          VPN_AVAILABLE: ${{ steps.vpn.outputs.vpn_available }}
+        run: |
+          set -Eeuo pipefail
+
+          WORKERS="$CONCURRENT_WORKERS"
+          RETRIES="$RETRY_COUNT"
+
+          if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then WORKERS="$DEFAULT_PARALLEL"; fi
+          if ! [[ "$RETRIES" =~ ^[1-9][0-9]*$ ]]; then RETRIES="$DEFAULT_RETRIES"; fi
+
+          GPLAY_DIR="$(pwd)/gplay-apk-downloader"
+          WORKSPACE_ROOT="$(pwd)"
+
+          now() { date '+%H:%M:%S'; }
+
+          format_duration() {
+            local secs="$1"
+            if [ "$secs" -ge 3600 ]; then
+              printf '%dh %dm %ds' $((secs / 3600)) $(( (secs % 3600) / 60 )) $((secs % 60))
+            elif [ "$secs" -ge 60 ]; then
+              printf '%dm %ds' $((secs / 60)) $((secs % 60))
+            else
+              printf '%ds' "$secs"
+            fi
+          }
+
+          format_bytes() {
+            local bytes="$1"
+            if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then
+              echo "0 B"
+              return
+            fi
+            numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || awk -v b="$bytes" 'BEGIN {
+              split("B KB MB GB TB", units, " ");
+              i=1;
+              while(b>=1024 && i<5) { b/=1024; i++ }
+              printf "%.2f %s", b, units[i]
+            }'
+          }
+
+          safe_log() {
+            (
+              flock -x 200
+              printf '%b\n' "$1"
+            ) 200>/tmp/terminal.lock
+          }
+
+          log_timing() {
+            local id="$1"
+            local message="$2"
+            printf '[%s] %s\n' "$(now)" "$message" >> "${WORKSPACE_ROOT}/work/logs/${id}-timing.log"
+          }
+
+          has_apks() {
+            local dir="$1"
+            find "$dir" -type f \( -iname '*.apk' -o -iname '*.apks' -o -iname '*.xapk' \) 2>/dev/null | grep -q .
+          }
+
+          classify_error() {
+            local logfile="$1"
+            if grep -qiE 'App not found|Item not found|404' "$logfile"; then
+              echo "APP_NOT_FOUND"
+              return
+            fi
+            if grep -qiE 'Purchase required|Paid app|not free' "$logfile"; then
+              echo "PAID_APP_RESTRICTION"
+              return
+            fi
+            if grep -qiE 'Device not compatible|Incompatible' "$logfile"; then
+              echo "DEVICE_INCOMPATIBLE"
+              return
+            fi
+            if grep -qiE 'rate limit|Too many requests|429' "$logfile"; then
+              echo "RATE_LIMITED"
+              return
+            fi
+            if grep -qiE 'timed out|timeout|Network error' "$logfile"; then
+              echo "NETWORK_TIMEOUT"
+              return
+            fi
+            echo "DOWNLOAD_ERROR"
+          }
+
+          run_gplay_download() {
+            local id="$1" pkg="$2" attempt="$3"
+            local dir="${WORKSPACE_ROOT}/work/downloads/${id}"
+            local logfile="${WORKSPACE_ROOT}/work/logs/${id}-attempt-${attempt}.log"
+
+            mkdir -p "$dir"
+
+            local -a cmd=(
+              ./gplay
+              download
+              "$pkg"
+              -a "$ARCH"
+              -o "$dir"
+            )
+
+            if [ "$MERGE_SPLITS" = "true" ]; then
+              cmd+=(-m)
+            fi
+
+            local exit_code=0
+            if [ "$RAW_LOGS" = "true" ]; then
+              set +e
+              (cd "$GPLAY_DIR" && timeout 1200 "${cmd[@]}") >> "${WORKSPACE_ROOT}/work/logs/${id}-raw.log" 2>&1
+              exit_code=$?
+              set -e
+            else
+              set +e
+              (cd "$GPLAY_DIR" && timeout 1200 "${cmd[@]}") > "$logfile" 2>&1
+              exit_code=$?
+              set -e
+            fi
+
+            if [ "$exit_code" -eq 0 ] && has_apks "$dir"; then
+              return 0
+            fi
+            return 1
+          }
+
+          process_one() {
+            local id_raw="$1"
+            local pkg="$2"
+
+            # Parse base 10 integer to bypass bash octal evaluation errors
+            local id=$((10#$id_raw))
+            local id_fmt
+            id_fmt="$(printf '%04d' "$id")"
+
+            local dir="${WORKSPACE_ROOT}/work/downloads/${id}"
+            mkdir -p "$dir"
+            : > "${WORKSPACE_ROOT}/work/logs/${id}-timing.log"
+
+            local start_sec="$(date +%s)"
+            local started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local status="failed"
+            local reason="exhausted"
+            local files_count=0
+            local total_size=0
+            local speed_str="0 B/s"
+            local primary_file="N/A"
+
+            local merge_label="split"
+            [ "$MERGE_SPLITS" = "true" ] && merge_label="merged APK"
+
+            safe_log "[$(now)] 🚀 #${id_fmt} (google-play) STARTING │ ${pkg} [${ARCH}, ${merge_label}]"
+
+            for attempt in $(seq 1 "$RETRIES"); do
+              local attempt_start="$(date +%s)"
+              log_timing "$id" "⚡ gplay download attempt ${attempt}/${RETRIES}"
+
+              if run_gplay_download "$id" "$pkg" "$attempt"; then
+                local attempt_elapsed=$(( $(date +%s) - attempt_start ))
+                status="success"
+                reason="completed"
+                log_timing "$id" "🏁 Download succeeded ── took $(format_duration "$attempt_elapsed") ── ✅ SUCCESS"
+                break
               else
-                echo "Push failed after $RETRIES attempts."
+                local attempt_elapsed=$(( $(date +%s) - attempt_start ))
+                local failure_type="$(classify_error "${WORKSPACE_ROOT}/work/logs/${id}-attempt-${attempt}.log")"
+                log_timing "$id" "✖ Attempt ${attempt} failed ── took $(format_duration "$attempt_elapsed") ── ⚠ ${failure_type}"
+
+                if [ "$failure_type" = "APP_NOT_FOUND" ] || [ "$failure_type" = "PAID_APP_RESTRICTION" ]; then
+                  reason="$failure_type"
+                  break
+                fi
+
+                if [ "$attempt" -lt "$RETRIES" ]; then
+                  sleep $((attempt * 4))
+                fi
+              fi
+            done
+
+            mapfile -t apks < <(find "$dir" -type f \( -iname '*.apk' -o -iname '*.apks' -o -iname '*.xapk' \) 2>/dev/null)
+            files_count="${#apks[@]}"
+
+            if [ "$files_count" -gt 0 ]; then
+              primary_file="$(basename "${apks[0]}")"
+              if [ "$files_count" -gt 1 ]; then
+                primary_file="${primary_file} (+ $((files_count - 1)) splits)"
+              fi
+
+              for f in "${apks[@]}"; do
+                local sz="$(stat -c%s "$f" 2>/dev/null || echo 0)"
+                total_size=$((total_size + sz))
+              done
+            fi
+
+            local finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local total_elapsed=$(( $(date +%s) - start_sec ))
+            local total_duration="$(format_duration "$total_elapsed")"
+
+            if [ "$total_elapsed" -gt 0 ] && [ "$total_size" -gt 0 ]; then
+              local spd_bps=$(( total_size / total_elapsed ))
+              speed_str="$(format_bytes "$spd_bps")/s"
+            fi
+
+            if [ "$status" != "success" ]; then
+              printf '%s\t%s\n' "$id" "$pkg" > "${WORKSPACE_ROOT}/work/failed/${id}.tsv"
+              printf '%s\n' "$reason" > "${WORKSPACE_ROOT}/work/failed/${id}.reason"
+            fi
+
+            jq -n \
+              --arg id "$id" \
+              --arg pkg "$pkg" \
+              --arg status "$status" \
+              --arg title "$primary_file" \
+              --arg count "$files_count" \
+              --arg size "$total_size" \
+              --arg arch "$ARCH" \
+              --arg merged "$MERGE_SPLITS" \
+              --arg duration "$total_duration" \
+              --arg speed "$speed_str" \
+              --arg started "$started_at" \
+              --arg finished "$finished_at" \
+              '{
+                index: ($id | tonumber),
+                package: $pkg,
+                status: $status,
+                filename: $title,
+                files_count: ($count | tonumber),
+                size_bytes: ($size | tonumber),
+                architecture: $arch,
+                merged_splits: ($merged | test("true")),
+                duration: $duration,
+                speed: $speed,
+                started_at: $started,
+                finished_at: $finished
+              }' > "${WORKSPACE_ROOT}/work/results/${id}.json"
+
+            (
+              flock -x 200
+              echo
+              echo "┌──────────────────────────────────────────────────────────────────────────────"
+              if [ "$status" = "success" ]; then
+                printf '│ 📱 GOOGLE PLAY #%s — ✅ SUCCESS (Total: %s — %s — %s)\n' \
+                  "$id_fmt" "$total_duration" "$(format_bytes "$total_size")" "$speed_str"
+                printf '│ Package : %s\n' "$pkg"
+                printf '│ Files   : %s [%d file(s)]\n' "$primary_file" "$files_count"
+              else
+                printf '│ 📱 GOOGLE PLAY #%s — ❌ FAILED (Total: %s — %s)\n' \
+                  "$id_fmt" "$total_duration" "$reason"
+                printf '│ Package : %s\n' "$pkg"
+              fi
+              printf '│ Options : Arch: %s | Merge Splits: %s\n' "$ARCH" "$MERGE_SPLITS"
+              echo "│ Steps & Provider Timing:"
+              if [ -s "${WORKSPACE_ROOT}/work/logs/${id}-timing.log" ]; then
+                sed 's/^/│   /' "${WORKSPACE_ROOT}/work/logs/${id}-timing.log"
+              else
+                echo "│   (No step timing recorded)"
+              fi
+              echo "└──────────────────────────────────────────────────────────────────────────────"
+              echo
+
+              if [ "$RAW_LOGS" = "true" ] && [ -f "${WORKSPACE_ROOT}/work/logs/${id}-raw.log" ]; then
+                echo "--- [RAW LOGS FOR #${id_fmt}] ---"
+                cat "${WORKSPACE_ROOT}/work/logs/${id}-raw.log"
+                echo "--- [END RAW LOGS FOR #${id_fmt}] ---"
+                echo
+              fi
+            ) 200>/tmp/terminal.lock
+          }
+
+          echo "🚀 Concurrency Workers: $WORKERS"
+          echo "🔄 Max Retries: $RETRIES"
+          echo
+
+          running=0
+          while IFS=$'\t' read -r id pkg; do
+            process_one "$id" "$pkg" &
+            running=$((running + 1))
+
+            if [ "$running" -ge "$WORKERS" ]; then
+              wait -n 2>/dev/null || true
+              running=$((running - 1))
+            fi
+          done < work/jobs.tsv
+
+          wait || true
+
+          echo
+          echo "Download round summary:"
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+
+          echo "Requested : $total"
+          echo "Successful: $success"
+          echo "Failed    : $failed"
+
+      # ============================================================
+      # 09. COLLECT FINAL FILES
+      # ============================================================
+      - name: "📚 Collect final APK files"
+        id: collect
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf output
+          mkdir -p output
+
+          count=0
+          total_bytes=0
+
+          while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            dest="output/$base"
+
+            if [ -e "$dest" ]; then
+              count=$((count + 1))
+              ext="${base##*.}"
+              name="${base%.*}"
+              dest="output/${name}_${count}.${ext}"
+            else
+              count=$((count + 1))
+            fi
+
+            cp --reflink=auto -p "$file" "$dest"
+            size="$(stat -c%s "$dest")"
+            total_bytes=$((total_bytes + size))
+          done < <(
+            find work/downloads -type f \( -iname '*.apk' -o -iname '*.apks' -o -iname '*.xapk' \) -print0 | sort -z
+          )
+
+          failed_report="output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt"
+          : > "$failed_report"
+          failed_count=0
+
+          for result in work/results/*.json; do
+            [ -f "$result" ] || continue
+            status="$(jq -r '.status' "$result")"
+            [ "$status" = "success" ] && continue
+
+            pkg="$(jq -r '.package' "$result")"
+            failed_count=$((failed_count + 1))
+            echo "$pkg" >> "$failed_report"
+          done
+
+          if [ "$failed_count" -eq 0 ]; then
+            rm -f "$failed_report"
+          fi
+
+          echo "FINAL_FILE_COUNT=$count" >> "$GITHUB_OUTPUT"
+          echo "TOTAL_BYTES=$total_bytes" >> "$GITHUB_OUTPUT"
+          echo "FAILED_COUNT=$failed_count" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Final collected APKs: $count ($total_bytes bytes)"
+          echo "Failed Packages     : $failed_count"
+
+      # ============================================================
+      # 10. DISCONNECT VPN (BEFORE UPLOADS)
+      # ============================================================
+      - name: "🔌 Disconnect VPN for uploads"
+        run: |
+          set +e
+          sudo killall openvpn >/dev/null 2>&1 || true
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+          echo "✅ VPN disconnected. Runner native gigabit bandwidth active for uploads."
+
+      # ============================================================
+      # 11. PACKAGE ASSETS (ZIP / SPLIT)
+      # ============================================================
+      - name: "📦 Package output"
+        id: archive
+        env:
+          BUNDLE_ALL: ${{ inputs.bundle_all }}
+          UPLOAD_METHOD: ${{ inputs.upload_method }}
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf work/archive work/package
+          mkdir -p work/archive work/package
+
+          files_found=0
+          while IFS= read -r -d '' file; do
+            files_found=$((files_found + 1))
+            cp --reflink=auto -p "$file" work/package/
+          done < <(find output -maxdepth 1 -type f ! -name 'FAILED-DOWNLOADS-*' -print0 | sort -z)
+
+          if [ "$files_found" -eq 0 ]; then
+            echo "⚠️ No APK files to package."
+            echo "HAS_ASSETS=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          is_disk_full() {
+            local msg="$1"
+            [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
+          }
+
+          if [ "$BUNDLE_ALL" = "true" ]; then
+            zip_name="google-play_bundle_${RUN_SUFFIX}.zip"
+            echo "📦 Bundling all files into: $zip_name"
+
+            set +e
+            if [ "$UPLOAD_METHOD" = "repo" ]; then
+              zip_err="$( (cd work/package && zip -0 -s 90m -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            elif [ "$UPLOAD_METHOD" = "release" ]; then
+              zip_err="$( (cd work/package && zip -0 -s 1900m -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            else
+              zip_err="$( (cd work/package && zip -0 -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            fi
+            set -e
+
+            if [ "$zip_code" -ne 0 ]; then
+              if is_disk_full "$zip_err" && [ "$UPLOAD_METHOD" = "drive" ]; then
+                echo "⚠️ Disk full during bundling. Uploading raw APKs directly to Google Drive."
+                cp -p work/package/* work/archive/
+              else
+                echo "❌ Zipping failed: $zip_err"
                 exit 1
               fi
             fi
+
+          else
+            index=0
+            while IFS= read -r -d '' file; do
+              index=$((index + 1))
+              base="$(basename "$file")"
+              safe="$(printf '%s' "$base" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
+              zip_name="single-${index}-${safe}-${RUN_SUFFIX}.zip"
+
+              set +e
+              if [ "$UPLOAD_METHOD" = "repo" ]; then
+                (cd work/package && zip -0 -s 90m "../../work/archive/${zip_name}" "$base")
+              elif [ "$UPLOAD_METHOD" = "release" ]; then
+                (cd work/package && zip -0 -s 1900m "../../work/archive/${zip_name}" "$base")
+              else
+                (cd work/package && zip -0 "../../work/archive/${zip_name}" "$base")
+              fi
+              set -e
+            done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
+          fi
+
+          find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+
+          echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
+          echo
+          echo "📦 Final package contents in output/:"
+          ls -lh output/
+
+      # ============================================================
+      # 12. GITHUB STEP SUMMARY
+      # ============================================================
+      - name: "📊 Write GitHub summary"
+        env:
+          ARCH_INPUT: ${{ inputs.architecture }}
+          MERGE_INPUT: ${{ inputs.merge_splits }}
+          UPLOAD_INPUT: ${{ inputs.upload_method }}
+          BUNDLE_INPUT: ${{ inputs.bundle_all }}
+          VPN_INPUT: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
+        run: |
+          set -Eeuo pipefail
+
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          file_count="${{ steps.collect.outputs.FINAL_FILE_COUNT || 0 }}"
+          total_bytes="${{ steps.collect.outputs.TOTAL_BYTES || 0 }}"
+          formatted_bytes="$(numfmt --to=iec-i --suffix=B "$total_bytes" 2>/dev/null || echo "$total_bytes bytes")"
+
+          {
+            echo "# 📱 Google Play Downloader"
+            echo
+            echo "## Configuration"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Architecture | \`$ARCH_INPUT\` |"
+            echo "| Merge Split APKs | \`$MERGE_INPUT\` |"
+            echo "| Upload Destination | \`$UPLOAD_INPUT\` |"
+            echo "| Bundle into Single ZIP | \`$BUNDLE_INPUT\` |"
+            echo "| VPN Enabled | \`$VPN_INPUT\` ($VPN_TYPE) |"
+            echo
+            echo "## Result"
+            echo
+            echo "| Metric | Count / Size |"
+            echo "|---|---:|"
+            echo "| Requested Packages | $total |"
+            echo "| Successful | $success |"
+            echo "| Failed | $failed |"
+            echo "| Downloaded Files | $file_count |"
+            echo "| Total Payload Size | $formatted_bytes |"
+            echo
+            echo "## Package Breakdown"
+            echo '| # | Status | Package | Files | Size | Speed | Duration |'
+            echo '|---|---|---|---|---|---|---|'
+            for res in work/results/*.json; do
+              [ -f "$res" ] || continue
+              idx="$(jq -r '.index' "$res")"
+              st="$(jq -r '.status' "$res")"
+              pkg="$(jq -r '.package' "$res")"
+              fn="$(jq -r '.filename // "N/A"' "$res")"
+              sz="$(jq -r '.size_bytes' "$res")"
+              spd="$(jq -r '.speed' "$res")"
+              dur="$(jq -r '.duration' "$res")"
+              sz_fmt="$(numfmt --to=iec-i --suffix=B "$sz" 2>/dev/null || echo "$sz B")"
+              [ "$st" = "success" ] && icon="✅" || icon="❌"
+              echo "| $idx | $icon $st | \`$pkg\` | $fn | $sz_fmt | $spd | $dur |"
+            done
+            echo
+            if [ -f "output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt" ]; then
+              echo "### ⚠️ Failed Packages"
+              echo '```text'
+              cat "output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ============================================================
+      # 13. DIAGNOSTICS
+      # ============================================================
+      - name: "📊 Upload diagnostics"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloader-diagnostics-${{ github.run_number }}
+          path: |
+            work/logs/
+            work/results/
+            work/failed/
+            work/jobs.tsv
+            output/FAILED-DOWNLOADS-*.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
+      # ============================================================
+      # 14. GOOGLE DRIVE UPLOAD (RESUMABLE CHUNKS)
+      # ============================================================
+      - name: "☁️ Upload to Google Drive"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'drive'
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_FOLDER_NAME: "github-actions"
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "$GOOGLE_CLIENT_ID" ] ||
+             [ -z "$GOOGLE_CLIENT_SECRET" ] ||
+             [ -z "$GOOGLE_REFRESH_TOKEN" ]; then
+            echo "❌ Google Drive credentials are missing in secrets."
+            exit 1
+          fi
+
+          token_json="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --request POST \
+              https://oauth2.googleapis.com/token \
+              --data-urlencode "client_id=${GOOGLE_CLIENT_ID}" \
+              --data-urlencode "client_secret=${GOOGLE_CLIENT_SECRET}" \
+              --data-urlencode "refresh_token=${GOOGLE_REFRESH_TOKEN}" \
+              --data-urlencode "grant_type=refresh_token"
+          )"
+
+          access_token="$(jq -r '.access_token // empty' <<< "$token_json")"
+
+          if [ -z "$access_token" ]; then
+            echo "❌ Could not obtain Google Drive access token."
+            exit 1
+          fi
+
+          query="mimeType='application/vnd.google-apps.folder' and name='${DRIVE_FOLDER_NAME}' and trashed=false"
+
+          folder_response="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --get \
+              https://www.googleapis.com/drive/v3/files \
+              -H "Authorization: Bearer ${access_token}" \
+              --data-urlencode "q=${query}" \
+              --data-urlencode "fields=files(id,name)"
+          )"
+
+          folder_id="$(jq -r '.files[0].id // empty' <<< "$folder_response")"
+
+          if [ -z "$folder_id" ]; then
+            body="$(
+              jq -n \
+                --arg name "$DRIVE_FOLDER_NAME" \
+                '{
+                  name: $name,
+                  mimeType: "application/vnd.google-apps.folder"
+                }'
+            )"
+
+            folder_id="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --retry 5 \
+                --retry-delay 2 \
+                --retry-all-errors \
+                --request POST \
+                https://www.googleapis.com/drive/v3/files \
+                -H "Authorization: Bearer ${access_token}" \
+                -H "Content-Type: application/json" \
+                --data "$body" |
+              jq -r '.id // empty'
+            )"
+          fi
+
+          if [ -z "$folder_id" ]; then
+            echo "❌ Could not locate or create Drive folder."
+            exit 1
+          fi
+
+          upload_file() {
+            local file="$1"
+            local name size
+            name="$(basename "$file")"
+            size="$(stat -c%s "$file")"
+
+            echo "⬆️ Uploading: $name ($size bytes)"
+
+            local headers="$(mktemp)"
+            local metadata="$(
+              jq -n \
+                --arg name "$name" \
+                --arg folder "$folder_id" \
+                '{
+                  name: $name,
+                  parents: [$folder]
+                }'
+            )"
+
+            if ! curl \
+              --silent \
+              --show-error \
+              --request POST \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              -D "$headers" \
+              -o /dev/null \
+              -H "Authorization: Bearer ${access_token}" \
+              -H "Content-Type: application/json; charset=UTF-8" \
+              -H "X-Upload-Content-Type: application/octet-stream" \
+              -H "X-Upload-Content-Length: ${size}" \
+              --data "$metadata" \
+              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"; then
+              rm -f "$headers"
+              return 1
+            fi
+
+            local session_uri="$(
+              awk '
+                BEGIN { IGNORECASE=1 }
+                /^location:/ {
+                  sub(/\r$/, "")
+                  sub(/^[^:]*:[[:space:]]*/, "")
+                  print
+                  exit
+                }
+              ' "$headers"
+            )"
+            rm -f "$headers"
+
+            if [ -z "$session_uri" ]; then
+              echo "❌ Could not initialize resumable Drive session."
+              return 1
+            fi
+
+            local offset=0
+            while [ "$offset" -lt "$size" ]; do
+              local remaining=$((size - offset))
+              local length="$DRIVE_CHUNK_SIZE"
+              [ "$remaining" -lt "$length" ] && length="$remaining"
+
+              local end=$((offset + length - 1))
+              local chunk="$(mktemp)"
+
+              dd if="$file" of="$chunk" iflag=skip_bytes,count_bytes \
+                skip="$offset" count="$length" status=none
+
+              local chunk_done="false"
+              for attempt in 1 2 3 4 5; do
+                local response="$(mktemp)"
+                local response_headers="$(mktemp)"
+
+                local code="$(
+                  curl \
+                    --silent \
+                    --show-error \
+                    --request PUT \
+                    -D "$response_headers" \
+                    -o "$response" \
+                    --write-out '%{http_code}' \
+                    -H "Authorization: Bearer ${access_token}" \
+                    -H "Content-Type: application/octet-stream" \
+                    -H "Content-Length: ${length}" \
+                    -H "Content-Range: bytes ${offset}-${end}/${size}" \
+                    --data-binary "@${chunk}" \
+                    "$session_uri"
+                )"
+
+                case "$code" in
+                  200|201)
+                    offset="$size"
+                    chunk_done="true"
+                    ;;
+                  308)
+                    local range="$(
+                      awk '
+                        BEGIN { IGNORECASE=1 }
+                        /^Range:/ { sub(/\r$/, ""); print }
+                      ' "$response_headers"
+                    )"
+
+                    if [[ "$range" =~ bytes=0-([0-9]+) ]]; then
+                      offset=$((BASH_REMATCH[1] + 1))
+                    else
+                      offset=$((end + 1))
+                    fi
+                    chunk_done="true"
+                    ;;
+                  429|500|502|503|504)
+                    local delay=$((2 ** attempt))
+                    [ "$delay" -gt 30 ] && delay=30
+                    echo "⚠️ Drive HTTP $code; retrying in ${delay}s..."
+                    sleep "$delay"
+                    ;;
+                  *)
+                    echo "❌ Drive upload chunk error: HTTP $code"
+                    cat "$response" 2>/dev/null || true
+                    rm -f "$response" "$response_headers" "$chunk"
+                    return 1
+                    ;;
+                esac
+
+                rm -f "$response" "$response_headers"
+                [ "$offset" -ge "$size" ] || [ "$chunk_done" = "true" ] && break
+              done
+
+              rm -f "$chunk"
+              if [ "$offset" -lt "$size" ] && [ "$chunk_done" != "true" ]; then
+                echo "❌ Resumable upload chunk failed."
+                return 1
+              fi
+
+              local percent=$((offset * 100 / size))
+              echo "   Progress: ${percent}% (${offset}/${size} bytes)"
+            done
+
+            echo "✅ Uploaded: $name"
+          }
+
+          for file in output/*; do
+            [ -f "$file" ] || continue
+            case "$(basename "$file")" in
+              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt|*.*)
+                upload_file "$file"
+                ;;
+            esac
           done
 
-          echo "All files uploaded to the 'google-play' folder."
+          echo "✅ Google Drive upload complete."
 
-      - name: Create Release and upload assets (release method)
-        if: ${{ inputs.upload_method == 'release' }}
+      # ============================================================
+      # 15. REPOSITORY UPLOAD
+      # ============================================================
+      - name: "📤 Upload to repository"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'repo'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          ARCH_INPUT: ${{ inputs.architecture }}
         run: |
-          OUTPUT_DIR="google-play"
-          ASSETS_FILE="${OUTPUT_DIR}_assets.txt"
+          set -Eeuo pipefail
 
-          if [ ! -s "$ASSETS_FILE" ]; then
-            echo "No assets to release."
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+
+          git add output/
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ Nothing to commit."
             exit 0
           fi
 
-          RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
-          TAG="google-play-downloader-${RAND5}"
-          echo "Creating release tag: $TAG"
+          git commit -m "Add Google Play APK downloads (${ARCH_INPUT}) [skip ci]"
 
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt ${attempt}/5..."
+            if git pull --rebase --autostash origin "$BRANCH_NAME" &&
+               git push origin "$BRANCH_NAME"; then
+              echo "✅ Repository push succeeded."
+              exit 0
+            fi
+            sleep $((attempt * 3))
+          done
 
-          git tag "$TAG" -m "Google Play download release"
-          git push origin "$TAG"
+          echo "❌ Repository push failed."
+          exit 1
 
-          ASSET_ARGS=""
-          while IFS= read -r file; do
-            ASSET_ARGS="$ASSET_ARGS ${OUTPUT_DIR}/$file"
-          done < "$ASSETS_FILE"
+      # ============================================================
+      # 16. GITHUB RELEASE
+      # ============================================================
+      - name: "🏷️ Create GitHub Release"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VPN_INPUT: ${{ inputs.vpn_enabled }}
+          ARCH_INPUT: ${{ inputs.architecture }}
+        run: |
+          set -Eeuo pipefail
 
-          gh release create "$TAG" $ASSET_ARGS \
-            --title "google-play-downloader-${RAND5}" \
-            --notes "Automated release from Google Play Download workflow." \
-            --target "${{ github.ref_name }}"
+          tag="gplay-${RUN_SUFFIX}"
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
 
-          echo "Release '$TAG' created with assets."
+          {
+            echo "# 📱 Google Play APK Downloader Release"
+            echo
+            echo "Requested Packages: ${total}"
+            echo "Successful: ${success}"
+            echo "Failed: ${failed}"
+            echo "Architecture: ${ARCH_INPUT}"
+            echo "VPN Protected: ${VPN_INPUT}"
+          } > work/release-notes.md
+
+          mapfile -t assets < <(
+            find output \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name '*.zip' \
+                -o -name '*.z[0-9][0-9]' \
+                -o -name 'FAILED-DOWNLOADS-*.txt' \
+              \) \
+              -print |
+            sort
+          )
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "❌ No release assets found."
+            exit 1
+          fi
+
+          gh release create \
+            "$tag" \
+            "${assets[@]}" \
+            --title "Google Play Download ${RUN_SUFFIX}" \
+            --notes-file work/release-notes.md \
+            --target "$GITHUB_SHA"
+
+          echo "✅ Release created."
+
+      # ============================================================
+      # 17. FINAL STATUS
+      # ============================================================
+      - name: "✅ Final status"
+        if: always()
+        env:
+          FAIL_ON_PARTIAL: ${{ inputs.fail_on_partial }}
+        run: |
+          set -Eeuo pipefail
+
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          file_count="${{ steps.collect.outputs.FINAL_FILE_COUNT || 0 }}"
+
+          echo
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║                  📱 FINAL RESULT                           ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          printf '║ Requested Pkgs : %-43s ║\n' "$total"
+          printf '║ Successful     : %-43s ║\n' "$success"
+          printf '║ Failed         : %-43s ║\n' "$failed"
+          printf '║ Files Saved    : %-43s ║\n' "$file_count"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo
+
+          if [ "$success" -eq 0 ]; then
+            echo "❌ No packages downloaded successfully."
+            exit 1
+          fi
+
+          if [ "$failed" -gt 0 ] && [ "$FAIL_ON_PARTIAL" = "true" ]; then
+            echo "❌ Partial failures encountered with fail_on_partial=true."
+            exit 1
+          fi
+
+          if [ "$failed" -gt 0 ]; then
+            echo "⚠️ Partial downloads accepted."
+          else
+            echo "✅ All packages downloaded successfully."
+          fi
+
+      # ============================================================
+      # 18. CLEANUP
+      # ============================================================
+      - name: "🧹 Cleanup"
+        if: always()
+        run: |
+          set +e
+
+          sudo killall openvpn >/dev/null 2>&1 || true
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+
+          rm -rf gplay-apk-downloader 2>/dev/null || true
+          rm -f \
+            /tmp/wg0.conf \
+            /tmp/client.ovpn \
+            /tmp/ovpn-auth.txt \
+            /tmp/openvpn.log \
+            /tmp/terminal.lock 2>/dev/null || true
+
+          echo "✅ Cleanup complete."
