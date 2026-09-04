@@ -294,7 +294,7 @@ jobs:
           fi
 
       # ============================================================
-      # 08. PARSE URLs AND PARAMETERS (OCTAL BUG FIXED)
+      # 08. PARSE URLs AND PARAMETERS
       # ============================================================
       - name: "📝 Parse URLs and per-URL arguments"
         env:
@@ -307,7 +307,6 @@ jobs:
 
           : > work/jobs.tsv
 
-          # Compute global defaults
           def_vq=$(echo "$GLOBAL_VQ" | grep -oE '[0-9]+' | head -1 || echo "720")
           [ "$GLOBAL_VQ" = "best" ] && def_vq="max"
 
@@ -324,7 +323,6 @@ jobs:
 
           index=0
 
-          # Process line-by-line / comma separated input tokens
           while IFS= read -r line; do
             line=$(echo "$line" | xargs)
             [ -z "$line" ] && continue
@@ -338,14 +336,12 @@ jobs:
                 type="$def_type"
                 val="$def_val"
 
-                # Check if next token is 'v' or 'a'
                 if [ $((i + 1)) -lt ${#tokens[@]} ]; then
                   next="${tokens[$((i + 1))]}"
                   if [ "$next" = "v" ] || [ "$next" = "a" ]; then
                     type="$next"
                     i=$((i + 1))
 
-                    # Check for quality number following 'v' or 'a'
                     if [ $((i + 1)) -lt ${#tokens[@]} ]; then
                       qval="${tokens[$((i + 1))]}"
                       if [[ "$qval" =~ ^[0-9]+$ ]] || [ "$qval" = "max" ] || [ "$qval" = "best" ] || [ "$qval" = "min" ]; then
@@ -357,7 +353,6 @@ jobs:
                 fi
 
                 index=$((index + 1))
-                # Write plain integer ID to guarantee no octal interpretation errors
                 printf '%d\t%s\t%s\t%s\n' "$index" "$link" "$type" "$val" >> work/jobs.tsv
               fi
               i=$((i + 1))
@@ -583,7 +578,6 @@ jobs:
             fi
           }
 
-          # Strategy A: Primary yt-dlp
           run_primary_ytdlp() {
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
@@ -659,7 +653,6 @@ jobs:
             return 1
           }
 
-          # Strategy B: Piped API Proxy Fallback (Bypasses Datacenter IP Blocks)
           run_piped_fallback() {
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
@@ -741,7 +734,6 @@ jobs:
             fi
           }
 
-          # Strategy C: Advanced Multi-Client (tv, web_music, android) with forced IPv4
           run_advanced_ytdlp() {
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
@@ -803,7 +795,6 @@ jobs:
             local type="$3"
             local val="$4"
 
-            # Parse base 10 integer to bypass bash octal evaluation errors
             local id=$((10#$id_raw))
             local id_fmt
             id_fmt="$(printf '%04d' "$id")"
@@ -825,7 +816,6 @@ jobs:
 
             safe_log "[$(now)] 🚀 #${id_fmt} (youtube) STARTING  │ ${link} [${type_str}]"
 
-            # 1. Primary Strategy
             local step1_start="$(date +%s)"
             if run_primary_ytdlp "$id" "$link" "$type" "$val"; then
               local step1_elapsed=$(( $(date +%s) - step1_start ))
@@ -836,7 +826,6 @@ jobs:
               local step1_elapsed=$(( $(date +%s) - step1_start ))
               log_timing "$id" "⚡ primary yt-dlp ── took $(format_duration "$step1_elapsed") ── ✖ BLOCKED / FAILED → Piped"
 
-              # 2. Piped Proxy Fallback
               local step2_start="$(date +%s)"
               if run_piped_fallback "$id" "$link" "$type" "$val"; then
                 local step2_elapsed=$(( $(date +%s) - step2_start ))
@@ -847,7 +836,6 @@ jobs:
                 local step2_elapsed=$(( $(date +%s) - step2_start ))
                 log_timing "$id" "🔌 piped fallback ── took $(format_duration "$step2_elapsed") ── ✖ FAILED → Advanced clients"
 
-                # 3. Advanced Multi-Client Fallback
                 local step3_start="$(date +%s)"
                 if run_advanced_ytdlp "$id" "$link" "$type" "$val"; then
                   local step3_elapsed=$(( $(date +%s) - step3_start ))
@@ -1122,6 +1110,10 @@ jobs:
             done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
           fi
 
+          # Purge raw unpacked media files from output/ so ONLY packaged archives remain
+          find output -maxdepth 1 -type f ! -name 'FAILED-DOWNLOADS-*' -delete
+
+          # Move archives to output/
           find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
 
           echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
@@ -1457,7 +1449,7 @@ jobs:
           for file in output/*; do
             [ -f "$file" ] || continue
             case "$(basename "$file")" in
-              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt|*.*)
+              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt)
                 upload_file "$file"
                 ;;
             esac
