@@ -46,7 +46,7 @@ on:
         description: "📦 Bundle all downloaded tracks into a single ZIP archive?"
         required: true
         type: boolean
-        default: false
+        default: true
 
       vpn_enabled:
         description: "🔒 Route downloads through VPN?"
@@ -85,7 +85,7 @@ on:
         description: "❌ Fail workflow if any URL fails?"
         required: true
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
