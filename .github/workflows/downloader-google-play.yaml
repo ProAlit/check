@@ -78,7 +78,7 @@ on:
         description: "❌ Fail workflow if any package fails?"
         required: true
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
