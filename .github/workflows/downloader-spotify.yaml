@@ -4,9 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: "🎵 Spotify/Tidal/Apple Music/SoundCloud/YouTube/Pandora URLs"
+        description: "🎵 Spotify/Tidal/Apple Music/SoundCloud/YouTube URLs"
         required: true
         type: string
+
+      install_source:
+        description: "📦 spotDL installation source"
+        required: true
+        type: choice
+        options:
+          - repo
+          - pip
+        default: repo
+
+      primary_provider:
+        description: "⚡ Primary search provider (use 'piped' for GitHub Actions cloud IPs)"
+        required: true
+        type: choice
+        options:
+          - piped
+          - youtube-music
+          - youtube
+          - soundcloud
+        default: piped
 
       output_format:
         description: "🎧 Output format"
@@ -46,8 +66,35 @@ on:
           - release
         default: drive
 
+      vpn_enabled:
+        description: "🔒 Enable VPN?"
+        required: true
+        type: boolean
+        default: false
+
+      vpn_type:
+        description: "🛡️ VPN Type (if VPN enabled)"
+        required: true
+        type: choice
+        options:
+          - wireguard
+          - openvpn
+        default: wireguard
+
       fallback_soundcloud:
         description: "☁️ Fallback: SoundCloud?"
+        required: true
+        type: boolean
+        default: true
+
+      fallback_piped:
+        description: "⚡ Fallback: Piped?"
+        required: true
+        type: boolean
+        default: true
+
+      fallback_youtube:
+        description: "📺 Fallback: YouTube / YouTube Music?"
         required: true
         type: boolean
         default: false
@@ -58,23 +105,11 @@ on:
         type: boolean
         default: false
 
-      fallback_piped:
-        description: "⚡ Fallback: Piped?"
-        required: true
-        type: boolean
-        default: false
-
       bundle_all:
         description: "📦 Bundle all tracks into one ZIP?"
         required: true
         type: boolean
         default: true
-
-      vpn_enabled:
-        description: "🔒 Enable WireGuard VPN?"
-        required: true
-        type: boolean
-        default: false
 
       use_custom_credentials:
         description: "🔑 Use custom Spotify credentials?"
@@ -83,7 +118,7 @@ on:
         default: false
 
       concurrent_downloads:
-        description: "⚡ Concurrent URL workers"
+        description: "⚡ Concurrent URL workers (keep at 2-3 to avoid rate limits)"
         required: true
         type: number
         default: 2
@@ -117,7 +152,7 @@ env:
   POT_SERVER_PORT: "4416"
   DEFAULT_PARALLEL: "2"
   DEFAULT_RETRIES: "2"
-  SPOTDL_THREADS: "3"
+  SPOTDL_THREADS: "2"
 
   YTDLP_RETRIES: "8"
   YTDLP_FRAGMENT_RETRIES: "8"
@@ -142,9 +177,8 @@ jobs:
       # ============================================================
       # 01. CHECKOUT
       # ============================================================
-
       - name: "📥 Checkout repository"
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: true
@@ -152,7 +186,6 @@ jobs:
       # ============================================================
       # 02. SYSTEM DEPENDENCIES
       # ============================================================
-
       - name: "🛠️ Install system dependencies"
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -169,6 +202,8 @@ jobs:
             unzip \
             aria2 \
             wireguard-tools \
+            openvpn \
+            openvpn-systemd-resolved \
             openssl \
             python3 \
             python3-pip \
@@ -179,7 +214,6 @@ jobs:
       # ============================================================
       # 03. DENO
       # ============================================================
-
       - name: "🦕 Install latest Deno"
         run: |
           set -Eeuo pipefail
@@ -199,40 +233,66 @@ jobs:
           deno --version
 
       # ============================================================
-      # 04. PYTHON PACKAGES
+      # 04. INSTALL PACKAGES (REPO vs PIP TOGGLE)
       # ============================================================
-
-      - name: "📦 Install latest downloader packages"
+      - name: "📦 Install downloader packages"
         env:
+          INSTALL_SOURCE: ${{ inputs.install_source }}
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
           PIP_NO_INPUT: "1"
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         run: |
           set -Eeuo pipefail
 
-          python3 -m pip install \
-            --upgrade \
-            --break-system-packages \
-            --retries 5 \
-            --timeout 60 \
-            pip \
-            setuptools \
-            wheel
+          echo "⚙️ Installation method: ${INSTALL_SOURCE}"
 
-          python3 -m pip install \
-            --upgrade \
-            --break-system-packages \
-            --retries 5 \
-            --timeout 60 \
-            spotdl \
-            "yt-dlp[default]" \
-            yt-dlp-ejs \
-            bgutil-ytdlp-pot-provider
+          if [ "$INSTALL_SOURCE" = "repo" ]; then
+            echo "📥 Installing uv package manager..."
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+            echo "📥 Cloning latest spotDL source code..."
+            rm -rf "$HOME/spotdl-repo"
+            git clone --depth 1 https://github.com/spotDL/spotify-downloader.git "$HOME/spotdl-repo"
+
+            cd "$HOME/spotdl-repo"
+            echo "⚡ Running uv sync..."
+            uv sync --no-dev
+
+            echo "📦 Installing plugins & extra packages into uv virtual environment..."
+            uv pip install "yt-dlp[default]" yt-dlp-ejs bgutil-ytdlp-pot-provider
+
+            # Expose spotdl and yt-dlp to system PATH
+            sudo ln -sf "$HOME/spotdl-repo/.venv/bin/spotdl" /usr/local/bin/spotdl
+            sudo ln -sf "$HOME/spotdl-repo/.venv/bin/yt-dlp" /usr/local/bin/yt-dlp
+
+            python3 -m pip install --upgrade --break-system-packages pip setuptools wheel
+          else
+            echo "📦 Installing spotDL via PyPI (pip)..."
+            python3 -m pip install \
+              --upgrade \
+              --break-system-packages \
+              --retries 5 \
+              --timeout 60 \
+              pip \
+              setuptools \
+              wheel
+
+            python3 -m pip install \
+              --upgrade \
+              --break-system-packages \
+              --retries 5 \
+              --timeout 60 \
+              spotdl \
+              "yt-dlp[default]" \
+              yt-dlp-ejs \
+              bgutil-ytdlp-pot-provider
+          fi
 
       # ============================================================
-      # 05. TOOLCHAIN
+      # 05. TOOLCHAIN VERIFICATION
       # ============================================================
-
       - name: "🔎 Show installed versions"
         run: |
           set -Eeuo pipefail
@@ -244,16 +304,9 @@ jobs:
           echo "FFmpeg : $(ffmpeg -version | sed -n '1p')"
           echo "FFprobe: $(ffprobe -version | sed -n '1p')"
 
-          echo
-          python3 -m pip list |
-            grep -Ei \
-              'spotdl|yt-dlp|bgutil|ejs|spotipy|mutagen|rapidfuzz' \
-            || true
-
       # ============================================================
       # 06. WORKSPACE & IDENTIFIER
       # ============================================================
-
       - name: "📁 Initialize workspace"
         run: |
           set -Eeuo pipefail
@@ -276,9 +329,8 @@ jobs:
           echo "✅ Workspace initialized."
 
       # ============================================================
-      # 07. PARSE URLs
+      # 07. PARSE URLs (OCTAL BUG FIXED)
       # ============================================================
-
       - name: "🔗 Parse and classify URLs"
         env:
           RAW_URLS: ${{ inputs.urls }}
@@ -335,7 +387,8 @@ jobs:
               continue
             fi
 
-            printf '%04d\t%s\t%s\n' \
+            # Plain integer output ensures Bash does not treat indices as octal numbers
+            printf '%d\t%s\t%s\n' \
               "$index" \
               "$type" \
               "$url" \
@@ -352,62 +405,122 @@ jobs:
           cat work/jobs.tsv
 
       # ============================================================
-      # 08. OPTIONAL WIREGUARD
+      # 08. VPN CONFIGURATION (WIREGUARD & OPENVPN)
       # ============================================================
-
-      - name: "🔒 Configure WireGuard"
+      - name: "🔒 Configure VPN (WireGuard / OpenVPN)"
         id: vpn
         env:
           VPN_ENABLED: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
           WG_CONFIG: ${{ secrets.WG_CONFIG }}
+          OVPN_CONFIG: ${{ secrets.OVPN_CONFIG }}
+          OVPN_AUTH: ${{ secrets.OVPN_AUTH }}
         run: |
           set -Eeuo pipefail
 
           if [ "$VPN_ENABLED" != "true" ]; then
-            echo "🚫 VPN disabled."
+            echo "🚫 VPN disabled by input."
             echo "vpn_available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ -z "$WG_CONFIG" ]; then
-            echo "⚠️ VPN requested but WG_CONFIG is empty."
-            echo "vpn_available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          echo "🛡️ Configuring VPN protocol: ${VPN_TYPE}"
 
-          umask 077
-          printf '%s\n' "$WG_CONFIG" > /tmp/wg0.conf
+          if [ "$VPN_TYPE" = "wireguard" ]; then
+            if [ -z "$WG_CONFIG" ]; then
+              echo "⚠️ WireGuard requested but WG_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
 
-          sudo install \
-            -m 600 \
-            /tmp/wg0.conf \
-            /etc/wireguard/wg0.conf
+            umask 077
+            printf '%s\n' "$WG_CONFIG" > /tmp/wg0.conf
 
-          if sudo wg-quick up wg0; then
-            echo "✅ WireGuard connected."
+            sudo install \
+              -m 600 \
+              /tmp/wg0.conf \
+              /etc/wireguard/wg0.conf
 
-            public_ip="$(
-              curl \
-                -4 \
-                --silent \
-                --show-error \
-                --max-time 15 \
-                https://api.ipify.org \
-              || echo "unavailable"
-            )"
+            if sudo wg-quick up wg0; then
+              echo "✅ WireGuard connected."
 
-            echo "🌐 Public IPv4: $public_ip"
-            echo "vpn_available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "❌ WireGuard failed."
-            sudo wg-quick down wg0 >/dev/null 2>&1 || true
-            echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              public_ip="$(
+                curl \
+                  -4 \
+                  --silent \
+                  --show-error \
+                  --max-time 15 \
+                  https://api.ipify.org \
+                || echo "unavailable"
+              )"
+
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ WireGuard failed."
+              sudo wg-quick down wg0 >/dev/null 2>&1 || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            fi
+
+          elif [ "$VPN_TYPE" = "openvpn" ]; then
+            if [ -z "$OVPN_CONFIG" ]; then
+              echo "⚠️ OpenVPN requested but OVPN_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ ! -c /dev/net/tun ]; then
+              sudo mkdir -p /dev/net
+              sudo mknod /dev/net/tun c 10 200
+              sudo chmod 600 /dev/net/tun
+            fi
+
+            umask 077
+            printf '%s\n' "$OVPN_CONFIG" > /tmp/client.ovpn
+
+            if [ -n "$OVPN_AUTH" ]; then
+              printf '%s\n' "$OVPN_AUTH" > /tmp/ovpn-auth.txt
+              chmod 600 /tmp/ovpn-auth.txt
+              echo "auth-user-pass /tmp/ovpn-auth.txt" >> /tmp/client.ovpn
+            fi
+
+            echo "🚀 Starting OpenVPN daemon..."
+            sudo openvpn --config /tmp/client.ovpn --daemon --log /tmp/openvpn.log
+
+            echo "⏳ Waiting for OpenVPN tunnel interface..."
+            ready="false"
+            for attempt in $(seq 1 30); do
+              if ip link show dev tun0 >/dev/null 2>&1 || ip link show dev tun1 >/dev/null 2>&1; then
+                ready="true"
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$ready" = "true" ]; then
+              echo "✅ OpenVPN connected."
+              sleep 2
+              public_ip="$(
+                curl \
+                  -4 \
+                  --silent \
+                  --show-error \
+                  --max-time 15 \
+                  https://api.ipify.org \
+                || echo "unavailable"
+              )"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ OpenVPN failed to connect."
+              cat /tmp/openvpn.log 2>/dev/null || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       # ============================================================
       # 09. BGUTIL PO TOKEN
       # ============================================================
-
       - name: "🛡️ Start bgutil PO-token provider"
         id: pot
         run: |
@@ -463,7 +576,6 @@ jobs:
       # ============================================================
       # 10. DOWNLOAD ENGINE
       # ============================================================
-
       - name: "⬇️ Download media"
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
@@ -471,6 +583,7 @@ jobs:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
           YOUTUBE_MUSIC_COOKIES: ${{ secrets.YOUTUBE_MUSIC_COOKIES }}
           USE_CUSTOM_CREDENTIALS: ${{ inputs.use_custom_credentials }}
+          PRIMARY_PROVIDER: ${{ inputs.primary_provider }}
           OUTPUT_FORMAT: ${{ inputs.output_format }}
           AUDIO_QUALITY: ${{ inputs.audio_quality }}
           CONCURRENT_WORKERS: ${{ inputs.concurrent_downloads }}
@@ -481,6 +594,7 @@ jobs:
           FALLBACK_SOUNDCLOUD: ${{ inputs.fallback_soundcloud }}
           FALLBACK_BANDCAMP: ${{ inputs.fallback_bandcamp }}
           FALLBACK_PIPED: ${{ inputs.fallback_piped }}
+          FALLBACK_YOUTUBE: ${{ inputs.fallback_youtube }}
         run: |
           set -Eeuo pipefail
 
@@ -547,7 +661,6 @@ jobs:
             fi
           }
 
-          # Mutex print to prevent terminal mangling
           safe_log() {
             (
               flock -x 200
@@ -618,7 +731,7 @@ jobs:
             help_text="$(spotdl --help 2>&1 || true)"
 
             SUPPORTED_PROVIDERS=()
-            local candidates=(youtube-music youtube soundcloud bandcamp piped)
+            local candidates=(piped youtube-music youtube soundcloud bandcamp)
             local provider
 
             for provider in "${candidates[@]}"; do
@@ -695,9 +808,10 @@ jobs:
               --threads
               "$SPOTDL_THREADS"
               --max-retries
-              3
+              2
               --overwrite
               skip
+              --dont-filter-results
               --restrict
               none
               --max-filename-length
@@ -709,6 +823,10 @@ jobs:
               "${dir}/cache"
               --archive
               "${dir}/archive.txt"
+              --lyrics
+              genius
+              musixmatch
+              synced
             )
 
             if [ "$RAW_LOGS" = "true" ]; then
@@ -905,9 +1023,14 @@ jobs:
           }
 
           process_one() {
-            local id="$1"
+            local id_raw="$1"
             local type="$2"
             local url="$3"
+
+            # Parse as base 10 to eliminate octal parsing issues
+            local id=$((10#$id_raw))
+            local id_fmt
+            id_fmt="$(printf '%04d' "$id")"
 
             local dir="work/downloads/${id}"
             mkdir -p "$dir"
@@ -922,10 +1045,9 @@ jobs:
             local winner="none"
             local reason="all strategies failed"
 
-            # Live single-line status notification
-            safe_log "[$(now)] 🚀 #$(printf '%04d' "$id") (${type}) STARTING  │ ${url}"
+            safe_log "[$(now)] 🚀 #${id_fmt} (${type}) STARTING  │ ${url}"
 
-            # Direct strategy for YouTube / SoundCloud
+            # Direct yt-dlp strategy for standalone YouTube / SoundCloud links
             if [ "$type" = "youtube" ] || [ "$type" = "soundcloud" ]; then
               local step_start
               step_start="$(date +%s)"
@@ -945,20 +1067,25 @@ jobs:
               fi
             fi
 
-            # spotDL strategy chain
+            # Dynamic provider cascade
             if [ "$status" != "success" ]; then
-              local -a provider_order=("youtube-music" "youtube")
+              local -a provider_order=("$PRIMARY_PROVIDER")
 
-              if [ "$FALLBACK_SOUNDCLOUD" = "true" ]; then
+              if [ "$FALLBACK_PIPED" = "true" ] && [ "$PRIMARY_PROVIDER" != "piped" ]; then
+                provider_order+=("piped")
+              fi
+
+              if [ "$FALLBACK_SOUNDCLOUD" = "true" ] && [ "$PRIMARY_PROVIDER" != "soundcloud" ]; then
                 provider_order+=("soundcloud")
               fi
 
-              if [ "$FALLBACK_BANDCAMP" = "true" ]; then
-                provider_order+=("bandcamp")
+              if [ "$FALLBACK_YOUTUBE" = "true" ]; then
+                [ "$PRIMARY_PROVIDER" != "youtube-music" ] && provider_order+=("youtube-music")
+                [ "$PRIMARY_PROVIDER" != "youtube" ] && provider_order+=("youtube")
               fi
 
-              if [ "$FALLBACK_PIPED" = "true" ]; then
-                provider_order+=("piped")
+              if [ "$FALLBACK_BANDCAMP" = "true" ] && [ "$PRIMARY_PROVIDER" != "bandcamp" ]; then
+                provider_order+=("bandcamp")
               fi
 
               for provider in "${provider_order[@]}"; do
@@ -992,20 +1119,18 @@ jobs:
 
                   log_timing "$id" "🔌 ${provider} (attempt ${attempt}/${RETRIES}) ── took ${attempt_time_str} ── ⚠ ${failure_type}"
 
-                  # Immediate break on non-transient failures
-                  if [ "$failure_type" = "NO_RESULT" ] ||
-                     [ "$failure_type" = "CONFIGURATION" ] ||
-                     [ "$failure_type" = "FORMAT" ]; then
+                  # Non-transient configurations can skip immediate retries
+                  if [ "$failure_type" = "CONFIGURATION" ] || [ "$failure_type" = "FORMAT" ]; then
                     break
                   fi
 
                   if [ "$attempt" -lt "$RETRIES" ]; then
                     local delay
                     case "$failure_type" in
-                      RATE_LIMIT) delay=$((attempt * 10)) ;;
-                      BLOCKED|FORBIDDEN) delay=$((attempt * 6)) ;;
-                      NETWORK) delay=$((attempt * 4)) ;;
-                      *) delay=$((attempt * 3)) ;;
+                      RATE_LIMIT) delay=$((attempt * 8)) ;;
+                      BLOCKED|FORBIDDEN) delay=$((attempt * 5)) ;;
+                      NETWORK) delay=$((attempt * 3)) ;;
+                      *) delay=$((attempt * 2)) ;;
                     esac
 
                     [ "$delay" -gt 30 ] && delay=30
@@ -1033,15 +1158,14 @@ jobs:
 
             write_result "$id" "$type" "$url" "$status" "$winner" "$reason" "$started_at" "$finished_at"
 
-            # Print single atomic formatted card with timing details
             (
               flock -x 200
               echo
               echo "┌──────────────────────────────────────────────────────────────────────────────"
               if [ "$status" = "success" ]; then
-                printf '│ 🎵 INPUT #%04d — ✅ SUCCESS (Total: %s via %s)\n' "$id" "$total_duration" "$winner"
+                printf '│ 🎵 INPUT #%s — ✅ SUCCESS (Total: %s via %s)\n' "$id_fmt" "$total_duration" "$winner"
               else
-                printf '│ 🎵 INPUT #%04d — ❌ FAILED (Total: %s — %s)\n' "$id" "$total_duration" "$reason"
+                printf '│ 🎵 INPUT #%s — ❌ FAILED (Total: %s — %s)\n' "$id_fmt" "$total_duration" "$reason"
               fi
               printf '│ URL  : %s\n' "$url"
               printf '│ Type : %s\n' "$type"
@@ -1055,9 +1179,9 @@ jobs:
               echo
 
               if [ "$RAW_LOGS" = "true" ] && [ -f "work/logs/${id}-raw.log" ]; then
-                echo "--- [RAW LOGS FOR #$(printf '%04d' "$id")] ---"
+                echo "--- [RAW LOGS FOR #${id_fmt}] ---"
                 cat "work/logs/${id}-raw.log"
-                echo "--- [END RAW LOGS FOR #$(printf '%04d' "$id")] ---"
+                echo "--- [END RAW LOGS FOR #${id_fmt}] ---"
                 echo
               fi
             ) 200>/tmp/terminal.lock
@@ -1069,18 +1193,20 @@ jobs:
           echo "Detected spotDL providers:"
           printf '  ✓ %s\n' "${SUPPORTED_PROVIDERS[@]}"
           echo
-          echo "Enabled Provider Strategy:"
-          echo "  ✓ youtube-music"
-          echo "  ✓ youtube"
-          [ "$FALLBACK_SOUNDCLOUD" = "true" ] && echo "  ✓ soundcloud (enabled)" || echo "  ⨯ soundcloud (disabled)"
-          [ "$FALLBACK_BANDCAMP" = "true" ] && echo "  ✓ bandcamp (enabled)" || echo "  ⨯ bandcamp (disabled)"
-          [ "$FALLBACK_PIPED" = "true" ] && echo "  ✓ piped (enabled)" || echo "  ⨯ piped (disabled)"
+          echo "Enabled Provider Strategy Hierarchy:"
+          echo "  1. $PRIMARY_PROVIDER (Primary)"
+          [ "$FALLBACK_PIPED" = "true" ] && [ "$PRIMARY_PROVIDER" != "piped" ] && echo "  ✓ piped (fallback)"
+          [ "$FALLBACK_SOUNDCLOUD" = "true" ] && [ "$PRIMARY_PROVIDER" != "soundcloud" ] && echo "  ✓ soundcloud (fallback)"
+          if [ "$FALLBACK_YOUTUBE" = "true" ]; then
+            [ "$PRIMARY_PROVIDER" != "youtube-music" ] && echo "  ✓ youtube-music (fallback)"
+            [ "$PRIMARY_PROVIDER" != "youtube" ] && echo "  ✓ youtube (fallback)"
+          fi
+          [ "$FALLBACK_BANDCAMP" = "true" ] && [ "$PRIMARY_PROVIDER" != "bandcamp" ] && echo "  ✓ bandcamp (fallback)"
           echo
           echo "🚀 Concurrency: $WORKERS"
           echo "🔄 Transient retries/provider: $RETRIES"
           echo
 
-          # Parallel worker queue loop
           running=0
           while IFS=$'\t' read -r id type url; do
             process_one "$id" "$type" "$url" &
@@ -1105,9 +1231,8 @@ jobs:
           echo "Failed    : $failed"
 
       # ============================================================
-      # 11. CONVERT
+      # 11. CONVERT & VALIDATE AUDIO
       # ============================================================
-
       - name: "🔄 Convert and validate audio"
         env:
           TARGET_FORMAT: ${{ inputs.output_format }}
@@ -1218,7 +1343,6 @@ jobs:
       # ============================================================
       # 12. COLLECT FILES & FAILED URLs
       # ============================================================
-
       - name: "📚 Collect final files"
         id: collect
         run: |
@@ -1283,18 +1407,15 @@ jobs:
       # ============================================================
       # 13. SUMMARY
       # ============================================================
-
       - name: "📊 Write GitHub summary"
         env:
+          INSTALL_SOURCE: ${{ inputs.install_source }}
+          PRIMARY_PROVIDER: ${{ inputs.primary_provider }}
           FORMAT_INPUT: ${{ inputs.output_format }}
           QUALITY_INPUT: ${{ inputs.audio_quality }}
           UPLOAD_INPUT: ${{ inputs.upload_method }}
           BUNDLE_INPUT: ${{ inputs.bundle_all }}
           VPN_INPUT: ${{ inputs.vpn_enabled }}
-          RAW_INPUT: ${{ inputs.raw_logs }}
-          FALLBACK_SOUNDCLOUD: ${{ inputs.fallback_soundcloud }}
-          FALLBACK_BANDCAMP: ${{ inputs.fallback_bandcamp }}
-          FALLBACK_PIPED: ${{ inputs.fallback_piped }}
         run: |
           set -Eeuo pipefail
 
@@ -1303,11 +1424,6 @@ jobs:
           failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
           audio_count="${{ steps.collect.outputs.FINAL_AUDIO_COUNT || 0 }}"
 
-          strategy="YouTube Music → YouTube"
-          [ "$FALLBACK_SOUNDCLOUD" = "true" ] && strategy+=" → SoundCloud"
-          [ "$FALLBACK_BANDCAMP" = "true" ] && strategy+=" → Bandcamp"
-          [ "$FALLBACK_PIPED" = "true" ] && strategy+=" → Piped"
-
           {
             echo "# 🎵 Music Downloader"
             echo
@@ -1315,12 +1431,13 @@ jobs:
             echo
             echo "| Setting | Value |"
             echo "|---|---|"
+            echo "| Installation Source | \`$INSTALL_SOURCE\` |"
+            echo "| Primary Provider | \`$PRIMARY_PROVIDER\` |"
             echo "| Format | \`$FORMAT_INPUT\` |"
             echo "| Quality | \`$QUALITY_INPUT\` |"
             echo "| Upload | \`$UPLOAD_INPUT\` |"
             echo "| Bundle | \`$BUNDLE_INPUT\` |"
-            echo "| VPN | \`$VPN_INPUT\` |"
-            echo "| Strategy | $strategy |"
+            echo "| VPN Enabled | \`$VPN_INPUT\` |"
             echo
             echo "## Result"
             echo
@@ -1344,7 +1461,6 @@ jobs:
       # ============================================================
       # 14. PACKAGE
       # ============================================================
-
       - name: "📦 Package output"
         id: archive
         env:
@@ -1451,10 +1567,9 @@ jobs:
       # ============================================================
       # 15. DIAGNOSTICS
       # ============================================================
-
       - name: "📊 Upload diagnostics"
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: downloader-diagnostics-${{ github.run_number }}
           path: |
@@ -1471,18 +1586,18 @@ jobs:
       # ============================================================
       # 16. DISCONNECT VPN
       # ============================================================
-
       - name: "🔌 Disconnect VPN"
-        if: steps.vpn.outputs.vpn_available == 'true'
+        if: always()
         run: |
           set +e
+          sudo killall openvpn >/dev/null 2>&1 || true
           sudo wg-quick down wg0 >/dev/null 2>&1 || true
+          rm -f /tmp/client.ovpn /tmp/ovpn-auth.txt /tmp/wg0.conf /tmp/openvpn.log 2>/dev/null || true
           echo "✅ VPN disconnected."
 
       # ============================================================
-      # 17. GOOGLE DRIVE
+      # 17. GOOGLE DRIVE UPLOAD
       # ============================================================
-
       - name: "☁️ Upload to Google Drive"
         if: >
           steps.archive.outputs.HAS_ASSETS == 'true' &&
@@ -1749,7 +1864,6 @@ jobs:
       # ============================================================
       # 18. REPOSITORY UPLOAD
       # ============================================================
-
       - name: "📤 Upload to repository"
         if: >
           steps.archive.outputs.HAS_ASSETS == 'true' &&
@@ -1791,7 +1905,6 @@ jobs:
       # ============================================================
       # 19. GITHUB RELEASE
       # ============================================================
-
       - name: "🏷️ Create GitHub Release"
         if: >
           steps.archive.outputs.HAS_ASSETS == 'true' &&
@@ -1836,7 +1949,7 @@ jobs:
           )
 
           if [ "${#assets[@]}" -eq 0 ]; then
-            echo "❌ No release assets."
+            echo "❌ No release assets found."
             exit 1
           fi
 
@@ -1852,7 +1965,6 @@ jobs:
       # ============================================================
       # 20. FINAL STATUS
       # ============================================================
-
       - name: "✅ Final status"
         if: always()
         env:
@@ -1895,17 +2007,20 @@ jobs:
       # ============================================================
       # 21. CLEANUP
       # ============================================================
-
       - name: "🧹 Cleanup"
         if: always()
         run: |
           set +e
 
           docker rm -f bgutil-provider >/dev/null 2>&1 || true
+          sudo killall openvpn >/dev/null 2>&1 || true
           sudo wg-quick down wg0 >/dev/null 2>&1 || true
 
           rm -f \
             /tmp/wg0.conf \
+            /tmp/client.ovpn \
+            /tmp/ovpn-auth.txt \
+            /tmp/openvpn.log \
             /tmp/youtube-cookies.txt \
             /tmp/youtube-music-cookies.txt \
             /tmp/bgutil-ping.json \
