@@ -4,393 +4,1336 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: >
-          Enter one or more Kick VOD/Clip URLs.
-          Separate by commas, spaces, or newlines.
+        description: "🟢 Kick VOD/Clip URLs (separate by comma, space, or newline)"
         required: true
+        type: string
+
       quality:
-        description: 'Video quality (leave empty for best available)'
+        description: "🎚️ Video quality (leave empty for best available)"
         type: choice
         required: false
         options:
-          - ''                 # best available (default)
-          - 1080p60
-          - 1080p
-          - 720p60
-          - 720p
-          - 480p
-          - 360p
-          - 160p
-          - audio_only
-      bundle_all:
-        description: 'Bundle all downloaded files into a single ZIP archive'
-        type: boolean
-        default: false
+          - ""                 # best available (default)
+          - "1080p60"
+          - "1080p"
+          - "720p60"
+          - "720p"
+          - "480p"
+          - "360p"
+          - "160p"
+          - "audio_only"
+        default: ""
+
       upload_method:
-        description: 'Upload destination'
+        description: "☁️ Upload destination"
         required: true
         type: choice
         options:
-          - repo
-          - release
-          - drive
-        default: repo
-      vpn_enabled:
-        description: 'Route downloads through WireGuard VPN (requires secret WG_CONFIG)'
+          - drive         # Google Drive (folder: github-actions)
+          - repo          # Push to repository (split 90MB)
+          - release       # GitHub Release (split 1900MB)
+        default: drive
+
+      bundle_all:
+        description: "📦 Bundle all downloaded files into a single ZIP archive?"
+        required: true
         type: boolean
         default: false
+
+      vpn_enabled:
+        description: "🔒 Route downloads through VPN?"
+        required: true
+        type: boolean
+        default: false
+
+      vpn_type:
+        description: "🛡️ VPN Protocol (if VPN enabled)"
+        required: true
+        type: choice
+        options:
+          - wireguard
+          - openvpn
+        default: wireguard
+
       concurrent_downloads:
-        description: 'Number of URLs to download at the same time'
+        description: "⚡ Concurrent URL workers"
+        required: true
         type: number
-        default: 4
-        required: false
+        default: 3
+
+      retry_count:
+        description: "🔄 Retries per URL"
+        required: true
+        type: number
+        default: 2
+
+      raw_logs:
+        description: "🧪 Show raw verbose logs in console?"
+        required: true
+        type: boolean
+        default: false
+
+      fail_on_partial:
+        description: "❌ Fail workflow if any URL fails?"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: kick-downloader-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_PARALLEL: "3"
+  DEFAULT_RETRIES: "2"
+  DRIVE_CHUNK_SIZE: "16777216" # 16 MB Chunks
+  PIP_BREAK_SYSTEM_PACKAGES: "1"
+
 jobs:
-  actions:
+  kick-download:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      # ============================================================
+      # 01. CHECKOUT
+      # ============================================================
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
         with:
+          fetch-depth: 1
           persist-credentials: true
 
-      - name: Install dependencies
+      # ============================================================
+      # 02. SYSTEM DEPENDENCIES
+      # ============================================================
+      - name: "🛠️ Install system dependencies"
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg jq curl
+          set -Eeuo pipefail
 
-      - name: Get kick-dl CLI
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ffmpeg \
+            curl \
+            jq \
+            zip \
+            unzip \
+            tar \
+            wireguard-tools \
+            openvpn \
+            openvpn-systemd-resolved \
+            openssl \
+            python3 \
+            python3-pip \
+            python-is-python3
+
+          echo "✅ System dependencies installed."
+
+      # ============================================================
+      # 03. INSTALL KICK TOOLS (KICK-DL & YT-DLP)
+      # ============================================================
+      - name: "📦 Install kick-dl CLI & yt-dlp fallback"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
         run: |
-          echo "→ Fetching latest release info..."
+          set -Eeuo pipefail
+
+          echo "→ Fetching latest release info for kick-dl..."
           RELEASE_JSON=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/juliogarciape/kick-dl/releases/latest)
-          if ! echo "$RELEASE_JSON" | jq -e '.assets' > /dev/null 2>&1; then
-            echo "❌ Failed to fetch release info"
-            exit 1
-          fi
-          ASSET_NAME=$(echo "$RELEASE_JSON" | jq -r '.assets[].name' | grep -E 'linux.*amd64|Linux.*x86_64' | head -1)
-          if [ -z "$ASSET_NAME" ]; then
-            echo "❌ Could not find Linux amd64 asset"
-            exit 1
-          fi
-          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name==$name) | .browser_download_url')
-          echo "→ Downloading $ASSET_NAME ..."
-          curl -sSL -o kickdl_archive "$DOWNLOAD_URL"
-          if [[ "$ASSET_NAME" == *.zip ]]; then
-            unzip -q kickdl_archive -d kickdl_extracted
+            https://api.github.com/repos/juliogarciape/kick-dl/releases/latest || curl -sS https://api.github.com/repos/juliogarciape/kick-dl/releases/latest)
+
+          ASSET_NAME=$(echo "$RELEASE_JSON" | jq -r '.assets[].name // empty' | grep -Ei 'linux.*(amd64|x86_64)' | head -1 || true)
+          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name==$name) | .browser_download_url // empty' || true)
+
+          if [ -n "$DOWNLOAD_URL" ]; then
+            echo "→ Downloading $ASSET_NAME..."
+            curl -sSL -o /tmp/kickdl_archive "$DOWNLOAD_URL"
+            mkdir -p /tmp/kickdl_extracted
+
+            if [[ "$ASSET_NAME" == *.zip ]]; then
+              unzip -q /tmp/kickdl_archive -d /tmp/kickdl_extracted
+            else
+              tar -xf /tmp/kickdl_archive -C /tmp/kickdl_extracted 2>/dev/null || unzip -q /tmp/kickdl_archive -d /tmp/kickdl_extracted || true
+            fi
+
+            BINARY_PATH=$(find /tmp/kickdl_extracted -type f -name 'kick-dl*' | head -1 || true)
+            if [ -n "$BINARY_PATH" ]; then
+              chmod +x "$BINARY_PATH"
+              sudo mv "$BINARY_PATH" /usr/local/bin/kick-dl
+              echo "✅ kick-dl CLI installed."
+            fi
+            rm -rf /tmp/kickdl_archive /tmp/kickdl_extracted
           else
-            mkdir -p kickdl_extracted
-            tar xf kickdl_archive -C kickdl_extracted
+            echo "⚠️ Could not download pre-built kick-dl, will rely on yt-dlp."
           fi
-          BINARY_PATH=$(find kickdl_extracted -type f -name 'kick-dl' -o -name 'kick-dl*' | head -1)
-          if [ -z "$BINARY_PATH" ]; then
-            echo "❌ Could not find kick-dl binary in archive"
-            exit 1
-          fi
-          chmod +x "$BINARY_PATH"
-          sudo mv "$BINARY_PATH" /usr/local/bin/kick-dl
-          rm -rf kickdl_archive kickdl_extracted
-          echo "✅ kick-dl CLI ready"
 
-      - name: Parse URLs
-        id: parse
+          echo "→ Installing yt-dlp fallback engine..."
+          python3 -m pip install --upgrade --break-system-packages pip setuptools wheel
+          python3 -m pip install --upgrade --break-system-packages "yt-dlp[default]" curl_cffi requests
+
+          echo "✅ Kick download engines installed."
+
+      # ============================================================
+      # 04. TOOLCHAIN VERIFICATION
+      # ============================================================
+      - name: "🔎 Show toolchain versions"
         run: |
-          URLS_INPUT="${{ github.event.inputs.url }}"
-          URLS=$(echo "$URLS_INPUT" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
-          if [ -z "$URLS" ]; then
-            echo "No URLs provided." >&2
+          set -Eeuo pipefail
+
+          echo "kick-dl : $(command -v kick-dl >/dev/null && kick-dl --version 2>&1 || echo 'kick-dl binary available')"
+          echo "yt-dlp  : $(yt-dlp --version 2>&1)"
+          echo "FFmpeg  : $(ffmpeg -version | sed -n '1p')"
+
+      # ============================================================
+      # 05. WORKSPACE & IDENTIFIER
+      # ============================================================
+      - name: "📁 Initialize workspace"
+        run: |
+          set -Eeuo pipefail
+
+          RUN_SUFFIX="$(openssl rand -hex 4 | cut -c1-5)"
+          echo "RUN_SUFFIX=${RUN_SUFFIX}" >> "$GITHUB_ENV"
+          echo "🆔 Generated identifier: ${RUN_SUFFIX}"
+
+          rm -rf work output
+          mkdir -p \
+            work/downloads \
+            work/logs \
+            work/results \
+            work/failed \
+            work/archive \
+            work/package \
+            output
+
+          echo "✅ Workspace initialized."
+
+      # ============================================================
+      # 06. PARSE URLs (OCTAL BUG FIXED)
+      # ============================================================
+      - name: "🔗 Parse and classify URLs"
+        env:
+          RAW_URLS: ${{ inputs.url }}
+        run: |
+          set -Eeuo pipefail
+
+          : > work/input_urls.txt
+          : > work/jobs.tsv
+
+          # Clean and separate input URLs
+          printf '%s\n' "$RAW_URLS" |
+            tr ',' '\n' |
+            sed 's/\r//g' |
+            awk '{for (i = 1; i <= NF; i++) print $i}' |
+            sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+            awk 'NF' |
+            sort -u > work/input_urls.txt
+
+          if [ ! -s work/input_urls.txt ]; then
+            echo "❌ No URLs supplied."
             exit 1
           fi
-          echo "$URLS" | tr ' ' '\n' > urls.txt
-          echo "URLs to download:"
-          cat urls.txt
-          NUM=$(wc -l < urls.txt)
-          echo "NUM_URLS=$NUM" >> $GITHUB_OUTPUT
 
-      - name: 'Set up WireGuard VPN (if enabled)'
+          index=0
+          while IFS= read -r url; do
+            if [[ "$url" =~ ^https?://(www\.)?kick\.com/ ]]; then
+              index=$((index + 1))
+              # Output plain integer ID to guarantee no octal interpretation errors
+              printf '%d\t%s\n' "$index" "$url" >> work/jobs.tsv
+            else
+              echo "⚠️ Unsupported non-Kick URL skipped: $url"
+            fi
+          done < work/input_urls.txt
+
+          if [ ! -s work/jobs.tsv ]; then
+            echo "❌ No valid Kick URLs found."
+            exit 1
+          fi
+
+          echo "Accepted URLs: $(wc -l < work/jobs.tsv)"
+          cat work/jobs.tsv
+
+      # ============================================================
+      # 07. VPN CONFIGURATION (WIREGUARD & OPENVPN)
+      # ============================================================
+      - name: "🔒 Configure VPN (WireGuard / OpenVPN)"
         id: vpn
-        shell: bash
+        env:
+          VPN_ENABLED: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+          OVPN_CONFIG: ${{ secrets.OVPN_CONFIG }}
+          OVPN_AUTH: ${{ secrets.OVPN_AUTH }}
         run: |
-          VPN_ENABLED="${{ inputs.vpn_enabled }}"
-          echo "VPN_ENABLED=$VPN_ENABLED"
-          if [ "$VPN_ENABLED" = "true" ]; then
-            if [ -z "${{ secrets.WG_CONFIG }}" ]; then
-              echo "VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
-              echo "vpn_available=false" >> $GITHUB_OUTPUT
+          set -Eeuo pipefail
+
+          if [ "$VPN_ENABLED" != "true" ]; then
+            echo "🚫 VPN disabled by input."
+            echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "🛡️ Configuring VPN protocol: ${VPN_TYPE}"
+
+          if [ "$VPN_TYPE" = "wireguard" ]; then
+            if [ -z "$WG_CONFIG" ]; then
+              echo "⚠️ WireGuard requested but WG_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "→ Installing WireGuard tools..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || sudo apt-get install -y -qq wireguard-tools
-            echo "→ Writing WireGuard config..."
-            cat <<'EOF' > /tmp/wg0.conf
-          ${{ secrets.WG_CONFIG }}
-          EOF
-            sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
-            sudo chmod 600 /etc/wireguard/wg0.conf
-            echo "→ Bringing up wg0..."
+
+            umask 077
+            printf '%s\n' "$WG_CONFIG" > /tmp/wg0.conf
+            sudo install -m 600 /tmp/wg0.conf /etc/wireguard/wg0.conf
+
             if sudo wg-quick up wg0; then
-              echo "WireGuard VPN connected."
-              echo "vpn_available=true" >> $GITHUB_OUTPUT
+              echo "✅ WireGuard connected."
+              public_ip="$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org || echo "unavailable")"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
             else
-              echo "Failed to bring up WireGuard – VPN disabled."
-              sudo wg-quick down wg0 2>/dev/null || true
-              echo "vpn_available=false" >> $GITHUB_OUTPUT
+              echo "❌ WireGuard failed."
+              sudo wg-quick down wg0 >/dev/null 2>&1 || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
             fi
-          else
-            echo "vpn_available=false" >> $GITHUB_OUTPUT
+
+          elif [ "$VPN_TYPE" = "openvpn" ]; then
+            if [ -z "$OVPN_CONFIG" ]; then
+              echo "⚠️ OpenVPN requested but OVPN_CONFIG secret is empty."
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ ! -c /dev/net/tun ]; then
+              sudo mkdir -p /dev/net
+              sudo mknod /dev/net/tun c 10 200
+              sudo chmod 600 /dev/net/tun
+            fi
+
+            umask 077
+            printf '%s\n' "$OVPN_CONFIG" > /tmp/client.ovpn
+
+            if [ -n "$OVPN_AUTH" ]; then
+              printf '%s\n' "$OVPN_AUTH" > /tmp/ovpn-auth.txt
+              chmod 600 /tmp/ovpn-auth.txt
+              echo "auth-user-pass /tmp/ovpn-auth.txt" >> /tmp/client.ovpn
+            fi
+
+            echo "🚀 Starting OpenVPN daemon..."
+            sudo openvpn --config /tmp/client.ovpn --daemon --log /tmp/openvpn.log
+
+            echo "⏳ Waiting for OpenVPN tunnel interface..."
+            ready="false"
+            for attempt in $(seq 1 30); do
+              if ip link show dev tun0 >/dev/null 2>&1 || ip link show dev tun1 >/dev/null 2>&1; then
+                ready="true"
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$ready" = "true" ]; then
+              echo "✅ OpenVPN connected."
+              sleep 2
+              public_ip="$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org || echo "unavailable")"
+              echo "🌐 Public IPv4: $public_ip"
+              echo "vpn_available=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ OpenVPN failed to connect."
+              cat /tmp/openvpn.log 2>/dev/null || true
+              echo "vpn_available=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
-      - name: Download all Kick videos concurrently
+      # ============================================================
+      # 08. DOWNLOAD ENGINE (DUAL-STRATEGY: KICK-DL + YT-DLP)
+      # ============================================================
+      - name: "⬇️ Download Kick content"
+        env:
+          TARGET_QUALITY: ${{ inputs.quality }}
+          CONCURRENT_WORKERS: ${{ inputs.concurrent_downloads }}
+          RETRY_COUNT: ${{ inputs.retry_count }}
+          RAW_LOGS: ${{ inputs.raw_logs }}
+          VPN_AVAILABLE: ${{ steps.vpn.outputs.vpn_available }}
         run: |
-          set -e
-          VPN_AVAILABLE="${{ steps.vpn.outputs.vpn_available }}"
-          CONCURRENT="${{ inputs.concurrent_downloads }}"
-          OUTPUT_DIR="kick"
-          FAILED_FILE="failed_urls.txt"
-          mkdir -p "$OUTPUT_DIR"
-          > "$FAILED_FILE"
+          set -Eeuo pipefail
 
-          download_one() {
-            local url="$1"
-            local sanitized=$(echo "$url" | md5sum | cut -c1-12)
-            local outfile="${OUTPUT_DIR}/kick_${sanitized}.mp4"
-            echo "→ Downloading: $url"
-            QUALITY_ARG=""
-            if [ -n "${{ inputs.quality }}" ]; then
-              QUALITY_ARG="-q ${{ inputs.quality }}"
-            fi
-            # Adjust flags if kick-dl uses different ones
-            if kick-dl -u "$url" -o "$outfile" --ffmpeg-path /usr/bin/ffmpeg $QUALITY_ARG; then
-              echo "✅ Success: $url -> $outfile"
+          WORKERS="$CONCURRENT_WORKERS"
+          RETRIES="$RETRY_COUNT"
+
+          if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then WORKERS="$DEFAULT_PARALLEL"; fi
+          if ! [[ "$RETRIES" =~ ^[1-9][0-9]*$ ]]; then RETRIES="$DEFAULT_RETRIES"; fi
+
+          now() { date '+%H:%M:%S'; }
+
+          format_duration() {
+            local secs="$1"
+            if [ "$secs" -ge 3600 ]; then
+              printf '%dh %dm %ds' $((secs / 3600)) $(( (secs % 3600) / 60 )) $((secs % 60))
+            elif [ "$secs" -ge 60 ]; then
+              printf '%dm %ds' $((secs / 60)) $((secs % 60))
             else
-              echo "❌ Download failed: $url"
-              echo "$url" >> "$FAILED_FILE"
-              rm -f "$outfile" 2>/dev/null || true
+              printf '%ds' "$secs"
             fi
           }
-          export -f download_one
-          export OUTPUT_DIR FAILED_FILE VPN_AVAILABLE
-          echo "→ Starting parallel downloads (concurrency: $CONCURRENT, VPN: $VPN_AVAILABLE)"
-          cat urls.txt | xargs -P "$CONCURRENT" -I '{}' bash -c 'download_one "{}"'
-          echo "📊 Downloads finished."
-          ls -la "$OUTPUT_DIR/"
-        shell: bash
 
-      - name: Zip and bundle files
-        run: |
-          BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
-          UPLOAD_METHOD_INPUT="${{ inputs.upload_method }}"
-          if [ "$UPLOAD_METHOD_INPUT" = "repo" ]; then
-            SPLIT_SIZE="99m"
-          elif [ "$UPLOAD_METHOD_INPUT" = "release" ]; then
-            SPLIT_SIZE="1950m"
-          else
-            SPLIT_SIZE="none"
-          fi
-          OUTPUT_DIR="kick"
-          FAILED_FILE="failed_urls.txt"
-          if [ -s "$FAILED_FILE" ]; then
-            RAND_FAIL=$(mktemp -u XXXXX)
-            FAIL_NAME="links-failed-${RAND_FAIL}.txt"
-            mv "$FAILED_FILE" "${OUTPUT_DIR}/$FAIL_NAME"
-            echo "Created failure report: ${OUTPUT_DIR}/$FAIL_NAME"
-          else
-            rm -f "$FAILED_FILE"
-          fi
-          if [ "$BUNDLE_ALL" = "true" ]; then
-            BUNDLE_DIR="bundle_contents"
-            mkdir -p "$BUNDLE_DIR"
-            cp "$OUTPUT_DIR"/* "$BUNDLE_DIR/" 2>/dev/null || true
-            if [ -n "$(ls -A "$BUNDLE_DIR" 2>/dev/null)" ]; then
-              RAND_BUNDLE=$(mktemp -u XXXXX)
-              BUNDLE_ZIP="kick_${RAND_BUNDLE}.zip"
-              echo "Creating bundle: $BUNDLE_ZIP"
-              if [ "$SPLIT_SIZE" = "none" ]; then
-                (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
-              else
-                (cd "$BUNDLE_DIR" && zip -0 "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
-                FULLBUNDLE="${OUTPUT_DIR}/${BUNDLE_ZIP}"
-                SIZE=$(stat -c%s "$FULLBUNDLE" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt $(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 )) ]; then
-                  echo "Bundle ZIP larger than limit, splitting"
-                  rm "$FULLBUNDLE"
-                  (cd "$BUNDLE_DIR" && zip -0 -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${BUNDLE_ZIP}" *)
-                fi
-              fi
-              rm -rf "$BUNDLE_DIR"
-              echo "→ Removing original media files (keeping only the bundle ZIP)"
-              find "$OUTPUT_DIR" -type f ! -name "*.zip" ! -name "*.txt" -delete
-            else
-              echo "No files to bundle."
-              rm -rf "$BUNDLE_DIR"
+          format_bytes() {
+            local bytes="$1"
+            if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then
+              echo "0 B"
+              return
             fi
-          else
-            for f in "$OUTPUT_DIR"/*; do
-              [ -f "$f" ] || continue
-              fname=$(basename "$f")
-              RAND5=$( (tr -dc 'a-z' </dev/urandom || true) | head -c5 )
-              ZIP_BASE="${fname}_${RAND5}"
-              ZIP_NAME="${ZIP_BASE}.zip"
-              echo "Zipping: $fname → $ZIP_NAME"
-              TMPZIP="tmpzip_$$"
-              mkdir -p "$TMPZIP"
-              cp "$f" "$TMPZIP/"
-              if [ "$SPLIT_SIZE" = "none" ]; then
-                (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
+            numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || awk -v b="$bytes" 'BEGIN {
+              split("B KB MB GB TB", units, " ");
+              i=1;
+              while(b>=1024 && i<5) { b/=1024; i++ }
+              printf "%.2f %s", b, units[i]
+            }'
+          }
+
+          safe_log() {
+            (
+              flock -x 200
+              printf '%b\n' "$1"
+            ) 200>/tmp/terminal.lock
+          }
+
+          log_timing() {
+            local id="$1"
+            local message="$2"
+            printf '[%s] %s\n' "$(now)" "$message" >> "work/logs/${id}-timing.log"
+          }
+
+          has_media() {
+            local dir="$1"
+            find "$dir" -type f \( \
+              -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.ts' \
+              -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.aac' \
+            \) 2>/dev/null | grep -q .
+          }
+
+          # Strategy 1: kick-dl CLI
+          run_kick_dl() {
+            local id="$1" url="$2"
+            local dir="work/downloads/${id}"
+            local logfile="work/logs/${id}-kickdl.log"
+
+            if ! command -v kick-dl >/dev/null 2>&1; then
+              return 1
+            fi
+
+            local outfile="${dir}/kick_${id}.mp4"
+            local -a cmd=(
+              kick-dl
+              -u "$url"
+              -o "$outfile"
+              --ffmpeg-path /usr/bin/ffmpeg
+            )
+
+            if [ -n "$TARGET_QUALITY" ]; then
+              cmd+=(-q "$TARGET_QUALITY")
+            fi
+
+            local exit_code=0
+            if [ "$RAW_LOGS" = "true" ]; then
+              set +e
+              timeout 1200 "${cmd[@]}" >> "work/logs/${id}-raw.log" 2>&1
+              exit_code=$?
+              set -e
+            else
+              set +e
+              timeout 1200 "${cmd[@]}" > "$logfile" 2>&1
+              exit_code=$?
+              set -e
+            fi
+
+            if [ "$exit_code" -eq 0 ] && has_media "$dir"; then
+              return 0
+            fi
+            return 1
+          }
+
+          # Strategy 2: yt-dlp fallback engine
+          run_ytdlp_fallback() {
+            local id="$1" url="$2"
+            local dir="work/downloads/${id}"
+            local logfile="work/logs/${id}-ytdlp.log"
+
+            local -a cmd=(
+              yt-dlp
+              --ignore-config
+              --newline
+              --continue
+              --no-overwrites
+              --retries 3
+              --fragment-retries 3
+              --socket-timeout 30
+            )
+
+            if [ "$TARGET_QUALITY" = "audio_only" ]; then
+              cmd+=(
+                -x
+                --audio-format mp3
+                --audio-quality 320k
+                -o "${dir}/%(title,id)s.%(ext)s"
+              )
+            elif [ -n "$TARGET_QUALITY" ]; then
+              local height_num="$(echo "$TARGET_QUALITY" | grep -oE '[0-9]+' | head -1 || echo '')"
+              if [ -n "$height_num" ]; then
+                cmd+=(
+                  -f "bv*[height<=${height_num}]+ba/b[height<=${height_num}]/best"
+                  --merge-output-format mp4
+                  -o "${dir}/%(title,id)s-${TARGET_QUALITY}.%(ext)s"
+                )
               else
-                (cd "$TMPZIP" && zip -0 "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
-                FULLZIP="${OUTPUT_DIR}/${ZIP_NAME}"
-                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt $(( $(echo "$SPLIT_SIZE" | sed 's/m//') * 1048576 )) ]; then
-                  echo "ZIP larger than limit, splitting"
-                  rm "$FULLZIP"
-                  (cd "$TMPZIP" && zip -0 -s "$SPLIT_SIZE" "../${OUTPUT_DIR}/${ZIP_NAME}" "$fname")
+                cmd+=(-o "${dir}/%(title,id)s.%(ext)s")
+              fi
+            else
+              cmd+=(
+                -f "bestvideo+bestaudio/best"
+                --merge-output-format mp4
+                -o "${dir}/%(title,id)s.%(ext)s"
+              )
+            fi
+
+            cmd+=("$url")
+
+            local exit_code=0
+            if [ "$RAW_LOGS" = "true" ]; then
+              set +e
+              timeout 1200 "${cmd[@]}" >> "work/logs/${id}-raw.log" 2>&1
+              exit_code=$?
+              set -e
+            else
+              set +e
+              timeout 1200 "${cmd[@]}" > "$logfile" 2>&1
+              exit_code=$?
+              set -e
+            fi
+
+            if [ "$exit_code" -eq 0 ] && has_media "$dir"; then
+              return 0
+            fi
+            return 1
+          }
+
+          process_one() {
+            local id_raw="$1"
+            local url="$2"
+
+            # Parse base 10 integer to bypass bash octal evaluation errors
+            local id=$((10#$id_raw))
+            local id_fmt
+            id_fmt="$(printf '%04d' "$id")"
+
+            local dir="work/downloads/${id}"
+            mkdir -p "$dir"
+            : > "work/logs/${id}-timing.log"
+
+            local start_sec="$(date +%s)"
+            local started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local status="failed"
+            local winner="none"
+            local reason="exhausted"
+            local file_title="N/A"
+            local file_size=0
+            local speed_str="0 B/s"
+
+            local qual_label="${TARGET_QUALITY:-best available}"
+            safe_log "[$(now)] 🚀 #${id_fmt} (kick) STARTING  │ ${url} [${qual_label}]"
+
+            for attempt in $(seq 1 "$RETRIES"); do
+              local attempt_start="$(date +%s)"
+
+              # 1. Primary Strategy: kick-dl
+              log_timing "$id" "⚡ kick-dl attempt ${attempt}/${RETRIES}"
+              if run_kick_dl "$id" "$url"; then
+                local attempt_elapsed=$(( $(date +%s) - attempt_start ))
+                status="success"
+                winner="kick-dl"
+                reason="completed"
+                log_timing "$id" "🏁 kick-dl succeeded ── took $(format_duration "$attempt_elapsed") ── ✅ SUCCESS"
+                break
+              else
+                local attempt_elapsed=$(( $(date +%s) - attempt_start ))
+                log_timing "$id" "⚡ kick-dl failed ── took $(format_duration "$attempt_elapsed") ── ✖ Trying yt-dlp fallback"
+
+                # 2. Fallback Strategy: yt-dlp
+                local ytdlp_start="$(date +%s)"
+                if run_ytdlp_fallback "$id" "$url"; then
+                  local ytdlp_elapsed=$(( $(date +%s) - ytdlp_start ))
+                  status="success"
+                  winner="yt-dlp (fallback)"
+                  reason="completed"
+                  log_timing "$id" "🏁 yt-dlp fallback succeeded ── took $(format_duration "$ytdlp_elapsed") ── ✅ SUCCESS"
+                  break
+                else
+                  local ytdlp_elapsed=$(( $(date +%s) - ytdlp_start ))
+                  log_timing "$id" "✖ yt-dlp fallback failed ── took $(format_duration "$ytdlp_elapsed")"
                 fi
               fi
-              rm -rf "$TMPZIP"
+
+              if [ "$attempt" -lt "$RETRIES" ]; then
+                sleep $((attempt * 3))
+              fi
             done
+
+            mapfile -t prod_files < <(find "$dir" -maxdepth 1 -type f \( \
+              -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.ts' \
+              -o -iname '*.mp3' -o -iname '*.m4a' \
+            \) 2>/dev/null)
+
+            if [ "${#prod_files[@]}" -gt 0 ]; then
+              file_title="$(basename "${prod_files[0]}")"
+              file_size="$(stat -c%s "${prod_files[0]}")"
+            fi
+
+            local finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            local total_elapsed=$(( $(date +%s) - start_sec ))
+            local total_duration="$(format_duration "$total_elapsed")"
+
+            if [ "$total_elapsed" -gt 0 ] && [ "$file_size" -gt 0 ]; then
+              local spd_bps=$(( file_size / total_elapsed ))
+              speed_str="$(format_bytes "$spd_bps")/s"
+            fi
+
+            if [ "$status" != "success" ]; then
+              printf '%s\t%s\n' "$id" "$url" > "work/failed/${id}.tsv"
+              printf '%s\n' "All extraction engines exhausted" > "work/failed/${id}.reason"
+            fi
+
+            jq -n \
+              --arg id "$id" \
+              --arg url "$url" \
+              --arg status "$status" \
+              --arg provider "$winner" \
+              --arg title "$file_title" \
+              --arg size "$file_size" \
+              --arg quality "$qual_label" \
+              --arg duration "$total_duration" \
+              --arg speed "$speed_str" \
+              --arg started "$started_at" \
+              --arg finished "$finished_at" \
+              '{
+                index: ($id | tonumber),
+                url: $url,
+                status: $status,
+                provider: $provider,
+                filename: $title,
+                size_bytes: ($size | tonumber),
+                quality: $quality,
+                duration: $duration,
+                speed: $speed,
+                started_at: $started,
+                finished_at: $finished
+              }' > "work/results/${id}.json"
+
+            (
+              flock -x 200
+              echo
+              echo "┌──────────────────────────────────────────────────────────────────────────────"
+              if [ "$status" = "success" ]; then
+                printf '│ 🟢 KICK #%s — ✅ SUCCESS (Total: %s via %s)\n' "$id_fmt" "$total_duration" "$winner"
+                printf '│ File : %s (%s — %s)\n' "$file_title" "$(format_bytes "$file_size")" "$speed_str"
+              else
+                printf '│ 🟢 KICK #%s — ❌ FAILED (Total: %s)\n' "$id_fmt" "$total_duration"
+              fi
+              printf '│ URL  : %s\n' "$url"
+              printf '│ Mode : Quality: %s\n' "$qual_label"
+              echo "│ Steps & Provider Timing:"
+              if [ -s "work/logs/${id}-timing.log" ]; then
+                sed 's/^/│   /' "work/logs/${id}-timing.log"
+              else
+                echo "│   (No step timing recorded)"
+              fi
+              echo "└──────────────────────────────────────────────────────────────────────────────"
+              echo
+
+              if [ "$RAW_LOGS" = "true" ] && [ -f "work/logs/${id}-raw.log" ]; then
+                echo "--- [RAW LOGS FOR #${id_fmt}] ---"
+                cat "work/logs/${id}-raw.log"
+                echo "--- [END RAW LOGS FOR #${id_fmt}] ---"
+                echo
+              fi
+            ) 200>/tmp/terminal.lock
+          }
+
+          echo "🚀 Concurrency Workers: $WORKERS"
+          echo "🔄 Max Retries: $RETRIES"
+          echo
+
+          running=0
+          while IFS=$'\t' read -r id url; do
+            process_one "$id" "$url" &
+            running=$((running + 1))
+
+            if [ "$running" -ge "$WORKERS" ]; then
+              wait -n 2>/dev/null || true
+              running=$((running - 1))
+            fi
+          done < work/jobs.tsv
+
+          wait || true
+
+          echo
+          echo "Download round summary:"
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+
+          echo "Requested : $total"
+          echo "Successful: $success"
+          echo "Failed    : $failed"
+
+      # ============================================================
+      # 09. COLLECT FINAL FILES
+      # ============================================================
+      - name: "📚 Collect final files"
+        id: collect
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf output
+          mkdir -p output
+
+          count=0
+          total_bytes=0
+
+          while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            dest="output/$base"
+
+            if [ -e "$dest" ]; then
+              count=$((count + 1))
+              ext="${base##*.}"
+              name="${base%.*}"
+              dest="output/${name}_${count}.${ext}"
+            else
+              count=$((count + 1))
+            fi
+
+            cp --reflink=auto -p "$file" "$dest"
+            size="$(stat -c%s "$dest")"
+            total_bytes=$((total_bytes + size))
+          done < <(
+            find work/downloads -mindepth 2 -maxdepth 2 -type f \( \
+              -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.ts' \
+              -o -iname '*.mp3' -o -iname '*.m4a' \
+            \) -print0 | sort -z
+          )
+
+          failed_report="output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt"
+          : > "$failed_report"
+          failed_count=0
+
+          for result in work/results/*.json; do
+            [ -f "$result" ] || continue
+            status="$(jq -r '.status' "$result")"
+            [ "$status" = "success" ] && continue
+
+            url="$(jq -r '.url' "$result")"
+            failed_count=$((failed_count + 1))
+            echo "$url" >> "$failed_report"
+          done
+
+          if [ "$failed_count" -eq 0 ]; then
+            rm -f "$failed_report"
           fi
-          ls -1 "$OUTPUT_DIR" > "${OUTPUT_DIR}_assets.txt"
-          echo "Assets to upload:"
-          cat "${OUTPUT_DIR}_assets.txt"
-        shell: bash
 
-      - name: 'Disconnect VPN for uploads'
-        if: steps.vpn.outputs.vpn_available == 'true'
+          echo "FINAL_FILE_COUNT=$count" >> "$GITHUB_OUTPUT"
+          echo "TOTAL_BYTES=$total_bytes" >> "$GITHUB_OUTPUT"
+          echo "FAILED_COUNT=$failed_count" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Final collected media: $count ($total_bytes bytes)"
+          echo "Failed URLs          : $failed_count"
+
+      # ============================================================
+      # 10. DISCONNECT VPN (BEFORE UPLOADS)
+      # ============================================================
+      - name: "🔌 Disconnect VPN for uploads"
         run: |
-          echo "→ Bringing down WireGuard to use runner's native internet for uploads"
-          sudo wg-quick down wg0
+          set +e
+          sudo killall openvpn >/dev/null 2>&1 || true
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+          echo "✅ VPN disconnected. Runner native gigabit bandwidth active for uploads."
 
-      - name: "Upload to Google Drive"
-        if: inputs.upload_method == 'drive'
+      # ============================================================
+      # 11. PACKAGE ASSETS (ZIP / SPLIT)
+      # ============================================================
+      - name: "📦 Package output"
+        id: archive
         env:
-          CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          BUNDLE_ALL: ${{ inputs.bundle_all }}
+          UPLOAD_METHOD: ${{ inputs.upload_method }}
         run: |
-          ACCESS_TOKEN=$(curl -s -X POST https://oauth2.googleapis.com/token \
-            -d client_id="$CLIENT_ID" \
-            -d client_secret="$CLIENT_SECRET" \
-            -d refresh_token="$REFRESH_TOKEN" \
-            -d grant_type=refresh_token | jq -r '.access_token')
-          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "❌ Failed to obtain access token"
+          set -Eeuo pipefail
+
+          rm -rf work/archive work/package
+          mkdir -p work/archive work/package
+
+          files_found=0
+          while IFS= read -r -d '' file; do
+            files_found=$((files_found + 1))
+            cp --reflink=auto -p "$file" work/package/
+          done < <(find output -maxdepth 1 -type f ! -name 'FAILED-DOWNLOADS-*' -print0 | sort -z)
+
+          if [ "$files_found" -eq 0 ]; then
+            echo "⚠️ No media files to package."
+            echo "HAS_ASSETS=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          is_disk_full() {
+            local msg="$1"
+            [[ "$msg" =~ (No\ space\ left\ on\ device|Disk\ quota\ exceeded) ]]
+          }
+
+          if [ "$BUNDLE_ALL" = "true" ]; then
+            zip_name="kick_bundle_${RUN_SUFFIX}.zip"
+            echo "📦 Bundling all files into: $zip_name"
+
+            set +e
+            if [ "$UPLOAD_METHOD" = "repo" ]; then
+              zip_err="$( (cd work/package && zip -0 -s 90m -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            elif [ "$UPLOAD_METHOD" = "release" ]; then
+              zip_err="$( (cd work/package && zip -0 -s 1900m -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            else
+              zip_err="$( (cd work/package && zip -0 -r "../archive/${zip_name}" .) 2>&1 )"
+              zip_code=$?
+            fi
+            set -e
+
+            if [ "$zip_code" -ne 0 ]; then
+              if is_disk_full "$zip_err" && [ "$UPLOAD_METHOD" = "drive" ]; then
+                echo "⚠️ Disk full during bundling. Uploading raw media directly to Google Drive."
+                cp -p work/package/* work/archive/
+              else
+                echo "❌ Zipping failed: $zip_err"
+                exit 1
+              fi
+            fi
+
+          else
+            index=0
+            while IFS= read -r -d '' file; do
+              index=$((index + 1))
+              base="$(basename "$file")"
+              safe="$(printf '%s' "$base" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
+              zip_name="single-${index}-${safe}-${RUN_SUFFIX}.zip"
+
+              set +e
+              if [ "$UPLOAD_METHOD" = "repo" ]; then
+                (cd work/package && zip -0 -s 90m "../../work/archive/${zip_name}" "$base")
+              elif [ "$UPLOAD_METHOD" = "release" ]; then
+                (cd work/package && zip -0 -s 1900m "../../work/archive/${zip_name}" "$base")
+              else
+                (cd work/package && zip -0 "../../work/archive/${zip_name}" "$base")
+              fi
+              set -e
+            done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
+          fi
+
+          find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+
+          echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
+          echo
+          echo "📦 Final package contents in output/:"
+          ls -lh output/
+
+      # ============================================================
+      # 12. GITHUB STEP SUMMARY
+      # ============================================================
+      - name: "📊 Write GitHub summary"
+        env:
+          QUALITY_INPUT: ${{ inputs.quality }}
+          UPLOAD_INPUT: ${{ inputs.upload_method }}
+          BUNDLE_INPUT: ${{ inputs.bundle_all }}
+          VPN_INPUT: ${{ inputs.vpn_enabled }}
+          VPN_TYPE: ${{ inputs.vpn_type }}
+        run: |
+          set -Eeuo pipefail
+
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          file_count="${{ steps.collect.outputs.FINAL_FILE_COUNT || 0 }}"
+          total_bytes="${{ steps.collect.outputs.TOTAL_BYTES || 0 }}"
+          formatted_bytes="$(numfmt --to=iec-i --suffix=B "$total_bytes" 2>/dev/null || echo "$total_bytes bytes")"
+
+          {
+            echo "# 🟢 Kick Downloader"
+            echo
+            echo "## Configuration"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Target Quality | \`${QUALITY_INPUT:-best available}\` |"
+            echo "| Upload Destination | \`$UPLOAD_INPUT\` |"
+            echo "| Bundle into Single ZIP | \`$BUNDLE_INPUT\` |"
+            echo "| VPN Enabled | \`$VPN_INPUT\` ($VPN_TYPE) |"
+            echo
+            echo "## Result"
+            echo
+            echo "| Metric | Count / Size |"
+            echo "|---|---:|"
+            echo "| Requested URLs | $total |"
+            echo "| Successful | $success |"
+            echo "| Failed | $failed |"
+            echo "| Downloaded Media | $file_count |"
+            echo "| Total Payload Size | $formatted_bytes |"
+            echo
+            echo "## Download Breakdown"
+            echo '| # | Status | Title / File | Quality | Engine | Duration |'
+            echo '|---|---|---|---|---|---|'
+            for res in work/results/*.json; do
+              [ -f "$res" ] || continue
+              idx="$(jq -r '.index' "$res")"
+              st="$(jq -r '.status' "$res")"
+              fn="$(jq -r '.filename // "N/A"' "$res")"
+              ql="$(jq -r '.quality' "$res")"
+              pr="$(jq -r '.provider' "$res")"
+              dur="$(jq -r '.duration' "$res")"
+              [ "$st" = "success" ] && icon="✅" || icon="❌"
+              echo "| $idx | $icon $st | \`$fn\` | $ql | $pr | $dur |"
+            done
+            echo
+            if [ -f "output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt" ]; then
+              echo "### ⚠️ Failed URLs"
+              echo '```text'
+              cat "output/FAILED-DOWNLOADS-${RUN_SUFFIX}.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ============================================================
+      # 13. DIAGNOSTICS
+      # ============================================================
+      - name: "📊 Upload diagnostics"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloader-diagnostics-${{ github.run_number }}
+          path: |
+            work/logs/
+            work/results/
+            work/failed/
+            work/jobs.tsv
+            output/FAILED-DOWNLOADS-*.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
+      # ============================================================
+      # 14. GOOGLE DRIVE UPLOAD (RESUMABLE CHUNKS)
+      # ============================================================
+      - name: "☁️ Upload to Google Drive"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'drive'
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_FOLDER_NAME: "github-actions"
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "$GOOGLE_CLIENT_ID" ] ||
+             [ -z "$GOOGLE_CLIENT_SECRET" ] ||
+             [ -z "$GOOGLE_REFRESH_TOKEN" ]; then
+            echo "❌ Google Drive credentials are missing in secrets."
             exit 1
           fi
-          FOLDER_NAME="github-actions"
-          QUERY="mimeType='application/vnd.google-apps.folder' and name='$FOLDER_NAME' and trashed=false"
-          FOLDER_ID=$(curl -s -G \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            --data-urlencode "q=$QUERY" \
-            --data-urlencode "fields=files(id)" \
-            "https://www.googleapis.com/drive/v3/files" | jq -r '.files[0].id // ""')
-          if [ -z "$FOLDER_ID" ]; then
-            echo "→ Creating folder '$FOLDER_NAME'"
-            FOLDER_ID=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"name\":\"$FOLDER_NAME\", \"mimeType\":\"application/vnd.google-apps.folder\"}" \
-              "https://www.googleapis.com/drive/v3/files?fields=id" | jq -r '.id')
-            if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
-              echo "❌ Failed to create folder"
-              exit 1
-            fi
+
+          token_json="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --request POST \
+              https://oauth2.googleapis.com/token \
+              --data-urlencode "client_id=${GOOGLE_CLIENT_ID}" \
+              --data-urlencode "client_secret=${GOOGLE_CLIENT_SECRET}" \
+              --data-urlencode "refresh_token=${GOOGLE_REFRESH_TOKEN}" \
+              --data-urlencode "grant_type=refresh_token"
+          )"
+
+          access_token="$(jq -r '.access_token // empty' <<< "$token_json")"
+
+          if [ -z "$access_token" ]; then
+            echo "❌ Could not obtain Google Drive access token."
+            exit 1
           fi
-          echo "✅ Folder ID: $FOLDER_ID"
-          OUTPUT_DIR="kick"
-          for file in "$OUTPUT_DIR"/*; do
-            [ -f "$file" ] || continue
-            fname=$(basename "$file")
-            size=$(stat -c%s "$file")
-            echo "→ Uploading $fname ($size bytes)..."
-            SESSION_URI=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
+
+          query="mimeType='application/vnd.google-apps.folder' and name='${DRIVE_FOLDER_NAME}' and trashed=false"
+
+          folder_response="$(
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --get \
+              https://www.googleapis.com/drive/v3/files \
+              -H "Authorization: Bearer ${access_token}" \
+              --data-urlencode "q=${query}" \
+              --data-urlencode "fields=files(id,name)"
+          )"
+
+          folder_id="$(jq -r '.files[0].id // empty' <<< "$folder_response")"
+
+          if [ -z "$folder_id" ]; then
+            body="$(
+              jq -n \
+                --arg name "$DRIVE_FOLDER_NAME" \
+                '{
+                  name: $name,
+                  mimeType: "application/vnd.google-apps.folder"
+                }'
+            )"
+
+            folder_id="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --retry 5 \
+                --retry-delay 2 \
+                --retry-all-errors \
+                --request POST \
+                https://www.googleapis.com/drive/v3/files \
+                -H "Authorization: Bearer ${access_token}" \
+                -H "Content-Type: application/json" \
+                --data "$body" |
+              jq -r '.id // empty'
+            )"
+          fi
+
+          if [ -z "$folder_id" ]; then
+            echo "❌ Could not locate or create Drive folder."
+            exit 1
+          fi
+
+          upload_file() {
+            local file="$1"
+            local name size
+            name="$(basename "$file")"
+            size="$(stat -c%s "$file")"
+
+            echo "⬆️ Uploading: $name ($size bytes)"
+
+            local headers="$(mktemp)"
+            local metadata="$(
+              jq -n \
+                --arg name "$name" \
+                --arg folder "$folder_id" \
+                '{
+                  name: $name,
+                  parents: [$folder]
+                }'
+            )"
+
+            if ! curl \
+              --silent \
+              --show-error \
+              --request POST \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              -D "$headers" \
+              -o /dev/null \
+              -H "Authorization: Bearer ${access_token}" \
               -H "Content-Type: application/json; charset=UTF-8" \
-              -H "X-Upload-Content-Type: application/zip" \
-              -d "{\"name\":\"$fname\", \"parents\":[\"$FOLDER_ID\"]}" \
-              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable" \
-              -D - | tr -d '\r' | grep -i '^location:' | sed 's/^location: //i' | tr -d ' ')
-            if [ -z "$SESSION_URI" ]; then
-              echo "❌ Failed to initiate upload session for $fname, skipping"
-              continue
+              -H "X-Upload-Content-Type: application/octet-stream" \
+              -H "X-Upload-Content-Length: ${size}" \
+              --data "$metadata" \
+              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"; then
+              rm -f "$headers"
+              return 1
             fi
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Length: $size" \
-              -H "Content-Range: bytes 0-$((size-1))/$size" \
-              --upload-file "$file" \
-              "$SESSION_URI")
-            if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
-              echo "✅ Uploaded $fname"
-            else
-              echo "❌ Upload failed with HTTP $HTTP_CODE"
+
+            local session_uri="$(
+              awk '
+                BEGIN { IGNORECASE=1 }
+                /^location:/ {
+                  sub(/\r$/, "")
+                  sub(/^[^:]*:[[:space:]]*/, "")
+                  print
+                  exit
+                }
+              ' "$headers"
+            )"
+            rm -f "$headers"
+
+            if [ -z "$session_uri" ]; then
+              echo "❌ Could not initialize resumable Drive session."
+              return 1
             fi
+
+            local offset=0
+            while [ "$offset" -lt "$size" ]; do
+              local remaining=$((size - offset))
+              local length="$DRIVE_CHUNK_SIZE"
+              [ "$remaining" -lt "$length" ] && length="$remaining"
+
+              local end=$((offset + length - 1))
+              local chunk="$(mktemp)"
+
+              dd if="$file" of="$chunk" iflag=skip_bytes,count_bytes \
+                skip="$offset" count="$length" status=none
+
+              local chunk_done="false"
+              for attempt in 1 2 3 4 5; do
+                local response="$(mktemp)"
+                local response_headers="$(mktemp)"
+
+                local code="$(
+                  curl \
+                    --silent \
+                    --show-error \
+                    --request PUT \
+                    -D "$response_headers" \
+                    -o "$response" \
+                    --write-out '%{http_code}' \
+                    -H "Authorization: Bearer ${access_token}" \
+                    -H "Content-Type: application/octet-stream" \
+                    -H "Content-Length: ${length}" \
+                    -H "Content-Range: bytes ${offset}-${end}/${size}" \
+                    --data-binary "@${chunk}" \
+                    "$session_uri"
+                )"
+
+                case "$code" in
+                  200|201)
+                    offset="$size"
+                    chunk_done="true"
+                    ;;
+                  308)
+                    local range="$(
+                      awk '
+                        BEGIN { IGNORECASE=1 }
+                        /^Range:/ { sub(/\r$/, ""); print }
+                      ' "$response_headers"
+                    )"
+
+                    if [[ "$range" =~ bytes=0-([0-9]+) ]]; then
+                      offset=$((BASH_REMATCH[1] + 1))
+                    else
+                      offset=$((end + 1))
+                    fi
+                    chunk_done="true"
+                    ;;
+                  429|500|502|503|504)
+                    local delay=$((2 ** attempt))
+                    [ "$delay" -gt 30 ] && delay=30
+                    echo "⚠️ Drive HTTP $code; retrying in ${delay}s..."
+                    sleep "$delay"
+                    ;;
+                  *)
+                    echo "❌ Drive upload chunk error: HTTP $code"
+                    cat "$response" 2>/dev/null || true
+                    rm -f "$response" "$response_headers" "$chunk"
+                    return 1
+                    ;;
+                esac
+
+                rm -f "$response" "$response_headers"
+                [ "$offset" -ge "$size" ] || [ "$chunk_done" = "true" ] && break
+              done
+
+              rm -f "$chunk"
+              if [ "$offset" -lt "$size" ] && [ "$chunk_done" != "true" ]; then
+                echo "❌ Resumable upload chunk failed."
+                return 1
+              fi
+
+              local percent=$((offset * 100 / size))
+              echo "   Progress: ${percent}% (${offset}/${size} bytes)"
+            done
+
+            echo "✅ Uploaded: $name"
+          }
+
+          for file in output/*; do
+            [ -f "$file" ] || continue
+            case "$(basename "$file")" in
+              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt|*.*)
+                upload_file "$file"
+                ;;
+            esac
           done
 
-      - name: Upload to repository (split_push method)
-        if: ${{ inputs.upload_method == 'repo' }}
+          echo "✅ Google Drive upload complete."
+
+      # ============================================================
+      # 15. REPOSITORY UPLOAD
+      # ============================================================
+      - name: "📤 Upload to repository"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'repo'
         env:
-          BRANCH: ${{ github.ref_name }}
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
+          set -Eeuo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config http.postBuffer 524288000
-          OUTPUT_DIR="kick"
-          if [ -z "$(ls -A "$OUTPUT_DIR/")" ]; then
-            echo "No files to upload."
+
+          git add output/
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ Nothing to commit."
             exit 0
           fi
-          git add "$OUTPUT_DIR/"
-          COMMIT_MSG="Add: $(ls -1 "$OUTPUT_DIR/" | tr '\n' ' ' | sed 's/ *$//') [skip ci]"
-          git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
-          RETRIES=5
-          for i in $(seq 1 $RETRIES); do
-            echo "Push attempt $i..."
-            git pull --rebase --autostash origin "$BRANCH"
-            if git push origin "$BRANCH"; then
-              echo "Push succeeded."
-              break
-            else
-              [ $i -lt $RETRIES ] && sleep 3 || exit 1
+
+          git commit -m "Add downloaded Kick media [skip ci]"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt ${attempt}/5..."
+            if git pull --rebase --autostash origin "$BRANCH_NAME" &&
+               git push origin "$BRANCH_NAME"; then
+              echo "✅ Repository push succeeded."
+              exit 0
             fi
+            sleep $((attempt * 3))
           done
 
-      - name: Create Release and upload assets (release method)
-        if: ${{ inputs.upload_method == 'release' }}
+          echo "❌ Repository push failed."
+          exit 1
+
+      # ============================================================
+      # 16. GITHUB RELEASE
+      # ============================================================
+      - name: "🏷️ Create GitHub Release"
+        if: >
+          steps.archive.outputs.HAS_ASSETS == 'true' &&
+          inputs.upload_method == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VPN_INPUT: ${{ inputs.vpn_enabled }}
         run: |
-          OUTPUT_DIR="kick"
-          if [ ! -s "${OUTPUT_DIR}_assets.txt" ]; then
-            echo "No assets to release."
-            exit 0
-          fi
-          RAND5=$(mktemp -u XXXXX)
-          TAG="kick-downloader-${RAND5}"
-          echo "Creating release tag: $TAG"
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git tag "$TAG" -m "Kick download release"
-          git push origin "$TAG"
-          ASSET_ARGS=""
-          while IFS= read -r file; do
-            ASSET_ARGS="$ASSET_ARGS ${OUTPUT_DIR}/$file"
-          done < "${OUTPUT_DIR}_assets.txt"
-          gh release create "$TAG" $ASSET_ARGS \
-            --title "kick-downloader-${RAND5}" \
-            --notes "Automated release from Kick Downloader workflow." \
-            --target "${{ github.ref_name }}"
+          set -Eeuo pipefail
 
-      - name: Cleanup
+          tag="kick-${RUN_SUFFIX}"
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+
+          {
+            echo "# 🟢 Kick Downloader Release"
+            echo
+            echo "Requested URLs: ${total}"
+            echo "Successful: ${success}"
+            echo "Failed: ${failed}"
+            echo "VPN Protected: ${VPN_INPUT}"
+          } > work/release-notes.md
+
+          mapfile -t assets < <(
+            find output \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name '*.zip' \
+                -o -name '*.z[0-9][0-9]' \
+                -o -name 'FAILED-DOWNLOADS-*.txt' \
+              \) \
+              -print |
+            sort
+          )
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "❌ No release assets found."
+            exit 1
+          fi
+
+          gh release create \
+            "$tag" \
+            "${assets[@]}" \
+            --title "Kick Download ${RUN_SUFFIX}" \
+            --notes-file work/release-notes.md \
+            --target "$GITHUB_SHA"
+
+          echo "✅ Release created."
+
+      # ============================================================
+      # 17. FINAL STATUS
+      # ============================================================
+      - name: "✅ Final status"
+        if: always()
+        env:
+          FAIL_ON_PARTIAL: ${{ inputs.fail_on_partial }}
+        run: |
+          set -Eeuo pipefail
+
+          total="$(jq -s 'length' work/results/*.json 2>/dev/null || echo 0)"
+          success="$(jq -s '[.[] | select(.status == "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          failed="$(jq -s '[.[] | select(.status != "success")] | length' work/results/*.json 2>/dev/null || echo 0)"
+          file_count="${{ steps.collect.outputs.FINAL_FILE_COUNT || 0 }}"
+
+          echo
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║                     🟢 FINAL RESULT                        ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          printf '║ Requested URLs : %-43s ║\n' "$total"
+          printf '║ Successful     : %-43s ║\n' "$success"
+          printf '║ Failed         : %-43s ║\n' "$failed"
+          printf '║ Media Saved    : %-43s ║\n' "$file_count"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo
+
+          if [ "$success" -eq 0 ]; then
+            echo "❌ No URLs completed successfully."
+            exit 1
+          fi
+
+          if [ "$failed" -gt 0 ] && [ "$FAIL_ON_PARTIAL" = "true" ]; then
+            echo "❌ Partial failures encountered with fail_on_partial=true."
+            exit 1
+          fi
+
+          if [ "$failed" -gt 0 ]; then
+            echo "⚠️ Partial downloads accepted."
+          else
+            echo "✅ All downloads completed successfully."
+          fi
+
+      # ============================================================
+      # 18. CLEANUP
+      # ============================================================
+      - name: "🧹 Cleanup"
         if: always()
         run: |
-          rm -rf kick urls.txt failed_urls.txt kick_assets.txt 2>/dev/null || true
-          sudo wg-quick down wg0 2>/dev/null || true
+          set +e
+
+          sudo killall openvpn >/dev/null 2>&1 || true
+          sudo wg-quick down wg0 >/dev/null 2>&1 || true
+
+          rm -f \
+            /tmp/wg0.conf \
+            /tmp/client.ovpn \
+            /tmp/ovpn-auth.txt \
+            /tmp/openvpn.log \
+            /tmp/terminal.lock 2>/dev/null || true
+
+          echo "✅ Cleanup complete."
