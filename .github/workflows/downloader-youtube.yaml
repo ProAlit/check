@@ -31,7 +31,7 @@ on:
           - '480'
           - '360'
           - 'best'
-        default: '720 (HD)'
+        default: '480'
 
       audio_quality:
         description: 'Audio bitrate for MP3 downloads'
@@ -42,7 +42,7 @@ on:
           - '192'
           - '128'
           - '64'
-        default: '320'
+        default: '64'
 
       upload_method:
         description: "☁️ Upload destination"
@@ -58,7 +58,7 @@ on:
         description: "📦 Bundle all downloaded files into a single ZIP archive?"
         required: true
         type: boolean
-        default: false
+        default: true
 
       vpn_enabled:
         description: "🔒 Route downloads through VPN?"
@@ -79,7 +79,7 @@ on:
         description: "⚡ Concurrent URL download workers"
         required: true
         type: number
-        default: 3
+        default: 4
 
       retry_count:
         description: "🔄 Retries per provider strategy"
@@ -124,7 +124,7 @@ on:
           - Chrome-123:Macos-14
           - Chrome-124:Macos-14
           - Chrome-131:Macos-14
-        default: None
+        default: 'Chrome-131:Android-14'
 
       raw_logs:
         description: "🧪 Show raw verbose logs in console?"
@@ -136,7 +136,7 @@ on:
         description: "❌ Fail workflow if any URL fails?"
         required: true
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
