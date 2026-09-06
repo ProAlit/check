@@ -352,7 +352,6 @@ jobs:
                   printf '%s' "$val" > "${task_dir}/val.txt"
                 fi
 
-                # Store plain integer ID to guarantee no octal interpretation errors
                 printf '%d\t%s\n' "$index" "$link" >> work/jobs.tsv
               else
                 i=$((i + 1))
@@ -602,20 +601,13 @@ jobs:
 
             cmd+=(--extractor-args "youtube:player_client=default,web_embedded")
 
-            # Mode A: RAW MODE
             if [ "$mode" = "raw" ]; then
               raw_args="$(cat "${task_dir}/raw_args.txt")"
-
-              # Check if output template is specified in raw args
               if ! grep -qE -- '(-o|--output)' <<< "$raw_args"; then
                 cmd+=(-o "${dir}/%(title)s.%(ext)s")
               fi
-
-              # Append user raw args
               eval "cmd+=($raw_args)"
               cmd+=("$url")
-
-            # Mode B: SHORTCUT MODE
             else
               type="$(cat "${task_dir}/type.txt")"
               val="$(cat "${task_dir}/val.txt")"
@@ -664,7 +656,6 @@ jobs:
               return 0
             fi
 
-            # Fallback for shortcut mode with forced IPv4
             if [ "$mode" = "shortcut" ]; then
               local fallback_log="work/logs/${id}-fallback.log"
               cmd+=(--force-ipv4)
@@ -684,7 +675,6 @@ jobs:
             local id_raw="$1"
             local link="$2"
 
-            # Parse base 10 integer to bypass bash octal evaluation errors
             local id=$((10#$id_raw))
             local id_fmt
             id_fmt="$(printf '%04d' "$id")"
@@ -972,7 +962,18 @@ jobs:
             done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
           fi
 
-          find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+          # Preserve failure report if present before clearing raw media files
+          mkdir -p /tmp/reports_backup
+          cp -p output/FAILED-DOWNLOADS-* /tmp/reports_backup/ 2>/dev/null || true
+
+          # Clear uncompressed media from output to avoid duplicate uploads
+          rm -rf output
+          mkdir -p output
+
+          # Populate output solely with archived packages and reports
+          cp -p work/archive/* output/
+          cp -p /tmp/reports_backup/* output/ 2>/dev/null || true
+          rm -rf /tmp/reports_backup
 
           echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
           echo
@@ -1299,11 +1300,7 @@ jobs:
 
           for file in output/*; do
             [ -f "$file" ] || continue
-            case "$(basename "$file")" in
-              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt|*.*)
-                upload_file "$file"
-                ;;
-            esac
+            upload_file "$file"
           done
 
           echo "✅ Google Drive upload complete."
