@@ -6,8 +6,8 @@ QUAL = os.environ.get('FB_QUAL')
 TMP_INFO = os.environ.get('TMP_INFO')
 is_audio = FMT == 'mp3'
 
-VALID_VIDEO_QUAL = ('360p','480p','720p','1080p','1440p','2160p')
-VALID_AUDIO_QUAL = ('64kbps','128kbps','192kbps','320kbps')
+VALID_VIDEO_QUAL = ('360p', '480p', '720p', '1080p', '1440p', '2160p')
+VALID_AUDIO_QUAL = ('64kbps', '128kbps', '192kbps', '320kbps')
 
 if is_audio:
     QUAL = QUAL if QUAL in VALID_AUDIO_QUAL else '192kbps'
@@ -28,11 +28,14 @@ else:
     payload["output"]["quality"] = QUAL
 
 s = requests.Session()
-# Simple Windows UA – no extra headers that trigger Cloudflare
+# Use simple Windows UA – no extra headers that trigger Cloudflare
 s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
 
-# Visit media. subdomain first to obtain necessary session cookies
-s.get("https://media.ytmp3.gg/")
+# Visit media subdomain first to obtain necessary session cookies
+try:
+    s.get("https://media.ytmp3.gg/", timeout=15)
+except Exception:
+    pass
 
 resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
 resp.raise_for_status()
@@ -51,7 +54,7 @@ for _ in range(150):
             dl_url = status.get('downloadUrl')
             break
         if status.get('status') == 'failed':
-            print("::error::Server failed to prepare the video")
+            print("::error::Server failed to prepare the media file")
             sys.exit(1)
     except Exception:
         continue
@@ -60,7 +63,10 @@ if not dl_url:
     print("::error::Could not get download link after 5 minutes")
     sys.exit(1)
 
-vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)[1]
+# Robust ID matching for standard, shorts, and embed URLs
+vid_match = re.search(r'(?:v=|v\/|vi\/|youtu\.be\/|\/v\/|\/embed\/|\/shorts\/)([a-zA-Z0-9_-]{11})', URL)
+vid = vid_match.group(1) if vid_match else "video"
+
 clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
 clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
 clean = clean.lstrip('-')
@@ -68,4 +74,5 @@ fname = f"{clean}_{vid}_{QUAL}.{FMT}"
 
 with open(TMP_INFO, "w", encoding="utf-8") as f:
     json.dump({"url": dl_url, "filename": fname, "title": title}, f)
+
 print(f"::notice::ytmp3.gg prepared: {fname}")
