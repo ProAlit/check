@@ -521,6 +521,86 @@ jobs:
           if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then WORKERS="$DEFAULT_PARALLEL"; fi
           if ! [[ "$RETRIES" =~ ^[1-9][0-9]*$ ]]; then RETRIES="$DEFAULT_RETRIES"; fi
 
+          # Ensure ytmp3.gg helper script exists in environment
+          if [ ! -f ".github/scripts/youtube-downloader-ytmp3gg.py" ] && [ ! -f ".github/script/youtube-downloader-ytmp3gg.py" ]; then
+            mkdir -p /tmp/ytmp3gg
+            cat << 'EOF' > /tmp/ytmp3gg/youtube-downloader-ytmp3gg.py
+          import os, sys, time, re, requests, json
+
+          URL = os.environ.get('FB_URL')
+          FMT = os.environ.get('FB_FMT')
+          QUAL = os.environ.get('FB_QUAL')
+          TMP_INFO = os.environ.get('TMP_INFO')
+          is_audio = FMT == 'mp3'
+
+          VALID_VIDEO_QUAL = ('360p','480p','720p','1080p','1440p','2160p')
+          VALID_AUDIO_QUAL = ('64kbps','128kbps','192kbps','320kbps')
+
+          if is_audio:
+              QUAL = QUAL if QUAL in VALID_AUDIO_QUAL else '192kbps'
+          else:
+              QUAL = QUAL if QUAL in VALID_VIDEO_QUAL else '720p'
+
+          payload = {
+              "url": URL,
+              "os": "linux",
+              "output": {
+                  "type": "audio" if is_audio else "video",
+                  "format": FMT
+              }
+          }
+          if is_audio:
+              payload["audio"] = {"bitrate": QUAL}
+          else:
+              payload["output"]["quality"] = QUAL
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+          try:
+              s.get("https://media.ytmp3.gg/", timeout=15)
+          except Exception:
+              pass
+
+          resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+          resp.raise_for_status()
+
+          data = resp.json()
+          status_url = data.get('statusUrl')
+          title = data.get('title', 'video')
+          dl_url = None
+
+          for _ in range(150):
+              time.sleep(2)
+              try:
+                  r = s.get(status_url, timeout=20)
+                  status = r.json()
+                  if status.get('status') == 'completed':
+                      dl_url = status.get('downloadUrl')
+                      break
+                  if status.get('status') == 'failed':
+                      print("::error::Server failed to prepare the video")
+                      sys.exit(1)
+              except Exception:
+                  continue
+
+          if not dl_url:
+              print("::error::Could not get download link after 5 minutes")
+              sys.exit(1)
+
+          vid_match = re.search(r'(?:v=|v\/|vi\/|youtu\.be\/|\/v\/|\/embed\/|\/shorts\/)([a-zA-Z0-9_-]{11})', URL)
+          vid = vid_match.group(1) if vid_match else "video"
+          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+          clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
+          clean = clean.lstrip('-')
+          fname = f"{clean}_{vid}_{QUAL}.{FMT}"
+
+          with open(TMP_INFO, "w", encoding="utf-8") as f:
+              json.dump({"url": dl_url, "filename": fname, "title": title}, f)
+          print(f"::notice::ytmp3.gg prepared: {fname}")
+          EOF
+          fi
+
           now() { date '+%H:%M:%S'; }
 
           format_duration() {
@@ -578,6 +658,9 @@ jobs:
             fi
           }
 
+          # ────────────────────────────────────────────────────────────
+          # STRATEGY 1: Primary yt-dlp
+          # ────────────────────────────────────────────────────────────
           run_primary_ytdlp() {
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
@@ -653,6 +736,9 @@ jobs:
             return 1
           }
 
+          # ────────────────────────────────────────────────────────────
+          # STRATEGY 2: Piped API
+          # ────────────────────────────────────────────────────────────
           run_piped_fallback() {
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
@@ -734,6 +820,101 @@ jobs:
             fi
           }
 
+          # ────────────────────────────────────────────────────────────
+          # STRATEGY 3: ytmp3.gg External API
+          # ────────────────────────────────────────────────────────────
+          run_ytmp3gg_fallback() {
+            local id="$1" link="$2" type="$3" val="$4"
+            local dir="work/downloads/${id}"
+            local logfile="work/logs/${id}-ytmp3gg.log"
+
+            local script_path=""
+            if [ -f ".github/scripts/youtube-downloader-ytmp3gg.py" ]; then
+              script_path=".github/scripts/youtube-downloader-ytmp3gg.py"
+            elif [ -f ".github/script/youtube-downloader-ytmp3gg.py" ]; then
+              script_path=".github/script/youtube-downloader-ytmp3gg.py"
+            elif [ -f "/tmp/ytmp3gg/youtube-downloader-ytmp3gg.py" ]; then
+              script_path="/tmp/ytmp3gg/youtube-downloader-ytmp3gg.py"
+            fi
+
+            if [ -z "$script_path" ]; then
+              echo "❌ ytmp3.gg python script not found." >> "$logfile"
+              return 1
+            fi
+
+            local fmt_target="mp4"
+            local qual_target="720p"
+
+            if [ "$type" = "a" ]; then
+              fmt_target="mp3"
+              case "$val" in
+                max|best) qual_target="320kbps" ;;
+                min) qual_target="64kbps" ;;
+                *)
+                  local clean_val="${val//[^0-9]/}"
+                  [ -n "$clean_val" ] && qual_target="${clean_val}kbps" || qual_target="192kbps"
+                  ;;
+              esac
+            else
+              fmt_target="mp4"
+              case "$val" in
+                max|best) qual_target="1080p" ;;
+                min) qual_target="360p" ;;
+                *)
+                  local clean_val="${val//[^0-9]/}"
+                  [ -n "$clean_val" ] && qual_target="${clean_val}p" || qual_target="720p"
+                  ;;
+              esac
+            fi
+
+            local tmp_info
+            tmp_info="$(mktemp)"
+
+            echo "🔍 [ytmp3.gg] Requesting URL: $link (fmt: $fmt_target, qual: $qual_target)" >> "$logfile"
+
+            local py_exit=0
+            if [ "$RAW_LOGS" = "true" ]; then
+              FB_URL="$link" FB_FMT="$fmt_target" FB_QUAL="$qual_target" TMP_INFO="$tmp_info" \
+                python3 "$script_path" >> "work/logs/${id}-raw.log" 2>&1 || py_exit=$?
+            else
+              FB_URL="$link" FB_FMT="$fmt_target" FB_QUAL="$qual_target" TMP_INFO="$tmp_info" \
+                python3 "$script_path" >> "$logfile" 2>&1 || py_exit=$?
+            fi
+
+            if [ "$py_exit" -ne 0 ] || [ ! -s "$tmp_info" ]; then
+              echo "❌ [ytmp3.gg] Script failed or produced no metadata." >> "$logfile"
+              rm -f "$tmp_info"
+              return 1
+            fi
+
+            local dl_url fname
+            dl_url="$(jq -r '.url // empty' "$tmp_info" 2>/dev/null || true)"
+            fname="$(jq -r '.filename // empty' "$tmp_info" 2>/dev/null || true)"
+            rm -f "$tmp_info"
+
+            if [ -z "$dl_url" ] || [ -z "$fname" ]; then
+              echo "❌ [ytmp3.gg] Empty download URL or filename." >> "$logfile"
+              return 1
+            fi
+
+            local target_file="${dir}/${fname}"
+            echo "⬇️ [ytmp3.gg] Downloading payload: $fname" >> "$logfile"
+
+            if curl -L --fail --silent --show-error --retry 3 --retry-delay 3 -o "$target_file" "$dl_url" >> "$logfile" 2>&1; then
+              if [ -s "$target_file" ] && has_media "$dir"; then
+                echo "✅ [ytmp3.gg] Download successful: $fname" >> "$logfile"
+                return 0
+              fi
+            fi
+
+            echo "❌ [ytmp3.gg] Direct download failed." >> "$logfile"
+            rm -f "$target_file"
+            return 1
+          }
+
+          # ────────────────────────────────────────────────────────────
+          # STRATEGY 4: Advanced yt-dlp (multi-client)
+          # ────────────────────────────────────────────────────────────
           run_advanced_ytdlp() {
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
@@ -807,7 +988,6 @@ jobs:
             local started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             local status="failed"
             local winner="none"
-            local reason="exhausted"
             local resolved_title="N/A"
             local file_size=0
 
@@ -816,6 +996,7 @@ jobs:
 
             safe_log "[$(now)] 🚀 #${id_fmt} (youtube) STARTING  │ ${link} [${type_str}]"
 
+            # Cascade: Primary -> Piped -> ytmp3.gg -> Advanced yt-dlp
             local step1_start="$(date +%s)"
             if run_primary_ytdlp "$id" "$link" "$type" "$val"; then
               local step1_elapsed=$(( $(date +%s) - step1_start ))
@@ -834,17 +1015,28 @@ jobs:
                 log_timing "$id" "🔌 piped fallback ── took $(format_duration "$step2_elapsed") ── ✅ SUCCESS"
               else
                 local step2_elapsed=$(( $(date +%s) - step2_start ))
-                log_timing "$id" "🔌 piped fallback ── took $(format_duration "$step2_elapsed") ── ✖ FAILED → Advanced clients"
+                log_timing "$id" "🔌 piped fallback ── took $(format_duration "$step2_elapsed") ── ✖ FAILED → ytmp3.gg"
 
                 local step3_start="$(date +%s)"
-                if run_advanced_ytdlp "$id" "$link" "$type" "$val"; then
+                if run_ytmp3gg_fallback "$id" "$link" "$type" "$val"; then
                   local step3_elapsed=$(( $(date +%s) - step3_start ))
                   status="success"
-                  winner="yt-dlp (tv/android)"
-                  log_timing "$id" "📺 advanced multi-client ── took $(format_duration "$step3_elapsed") ── ✅ SUCCESS"
+                  winner="ytmp3.gg API"
+                  log_timing "$id" "🌐 ytmp3.gg fallback ── took $(format_duration "$step3_elapsed") ── ✅ SUCCESS"
                 else
                   local step3_elapsed=$(( $(date +%s) - step3_start ))
-                  log_timing "$id" "📺 advanced multi-client ── took $(format_duration "$step3_elapsed") ── ✖ ALL STRATEGIES FAILED"
+                  log_timing "$id" "🌐 ytmp3.gg fallback ── took $(format_duration "$step3_elapsed") ── ✖ FAILED → Advanced clients"
+
+                  local step4_start="$(date +%s)"
+                  if run_advanced_ytdlp "$id" "$link" "$type" "$val"; then
+                    local step4_elapsed=$(( $(date +%s) - step4_start ))
+                    status="success"
+                    winner="yt-dlp (tv/android)"
+                    log_timing "$id" "📺 advanced multi-client ── took $(format_duration "$step4_elapsed") ── ✅ SUCCESS"
+                  else
+                    local step4_elapsed=$(( $(date +%s) - step4_start ))
+                    log_timing "$id" "📺 advanced multi-client ── took $(format_duration "$step4_elapsed") ── ✖ ALL STRATEGIES FAILED"
+                  fi
                 fi
               fi
             fi
@@ -1110,10 +1302,7 @@ jobs:
             done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
           fi
 
-          # Purge raw unpacked media files from output/ so ONLY packaged archives remain
           find output -maxdepth 1 -type f ! -name 'FAILED-DOWNLOADS-*' -delete
-
-          # Move archives to output/
           find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
 
           echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
@@ -1603,7 +1792,8 @@ jobs:
           sudo killall openvpn >/dev/null 2>&1 || true
           sudo wg-quick down wg0 >/dev/null 2>&1 || true
 
-          rm -f \
+          rm -rf \
+            /tmp/ytmp3gg \
             /tmp/wg0.conf \
             /tmp/client.ovpn \
             /tmp/ovpn-auth.txt \
