@@ -209,7 +209,7 @@ jobs:
           echo "✅ Workspace initialized."
 
       # ============================================================
-      # 06. PARSE URLs (OCTAL BUG FIXED)
+      # 06. PARSE URLs
       # ============================================================
       - name: "🔗 Parse and classify URLs"
         env:
@@ -220,7 +220,6 @@ jobs:
           : > work/input_urls.txt
           : > work/jobs.tsv
 
-          # Clean and separate input URLs
           printf '%s\n' "$RAW_URLS" |
             tr ',' '\n' |
             sed 's/\r//g' |
@@ -238,7 +237,6 @@ jobs:
           while IFS= read -r url; do
             if [[ "$url" =~ ^https?://(www\.|clips\.)?twitch\.tv/ ]]; then
               index=$((index + 1))
-              # Output plain integer ID to guarantee no octal interpretation errors
               printf '%d\t%s\n' "$index" "$url" >> work/jobs.tsv
             else
               echo "⚠️ Unsupported non-Twitch URL skipped: $url"
@@ -412,7 +410,6 @@ jobs:
             \) 2>/dev/null | grep -q .
           }
 
-          # Strategy 1: TwitchDownloaderCLI (Intelligent VOD/Clip mode)
           run_twitch_downloader_cli() {
             local id="$1" url="$2"
             local dir="work/downloads/${id}"
@@ -461,7 +458,6 @@ jobs:
             return 1
           }
 
-          # Strategy 2: yt-dlp Fallback Engine
           run_ytdlp_fallback() {
             local id="$1" url="$2"
             local dir="work/downloads/${id}"
@@ -529,7 +525,6 @@ jobs:
             local id_raw="$1"
             local url="$2"
 
-            # Parse base 10 integer to bypass bash octal evaluation errors
             local id=$((10#$id_raw))
             local id_fmt
             id_fmt="$(printf '%04d' "$id")"
@@ -553,7 +548,6 @@ jobs:
             for attempt in $(seq 1 "$RETRIES"); do
               local attempt_start="$(date +%s)"
 
-              # 1. Primary Strategy: TwitchDownloaderCLI
               log_timing "$id" "⚡ TwitchDownloaderCLI attempt ${attempt}/${RETRIES}"
               if run_twitch_downloader_cli "$id" "$url"; then
                 local attempt_elapsed=$(( $(date +%s) - attempt_start ))
@@ -566,7 +560,6 @@ jobs:
                 local attempt_elapsed=$(( $(date +%s) - attempt_start ))
                 log_timing "$id" "⚡ TwitchDownloaderCLI failed ── took $(format_duration "$attempt_elapsed") ── ✖ Trying yt-dlp fallback"
 
-                # 2. Fallback Strategy: yt-dlp
                 local ytdlp_start="$(date +%s)"
                 if run_ytdlp_fallback "$id" "$url"; then
                   local ytdlp_elapsed=$(( $(date +%s) - ytdlp_start ))
@@ -767,7 +760,7 @@ jobs:
           echo "✅ VPN disconnected. Runner native gigabit bandwidth active for uploads."
 
       # ============================================================
-      # 11. PACKAGE ASSETS (ZIP / SPLIT)
+      # 11. PACKAGE ASSETS (ZIP / SPLIT) - FIXED NO DUPLICATES
       # ============================================================
       - name: "📦 Package output"
         id: archive
@@ -799,7 +792,7 @@ jobs:
 
           if [ "$BUNDLE_ALL" = "true" ]; then
             zip_name="twitch_bundle_${RUN_SUFFIX}.zip"
-            echo "📦 Bundling all files into: $zip_name"
+            echo "📦 Bundling all files into single archive: $zip_name"
 
             set +e
             if [ "$UPLOAD_METHOD" = "repo" ]; then
@@ -824,27 +817,52 @@ jobs:
               fi
             fi
 
+            # Clean raw media files from output/ so ONLY the bundle zip remains
+            find output -maxdepth 1 -type f ! -name 'FAILED-DOWNLOADS-*' -delete
+            find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+
           else
-            index=0
-            while IFS= read -r -d '' file; do
-              index=$((index + 1))
-              base="$(basename "$file")"
-              safe="$(printf '%s' "$base" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
-              zip_name="single-${index}-${safe}-${RUN_SUFFIX}.zip"
+            echo "ℹ️ bundle_all is false: uploading files separately without bundling."
 
-              set +e
-              if [ "$UPLOAD_METHOD" = "repo" ]; then
-                (cd work/package && zip -0 -s 90m "../../work/archive/${zip_name}" "$base")
-              elif [ "$UPLOAD_METHOD" = "release" ]; then
-                (cd work/package && zip -0 -s 1900m "../../work/archive/${zip_name}" "$base")
-              else
-                (cd work/package && zip -0 "../../work/archive/${zip_name}" "$base")
-              fi
-              set -e
-            done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
+            if [ "$UPLOAD_METHOD" = "drive" ]; then
+              # Leave raw media files directly in output/ so they upload as videos on Drive
+              echo "✅ Keeping separate media files uncompressed for Google Drive."
+            elif [ "$UPLOAD_METHOD" = "repo" ]; then
+              # Git repos fail if a single file > 100MB. Split files exceeding 90MB.
+              index=0
+              while IFS= read -r -d '' file; do
+                index=$((index + 1))
+                base="$(basename "$file")"
+                safe="$(printf '%s' "$base" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
+                size="$(stat -c%s "$file")"
+
+                if [ "$size" -gt 94371840 ]; then
+                  echo "📦 File '$base' exceeds 90MB ($size bytes), splitting into chunks..."
+                  zip_name="single-${index}-${safe}-${RUN_SUFFIX}.zip"
+                  (cd work/package && zip -0 -s 90m "../../work/archive/${zip_name}" "$base")
+                  rm -f "output/$base"
+                fi
+              done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
+              find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+            elif [ "$UPLOAD_METHOD" = "release" ]; then
+              # GitHub releases fail if a single file > 2GB. Split files exceeding 1.9GB.
+              index=0
+              while IFS= read -r -d '' file; do
+                index=$((index + 1))
+                base="$(basename "$file")"
+                safe="$(printf '%s' "$base" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
+                size="$(stat -c%s "$file")"
+
+                if [ "$size" -gt 1992294400 ]; then
+                  echo "📦 File '$base' exceeds 1.9GB ($size bytes), splitting into chunks..."
+                  zip_name="single-${index}-${safe}-${RUN_SUFFIX}.zip"
+                  (cd work/package && zip -0 -s 1900m "../../work/archive/${zip_name}" "$base")
+                  rm -f "output/$base"
+                fi
+              done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
+              find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+            fi
           fi
-
-          find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
 
           echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
           echo
@@ -935,7 +953,7 @@ jobs:
           compression-level: 6
 
       # ============================================================
-      # 14. GOOGLE DRIVE UPLOAD (RESUMABLE CHUNKS)
+      # 14. GOOGLE DRIVE UPLOAD (RESUMABLE CHUNKS) - FIXED
       # ============================================================
       - name: "☁️ Upload to Google Drive"
         if: >
@@ -1173,7 +1191,7 @@ jobs:
           for file in output/*; do
             [ -f "$file" ] || continue
             case "$(basename "$file")" in
-              *.zip|*.z[0-9][0-9]|FAILED-DOWNLOADS-*.txt|*.*)
+              *.zip|*.z[0-9][0-9]|*.mp4|*.mkv|*.ts|*.mp3|*.m4a|FAILED-DOWNLOADS-*.txt)
                 upload_file "$file"
                 ;;
             esac
@@ -1253,6 +1271,11 @@ jobs:
               \( \
                 -name '*.zip' \
                 -o -name '*.z[0-9][0-9]' \
+                -o -name '*.mp4' \
+                -o -name '*.mkv' \
+                -o -name '*.ts' \
+                -o -name '*.mp3' \
+                -o -name '*.m4a' \
                 -o -name 'FAILED-DOWNLOADS-*.txt' \
               \) \
               -print |
