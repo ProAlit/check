@@ -4,24 +4,47 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: >
-          Enter one or more YouTube URLs. Each can be followed by optional "v"/"a" and a
-          quality value (e.g. "v 480" or "a 192"). Separate entries with newlines, commas,
-          or spaces.
+        description: |
+          🌐 One or more YouTube URLs (newlines, commas, or spaces).
+          Each URL may be followed by:
+            - 🎥 Shortcut mode:  v <quality>  or  a <quality>
+              Video: max | min | height (e.g. 480, 720, 1080, 4k)
+              Audio: max | min | bitrate in kbps (e.g. 128, 192, 320)
         required: true
         type: string
 
-      output_format:
-        description: 'Output format (applied when no per-URL "v"/"a" is given)'
+      default_type:
+        description: "🎯 Default media type (if URL has no 'v' or 'a' specified)"
         required: true
         type: choice
         options:
-          - 'mp4 (video)'
-          - 'mp3 (audio only)'
-        default: 'mp4 (video)'
+          - 'v (Video)'
+          - 'a (Audio)'
+        default: 'v (Video)'
+
+      video_format:
+        description: "🎬 Video output format (mkv recommended for best compatibility & seeking)"
+        required: true
+        type: choice
+        options:
+          - 'mkv'
+          - 'mp4'
+          - 'webm'
+        default: 'mkv'
+
+      audio_format:
+        description: "🎵 Audio output format (opus recommended for quality/size ratio)"
+        required: true
+        type: choice
+        options:
+          - 'opus'
+          - 'mp3'
+          - 'm4a'
+          - 'flac'
+        default: 'opus'
 
       video_quality:
-        description: 'Max video resolution (default when no per-URL quality is specified)'
+        description: "📺 Max video resolution (default when no per-URL quality is specified)"
         required: true
         type: choice
         options:
@@ -31,28 +54,31 @@ on:
           - '480'
           - '360'
           - 'best'
-        default: '480'
+          - 'min'
+        default: '1080 (Full HD)'
 
       audio_quality:
-        description: 'Audio bitrate for MP3 downloads'
+        description: "🔊 Audio bitrate in kbps (default when no per-URL quality is specified)"
         required: true
         type: choice
         options:
+          - 'best'
           - '320'
+          - '256'
           - '192'
           - '128'
           - '64'
-        default: '64'
+        default: '192'
 
       upload_method:
-        description: "☁️ Upload destination"
+        description: "☁️ Upload destination (Drive, Repo, or Release)"
         required: true
         type: choice
         options:
-          - drive
-          - repo
-          - release
-        default: drive
+          - 'drive'
+          - 'repo'
+          - 'release'
+        default: 'drive'
 
       bundle_all:
         description: "📦 Bundle all downloaded files into a single ZIP archive?"
@@ -61,7 +87,7 @@ on:
         default: true
 
       vpn_enabled:
-        description: "🔒 Route downloads through VPN?"
+        description: "🔒 Route downloads through VPN for privacy/geo-bypass?"
         required: true
         type: boolean
         default: false
@@ -71,69 +97,69 @@ on:
         required: true
         type: choice
         options:
-          - wireguard
-          - openvpn
-        default: wireguard
+          - 'wireguard'
+          - 'openvpn'
+        default: 'wireguard'
 
       concurrent_downloads:
-        description: "⚡ Concurrent URL download workers"
+        description: "⚡ Concurrent URL download workers (higher = faster, but more CPU/RAM)"
         required: true
         type: number
         default: 4
 
       retry_count:
-        description: "🔄 Retries per provider strategy"
+        description: "🔄 Retries per provider strategy (helps with temporary network blocks)"
         required: true
         type: number
         default: 2
 
       impersonate:
-        description: "🎭 Impersonate browser client (curl_cffi)"
+        description: "🎭 Impersonate browser client (curl_cffi) – bypasses basic bot protections"
         required: true
         type: choice
         options:
-          - None
-          - Chrome-133:Macos-15
-          - Chrome-136:Macos-15
-          - Safari-17.2:Ios-17.2
-          - Safari-18.0:Ios-18.0
-          - Safari-18.4:Ios-18.4
-          - Safari-26.0:Ios-26.0
-          - Chrome-99:Android-12
-          - Chrome-131:Android-14
-          - Tor-14.5:Macos-14
-          - Edge-99:Windows-10
-          - Edge-101:Windows-10
-          - Firefox-133:Macos-14
-          - Firefox-135:Macos-14
-          - Safari-15.3:Macos-14
-          - Safari-15.5:Macos-14
-          - Safari-17.0:Macos-14
-          - Safari-18.0:Macos-15
-          - Safari-18.4:Macos-15
-          - Safari-26.0:Macos-26
-          - Chrome-99:Windows-10
-          - Chrome-100:Windows-10
-          - Chrome-101:Windows-10
-          - Chrome-104:Windows-10
-          - Chrome-107:Windows-10
-          - Chrome-110:Windows-10
-          - Chrome-116:Windows-10
-          - Chrome-119:Macos-14
-          - Chrome-120:Macos-14
-          - Chrome-123:Macos-14
-          - Chrome-124:Macos-14
-          - Chrome-131:Macos-14
+          - 'None'
+          - 'Chrome-133:Macos-15'
+          - 'Chrome-136:Macos-15'
+          - 'Safari-17.2:Ios-17.2'
+          - 'Safari-18.0:Ios-18.0'
+          - 'Safari-18.4:Ios-18.4'
+          - 'Safari-26.0:Ios-26.0'
+          - 'Chrome-99:Android-12'
+          - 'Chrome-131:Android-14'
+          - 'Tor-14.5:Macos-14'
+          - 'Edge-99:Windows-10'
+          - 'Edge-101:Windows-10'
+          - 'Firefox-133:Macos-14'
+          - 'Firefox-135:Macos-14'
+          - 'Safari-15.3:Macos-14'
+          - 'Safari-15.5:Macos-14'
+          - 'Safari-17.0:Macos-14'
+          - 'Safari-18.0:Macos-15'
+          - 'Safari-18.4:Macos-15'
+          - 'Safari-26.0:Macos-26'
+          - 'Chrome-99:Windows-10'
+          - 'Chrome-100:Windows-10'
+          - 'Chrome-101:Windows-10'
+          - 'Chrome-104:Windows-10'
+          - 'Chrome-107:Windows-10'
+          - 'Chrome-110:Windows-10'
+          - 'Chrome-116:Windows-10'
+          - 'Chrome-119:Macos-14'
+          - 'Chrome-120:Macos-14'
+          - 'Chrome-123:Macos-14'
+          - 'Chrome-124:Macos-14'
+          - 'Chrome-131:Macos-14'
         default: 'Chrome-131:Android-14'
 
       raw_logs:
-        description: "🧪 Show raw verbose logs in console?"
+        description: "🧪 Show raw verbose yt-dlp logs in console? (Useful for debugging)"
         required: true
         type: boolean
         default: false
 
       fail_on_partial:
-        description: "❌ Fail workflow if any URL fails?"
+        description: "❌ Fail workflow if any single URL fails?"
         required: true
         type: boolean
         default: false
@@ -270,6 +296,7 @@ jobs:
             work/failed \
             work/archive \
             work/package \
+            work/tasks \
             output
 
           echo "✅ Workspace initialized."
@@ -299,27 +326,25 @@ jobs:
       - name: "📝 Parse URLs and per-URL arguments"
         env:
           RAW_INPUT: ${{ inputs.url }}
-          GLOBAL_FORMAT: ${{ inputs.output_format }}
+          GLOBAL_TYPE: ${{ inputs.default_type }}
           GLOBAL_VQ: ${{ inputs.video_quality }}
           GLOBAL_AQ: ${{ inputs.audio_quality }}
+          GLOBAL_VF: ${{ inputs.video_format }}
+          GLOBAL_AF: ${{ inputs.audio_format }}
         run: |
           set -Eeuo pipefail
 
           : > work/jobs.tsv
 
-          def_vq=$(echo "$GLOBAL_VQ" | grep -oE '[0-9]+' | head -1 || echo "720")
+          GLOBAL_TYPE="${GLOBAL_TYPE%% *}" # Extract 'v' or 'a'
+
+          def_vq=$(echo "$GLOBAL_VQ" | grep -oE '[0-9]+' | head -1 || echo "1080")
           [ "$GLOBAL_VQ" = "best" ] && def_vq="max"
+          [ "$GLOBAL_VQ" = "min" ] && def_vq="min"
 
-          def_aq=$(echo "$GLOBAL_AQ" | grep -oE '[0-9]+' | head -1 || echo "320")
+          def_aq=$(echo "$GLOBAL_AQ" | grep -oE '[0-9]+' | head -1 || echo "192")
           [ "$GLOBAL_AQ" = "best" ] && def_aq="max"
-
-          if [ "$GLOBAL_FORMAT" = "mp3 (audio only)" ]; then
-            def_type="a"
-            def_val="$def_aq"
-          else
-            def_type="v"
-            def_val="$def_vq"
-          fi
+          [ "$GLOBAL_AQ" = "min" ] && def_aq="min"
 
           index=0
 
@@ -333,13 +358,14 @@ jobs:
               token="${tokens[$i]}"
               if [[ "$token" =~ ^https?:// ]]; then
                 link="$token"
-                type="$def_type"
-                val="$def_val"
+                type="$GLOBAL_TYPE"
+                val="$([ "$type" = "a" ] && echo "$def_aq" || echo "$def_vq")"
 
                 if [ $((i + 1)) -lt ${#tokens[@]} ]; then
                   next="${tokens[$((i + 1))]}"
                   if [ "$next" = "v" ] || [ "$next" = "a" ]; then
                     type="$next"
+                    val="$([ "$type" = "a" ] && echo "$def_aq" || echo "$def_vq")"
                     i=$((i + 1))
 
                     if [ $((i + 1)) -lt ${#tokens[@]} ]; then
@@ -353,7 +379,20 @@ jobs:
                 fi
 
                 index=$((index + 1))
-                printf '%d\t%s\t%s\t%s\n' "$index" "$link" "$type" "$val" >> work/jobs.tsv
+                task_dir="work/tasks/${index}"
+                mkdir -p "$task_dir"
+                
+                printf '%s' "$link" > "${task_dir}/url.txt"
+                printf '%s' "$type" > "${task_dir}/type.txt"
+                printf '%s' "$val" > "${task_dir}/val.txt"
+                
+                if [ "$type" = "a" ]; then
+                  printf '%s' "$GLOBAL_AF" > "${task_dir}/fmt.txt"
+                else
+                  printf '%s' "$GLOBAL_VF" > "${task_dir}/fmt.txt"
+                fi
+
+                printf '%d\t%s\n' "$index" "$link" >> work/jobs.tsv
               fi
               i=$((i + 1))
             done
@@ -645,7 +684,7 @@ jobs:
             local dir="$1"
             find "$dir" -type f \( \
               -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' \
-              -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.opus' \
+              -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.opus' -o -iname '*.flac' \
             \) -print -quit | grep -q .
           }
 
@@ -665,6 +704,7 @@ jobs:
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
             local logfile="work/logs/${id}-primary.log"
+            local fmt="$(cat "work/tasks/${id}/fmt.txt")"
 
             local -a cmd=(
               yt-dlp
@@ -692,25 +732,37 @@ jobs:
             cmd+=(--extractor-args "youtube:player_client=default,web_embedded")
 
             if [ "$type" = "a" ]; then
-              cmd+=(
-                -x
-                --audio-format mp3
-                --audio-quality "${val:-320k}"
-                -o "${dir}/%(title)s-${val}kbps.%(ext)s"
-              )
+              cmd+=(-x --audio-format "$fmt" --audio-quality "${val:-192k}")
+              cmd+=(-o "${dir}/%(title)s-${val}kbps.%(ext)s")
             else
               local fmt_selector
               case "$val" in
-                max|best|2160) fmt_selector="bv*[height<=2160]+ba/b[height<=2160]/best" ;;
+                max|best|4k|2160) fmt_selector="bv*[height<=2160]+ba/b[height<=2160]/best" ;;
                 1080) fmt_selector="bv*[height<=1080]+ba/b[height<=1080]/best" ;;
                 720) fmt_selector="bv*[height<=720]+ba/b[height<=720]/best" ;;
                 480) fmt_selector="bv*[height<=480]+ba/b[height<=480]/best" ;;
                 360) fmt_selector="bv*[height<=360]+ba/b[height<=360]/best" ;;
+                min) fmt_selector="wv*+wa/w" ;;
                 *) fmt_selector="bv*[height<=${val}]+ba/b[height<=${val}]/best" ;;
               esac
+              
+              if [ "$fmt" = "mp4" ]; then
+                case "$val" in
+                  max|best|4k|2160) fmt_selector="bv*[ext=mp4][height<=2160]+ba[ext=m4a]/b[ext=mp4][height<=2160]" ;;
+                  1080) fmt_selector="bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]" ;;
+                  720) fmt_selector="bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]" ;;
+                  480) fmt_selector="bv*[ext=mp4][height<=480]+ba[ext=m4a]/b[ext=mp4][height<=480]" ;;
+                  360) fmt_selector="bv*[ext=mp4][height<=360]+ba[ext=m4a]/b[ext=mp4][height<=360]" ;;
+                  min) fmt_selector="wv*[ext=mp4]+wa[ext=m4a]/w[ext=mp4]" ;;
+                  *) fmt_selector="bv*[ext=mp4][height<=${val}]+ba[ext=m4a]/b[ext=mp4][height<=${val}]" ;;
+                esac
+                cmd+=(--merge-output-format mp4 --postprocessor-args "ffmpeg:-movflags +faststart")
+              else
+                cmd+=(--merge-output-format "$fmt")
+              fi
+
               cmd+=(
                 -f "$fmt_selector"
-                --merge-output-format mp4
                 -o "${dir}/%(title)s-${val}p.%(ext)s"
               )
             fi
@@ -743,6 +795,7 @@ jobs:
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
             local logfile="work/logs/${id}-piped.log"
+            local fmt="$(cat "work/tasks/${id}/fmt.txt")"
 
             local vid
             vid="$(extract_video_id "$link")"
@@ -784,10 +837,19 @@ jobs:
               [ -z "$audio_url" ] && return 1
 
               local raw_audio="${dir}/temp_${vid}.m4a"
-              local final_mp3="${dir}/${safe_title}-${val}kbps.mp3"
+              local final_audio="${dir}/${safe_title}-${val}kbps.${fmt}"
 
               curl -L --fail --silent --show-error --retry 3 --retry-delay 2 -o "$raw_audio" "$audio_url"
-              ffmpeg -hide_banner -loglevel error -y -i "$raw_audio" -vn -c:a libmp3lame -b:a "${val}k" "$final_mp3"
+              
+              if [ "$fmt" = "mp3" ]; then
+                ffmpeg -hide_banner -loglevel error -y -i "$raw_audio" -vn -c:a libmp3lame -b:a "${val}k" "$final_audio"
+              elif [ "$fmt" = "opus" ]; then
+                ffmpeg -hide_banner -loglevel error -y -i "$raw_audio" -vn -c:a libopus -b:a "${val}k" "$final_audio"
+              elif [ "$fmt" = "flac" ]; then
+                ffmpeg -hide_banner -loglevel error -y -i "$raw_audio" -vn -c:a flac "$final_audio"
+              else # m4a
+                ffmpeg -hide_banner -loglevel error -y -i "$raw_audio" -vn -c:a aac -b:a "${val}k" "$final_audio"
+              fi
               rm -f "$raw_audio"
               return 0
             else
@@ -809,12 +871,16 @@ jobs:
 
               local tmp_v="${dir}/.tmp_${vid}_video"
               local tmp_a="${dir}/.tmp_${vid}_audio"
-              local final_mp4="${dir}/${safe_title}-${val}p.mp4"
+              local final_video="${dir}/${safe_title}-${val}p.${fmt}"
 
               curl -L --fail --silent --show-error --retry 3 --retry-delay 2 -o "$tmp_v" "$video_url"
               curl -L --fail --silent --show-error --retry 3 --retry-delay 2 -o "$tmp_a" "$audio_url"
 
-              ffmpeg -hide_banner -loglevel error -y -i "$tmp_v" -i "$tmp_a" -c copy "$final_mp4" 2>> "$logfile"
+              if [ "$fmt" = "mp4" ]; then
+                ffmpeg -hide_banner -loglevel error -y -i "$tmp_v" -i "$tmp_a" -c copy -movflags +faststart "$final_video" 2>> "$logfile"
+              else
+                ffmpeg -hide_banner -loglevel error -y -i "$tmp_v" -i "$tmp_a" -c copy "$final_video" 2>> "$logfile"
+              fi
               rm -f "$tmp_v" "$tmp_a"
               return 0
             fi
@@ -827,6 +893,7 @@ jobs:
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
             local logfile="work/logs/${id}-ytmp3gg.log"
+            local fmt="$(cat "work/tasks/${id}/fmt.txt")"
 
             local script_path=""
             if [ -f ".github/scripts/youtube-downloader-ytmp3gg.py" ]; then
@@ -842,11 +909,12 @@ jobs:
               return 1
             fi
 
-            local fmt_target="mp4"
+            local api_fmt="mp4"
+            [ "$type" = "a" ] && api_fmt="mp3"
+            
             local qual_target="720p"
 
             if [ "$type" = "a" ]; then
-              fmt_target="mp3"
               case "$val" in
                 max|best) qual_target="320kbps" ;;
                 min) qual_target="64kbps" ;;
@@ -856,7 +924,6 @@ jobs:
                   ;;
               esac
             else
-              fmt_target="mp4"
               case "$val" in
                 max|best) qual_target="1080p" ;;
                 min) qual_target="360p" ;;
@@ -870,14 +937,14 @@ jobs:
             local tmp_info
             tmp_info="$(mktemp)"
 
-            echo "🔍 [ytmp3.gg] Requesting URL: $link (fmt: $fmt_target, qual: $qual_target)" >> "$logfile"
+            echo "🔍 [ytmp3.gg] Requesting URL: $link (api_fmt: $api_fmt, qual: $qual_target)" >> "$logfile"
 
             local py_exit=0
             if [ "$RAW_LOGS" = "true" ]; then
-              FB_URL="$link" FB_FMT="$fmt_target" FB_QUAL="$qual_target" TMP_INFO="$tmp_info" \
+              FB_URL="$link" FB_FMT="$api_fmt" FB_QUAL="$qual_target" TMP_INFO="$tmp_info" \
                 python3 "$script_path" >> "work/logs/${id}-raw.log" 2>&1 || py_exit=$?
             else
-              FB_URL="$link" FB_FMT="$fmt_target" FB_QUAL="$qual_target" TMP_INFO="$tmp_info" \
+              FB_URL="$link" FB_FMT="$api_fmt" FB_QUAL="$qual_target" TMP_INFO="$tmp_info" \
                 python3 "$script_path" >> "$logfile" 2>&1 || py_exit=$?
             fi
 
@@ -901,8 +968,26 @@ jobs:
             echo "⬇️ [ytmp3.gg] Downloading payload: $fname" >> "$logfile"
 
             if curl -L --fail --silent --show-error --retry 3 --retry-delay 3 -o "$target_file" "$dl_url" >> "$logfile" 2>&1; then
-              if [ -s "$target_file" ] && has_media "$dir"; then
-                echo "✅ [ytmp3.gg] Download successful: $fname" >> "$logfile"
+              local final_file="${dir}/${fname%.*}.${fmt}"
+              
+              if [ "$api_fmt" != "$fmt" ]; then
+                # Remux to requested format
+                if [ "$fmt" = "mp4" ]; then
+                  ffmpeg -hide_banner -loglevel error -y -i "$target_file" -c copy -movflags +faststart "$final_file" 2>> "$logfile"
+                else
+                  ffmpeg -hide_banner -loglevel error -y -i "$target_file" -c copy "$final_file" 2>> "$logfile"
+                fi
+                rm -f "$target_file"
+              else
+                # Already correct format, just ensure faststart for mp4
+                if [ "$fmt" = "mp4" ]; then
+                  ffmpeg -hide_banner -loglevel error -y -i "$target_file" -c copy -movflags +faststart "${target_file}.tmp" 2>> "$logfile" && mv "${target_file}.tmp" "$target_file"
+                fi
+                final_file="$target_file"
+              fi
+
+              if [ -s "$final_file" ] && has_media "$dir"; then
+                echo "✅ [ytmp3.gg] Download successful: $(basename "$final_file")" >> "$logfile"
                 return 0
               fi
             fi
@@ -919,6 +1004,7 @@ jobs:
             local id="$1" link="$2" type="$3" val="$4"
             local dir="work/downloads/${id}"
             local logfile="work/logs/${id}-advanced.log"
+            local fmt="$(cat "work/tasks/${id}/fmt.txt")"
 
             local -a cmd=(
               yt-dlp
@@ -936,23 +1022,37 @@ jobs:
             [ -n "$COOKIES_FILE" ] && [ -f "$COOKIES_FILE" ] && cmd+=(--cookies "$COOKIES_FILE")
 
             if [ "$type" = "a" ]; then
-              cmd+=(
-                -x
-                --audio-format mp3
-                --audio-quality "${val:-320k}"
-                -o "${dir}/%(title)s-${val}kbps.%(ext)s"
-              )
+              cmd+=(-x --audio-format "$fmt" --audio-quality "${val:-192k}")
+              cmd+=(-o "${dir}/%(title)s-${val}kbps.%(ext)s")
             else
               local fmt_selector
               case "$val" in
-                max|best|2160) fmt_selector="bv*[height<=2160]+ba/b[height<=2160]/best" ;;
+                max|best|4k|2160) fmt_selector="bv*[height<=2160]+ba/b[height<=2160]/best" ;;
                 1080) fmt_selector="bv*[height<=1080]+ba/b[height<=1080]/best" ;;
                 720) fmt_selector="bv*[height<=720]+ba/b[height<=720]/best" ;;
+                480) fmt_selector="bv*[height<=480]+ba/b[height<=480]/best" ;;
+                360) fmt_selector="bv*[height<=360]+ba/b[height<=360]/best" ;;
+                min) fmt_selector="wv*+wa/w" ;;
                 *) fmt_selector="bv*[height<=${val}]+ba/b[height<=${val}]/best" ;;
               esac
+              
+              if [ "$fmt" = "mp4" ]; then
+                case "$val" in
+                  max|best|4k|2160) fmt_selector="bv*[ext=mp4][height<=2160]+ba[ext=m4a]/b[ext=mp4][height<=2160]" ;;
+                  1080) fmt_selector="bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]" ;;
+                  720) fmt_selector="bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]" ;;
+                  480) fmt_selector="bv*[ext=mp4][height<=480]+ba[ext=m4a]/b[ext=mp4][height<=480]" ;;
+                  360) fmt_selector="bv*[ext=mp4][height<=360]+ba[ext=m4a]/b[ext=mp4][height<=360]" ;;
+                  min) fmt_selector="wv*[ext=mp4]+wa[ext=m4a]/w[ext=mp4]" ;;
+                  *) fmt_selector="bv*[ext=mp4][height<=${val}]+ba[ext=m4a]/b[ext=mp4][height<=${val}]" ;;
+                esac
+                cmd+=(--merge-output-format mp4 --postprocessor-args "ffmpeg:-movflags +faststart")
+              else
+                cmd+=(--merge-output-format "$fmt")
+              fi
+
               cmd+=(
                 -f "$fmt_selector"
-                --merge-output-format mp4
                 -o "${dir}/%(title)s-${val}p.%(ext)s"
               )
             fi
@@ -973,14 +1073,13 @@ jobs:
           process_one() {
             local id_raw="$1"
             local link="$2"
-            local type="$3"
-            local val="$4"
 
             local id=$((10#$id_raw))
             local id_fmt
             id_fmt="$(printf '%04d' "$id")"
 
             local dir="work/downloads/${id}"
+            local task_dir="work/tasks/${id}"
             mkdir -p "$dir"
             : > "work/logs/${id}-timing.log"
 
@@ -991,8 +1090,12 @@ jobs:
             local resolved_title="N/A"
             local file_size=0
 
-            local type_str="Video (${val}p)"
-            [ "$type" = "a" ] && type_str="Audio (${val}kbps)"
+            local type="$(cat "${task_dir}/type.txt")"
+            local val="$(cat "${task_dir}/val.txt")"
+            local fmt="$(cat "${task_dir}/fmt.txt")"
+            
+            local type_str="Video (${val}p, ${fmt})"
+            [ "$type" = "a" ] && type_str="Audio (${val}kbps, ${fmt})"
 
             safe_log "[$(now)] 🚀 #${id_fmt} (youtube) STARTING  │ ${link} [${type_str}]"
 
@@ -1041,7 +1144,10 @@ jobs:
               fi
             fi
 
-            mapfile -t prod_files < <(find "$dir" -maxdepth 1 -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mp3' -o -iname '*.m4a' \) 2>/dev/null)
+            mapfile -t prod_files < <(find "$dir" -maxdepth 1 -type f \( \
+              -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' \
+              -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.opus' -o -iname '*.flac' \
+            \) 2>/dev/null)
             if [ "${#prod_files[@]}" -gt 0 ]; then
               resolved_title="$(basename "${prod_files[0]}")"
               file_size="$(stat -c%s "${prod_files[0]}")"
@@ -1115,8 +1221,8 @@ jobs:
           echo
 
           running=0
-          while IFS=$'\t' read -r id link type val; do
-            process_one "$id" "$link" "$type" "$val" &
+          while IFS=$'\t' read -r id link; do
+            process_one "$id" "$link" &
             running=$((running + 1))
 
             if [ "$running" -ge "$WORKERS" ]; then
@@ -1141,14 +1247,37 @@ jobs:
       # 12. REMUX & STANDARDIZE CONTAINERS
       # ============================================================
       - name: "🔧 Standardize video & audio formats"
+        env:
+          GLOBAL_VF: ${{ inputs.video_format }}
+          GLOBAL_AF: ${{ inputs.audio_format }}
         run: |
           set -Eeuo pipefail
 
-          find work/downloads -mindepth 2 -maxdepth 2 -type f \( -name '*.mkv' -o -name '*.webm' \) | while read -r source; do
-            output="${source%.*}.mp4"
-            echo "🔧 Remuxing to MP4 container: $(basename "$source")"
-            if ffmpeg -hide_banner -loglevel error -y -i "$source" -c copy "$output" 2>/dev/null; then
-              rm -f "$source"
+          # Remux videos
+          find work/downloads -mindepth 2 -maxdepth 2 -type f \( -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mp4' \) | while read -r source; do
+            ext="${source##*.}"
+            if [ "$ext" != "$GLOBAL_VF" ]; then
+              output="${source%.*}.${GLOBAL_VF}"
+              echo "🔧 Remuxing video to ${GLOBAL_VF}: $(basename "$source")"
+              if [ "$GLOBAL_VF" = "mp4" ]; then
+                ffmpeg -hide_banner -loglevel error -y -i "$source" -c copy -movflags +faststart "$output" 2>/dev/null && rm -f "$source"
+              else
+                ffmpeg -hide_banner -loglevel error -y -i "$source" -c copy "$output" 2>/dev/null && rm -f "$source"
+              fi
+            else
+              if [ "$GLOBAL_VF" = "mp4" ]; then
+                ffmpeg -hide_banner -loglevel error -y -i "$source" -c copy -movflags +faststart "${source}.tmp" 2>/dev/null && mv "${source}.tmp" "$source"
+              fi
+            fi
+          done
+
+          # Remux audio
+          find work/downloads -mindepth 2 -maxdepth 2 -type f \( -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.opus' -o -iname '*.flac' \) | while read -r source; do
+            ext="${source##*.}"
+            if [ "$ext" != "$GLOBAL_AF" ]; then
+              output="${source%.*}.${GLOBAL_AF}"
+              echo "🔧 Remuxing audio to ${GLOBAL_AF}: $(basename "$source")"
+              ffmpeg -hide_banner -loglevel error -y -i "$source" -c copy "$output" 2>/dev/null && rm -f "$source"
             fi
           done
 
@@ -1184,7 +1313,8 @@ jobs:
             total_bytes=$((total_bytes + size))
           done < <(
             find work/downloads -mindepth 2 -maxdepth 2 -type f \( \
-              -iname '*.mp4' -o -iname '*.mp3' -o -iname '*.m4a' \
+              -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' \
+              -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.opus' -o -iname '*.flac' \
             \) -print0 | sort -z
           )
 
@@ -1315,7 +1445,9 @@ jobs:
       # ============================================================
       - name: "📊 Write GitHub summary"
         env:
-          GLOBAL_FORMAT: ${{ inputs.output_format }}
+          GLOBAL_TYPE: ${{ inputs.default_type }}
+          GLOBAL_VF: ${{ inputs.video_format }}
+          GLOBAL_AF: ${{ inputs.audio_format }}
           GLOBAL_VQ: ${{ inputs.video_quality }}
           GLOBAL_AQ: ${{ inputs.audio_quality }}
           UPLOAD_INPUT: ${{ inputs.upload_method }}
@@ -1340,9 +1472,11 @@ jobs:
             echo
             echo "| Setting | Value |"
             echo "|---|---|"
-            echo "| Default Format | \`$GLOBAL_FORMAT\` |"
-            echo "| Default Video Quality | \`$GLOBAL_VQ\` |"
-            echo "| Default Audio Quality | \`$GLOBAL_AQ\` |"
+            echo "| Default Media Type | \`$GLOBAL_TYPE\` |"
+            echo "| Video Format | \`$GLOBAL_VF\` |"
+            echo "| Audio Format | \`$GLOBAL_AF\` |"
+            echo "| Video Quality | \`$GLOBAL_VQ\` |"
+            echo "| Audio Quality | \`$GLOBAL_AQ\` |"
             echo "| Upload Destination | \`$UPLOAD_INPUT\` |"
             echo "| Bundle into Single ZIP | \`$BUNDLE_INPUT\` |"
             echo "| Browser Impersonation | \`$IMPERSONATE_TARGET\` |"
