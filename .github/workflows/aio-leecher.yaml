@@ -73,7 +73,7 @@ on:
         default: '64'
 
       upload_method:
-        description: "☁️ Upload destination (Drive, Repo, or Release)"
+        description: "☁️ Upload destination"
         required: true
         type: choice
         options:
@@ -89,7 +89,7 @@ on:
         default: true
 
       vpn_enabled:
-        description: "🔒 Route downloads through VPN for privacy/geo-bypass?"
+        description: "🔒 Route downloads through VPN"
         required: true
         type: boolean
         default: false
@@ -104,7 +104,7 @@ on:
         default: 'wireguard'
 
       concurrent_downloads:
-        description: "⚡ Concurrent URL download workers (higher = faster, but more CPU/RAM)"
+        description: "⚡ Concurrent URL download workers"
         required: true
         type: number
         default: 3
@@ -116,7 +116,7 @@ on:
         default: 2
 
       impersonate:
-        description: "🎭 Impersonate browser client (curl_cffi) – bypasses basic bot protections"
+        description: "🎭 Impersonate browser client"
         required: true
         type: choice
         options:
