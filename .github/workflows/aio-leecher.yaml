@@ -732,9 +732,11 @@ jobs:
                     min) fmt_selector="wv*[ext=mp4]+wa[ext=m4a]/w[ext=mp4]" ;;
                     *) fmt_selector="bv*[ext=mp4][height<=${val}]+ba[ext=m4a]/b[ext=mp4][height<=${val}]" ;;
                   esac
-                  cmd+=(--merge-output-format mp4 --postprocessor-args "ffmpeg:-movflags +faststart")
+                  # Added --remux-video mp4 to force faststart on single pre-muxed files too
+                  cmd+=(--merge-output-format mp4 --remux-video mp4 --postprocessor-args "ffmpeg:-movflags +faststart")
                 else
-                  cmd+=(--merge-output-format "$fmt")
+                  # Added --remux-video "$fmt" to force MKV/WebM container on single files
+                  cmd+=(--merge-output-format "$fmt" --remux-video "$fmt")
                 fi
 
                 cmd+=(
