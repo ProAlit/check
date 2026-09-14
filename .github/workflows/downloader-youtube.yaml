@@ -55,7 +55,7 @@ on:
           - '360'
           - 'best'
           - 'min'
-        default: '1080 (Full HD)'
+        default: '480'
 
       audio_quality:
         description: "🔊 Audio bitrate in kbps (default when no per-URL quality is specified)"
@@ -68,7 +68,7 @@ on:
           - '192'
           - '128'
           - '64'
-        default: '192'
+        default: '64'
 
       upload_method:
         description: "☁️ Upload destination (Drive, Repo, or Release)"
@@ -99,7 +99,7 @@ on:
         options:
           - 'wireguard'
           - 'openvpn'
-        default: 'wireguard'
+        default: 'openvpn'
 
       concurrent_downloads:
         description: "⚡ Concurrent URL download workers (higher = faster, but more CPU/RAM)"
