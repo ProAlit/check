@@ -5,34 +5,91 @@ on:
     inputs:
       url:
         description: |
-          One or more URLs (newlines, commas, or spaces).
+          🌐 One or more URLs (newlines, commas, or spaces).
           Each URL may be followed by:
-            - Shortcut mode:  v <quality>  or  a <quality>
+            - 🎥 Shortcut mode:  v <quality>  or  a <quality>
               Video: max | min | height (e.g. 480, 720, 1080, 4k)
               Audio: max | min | bitrate in kbps (e.g. 128, 192, 320)
-            - Raw mode:  -- <raw yt-dlp arguments>
+            - ⚙️ Raw mode:  -- <raw yt-dlp arguments>
               Example:  https://example.com/video -- -f bestvideo+bestaudio --merge-output-format mkv
         required: true
         type: string
 
-      upload_method:
-        description: "☁️ Upload destination"
+      default_type:
+        description: "🎯 Default media type (if URL has no 'v' or 'a' specified)"
         required: true
         type: choice
         options:
-          - drive         # Google Drive (folder: github-actions)
-          - repo          # Push to repository (split 90MB)
-          - release       # GitHub Release (split 1900MB)
-        default: drive
+          - 'v (Video)'
+          - 'a (Audio)'
+        default: 'v (Video)'
+
+      video_format:
+        description: "🎬 Video output format (mkv recommended for best compatibility & seeking)"
+        required: true
+        type: choice
+        options:
+          - 'mkv'
+          - 'mp4'
+          - 'webm'
+        default: 'mkv'
+
+      audio_format:
+        description: "🎵 Audio output format (opus recommended for quality/size ratio)"
+        required: true
+        type: choice
+        options:
+          - 'opus'
+          - 'mp3'
+          - 'm4a'
+          - 'flac'
+        default: 'opus'
+
+      video_quality:
+        description: "📺 Max video resolution (default when no per-URL quality is specified)"
+        required: true
+        type: choice
+        options:
+          - '2160 (4K)'
+          - '1080 (Full HD)'
+          - '720 (HD)'
+          - '480'
+          - '360'
+          - 'best'
+          - 'min'
+        default: '480'
+
+      audio_quality:
+        description: "🔊 Audio bitrate in kbps (default when no per-URL quality is specified)"
+        required: true
+        type: choice
+        options:
+          - 'best'
+          - '320'
+          - '256'
+          - '192'
+          - '128'
+          - '64'
+        default: '64'
+
+      upload_method:
+        description: "☁️ Upload destination (Drive, Repo, or Release)"
+        required: true
+        type: choice
+        options:
+          - 'drive'
+          - 'repo'
+          - 'release'
+        default: 'drive'
 
       bundle_all:
         description: "📦 Bundle all downloaded files into a single ZIP archive?"
         required: true
         type: boolean
-        default: false
+        default: true
 
       vpn_enabled:
-        description: "🔒 Route downloads through VPN?"
+        description: "🔒 Route downloads through VPN for privacy/geo-bypass?"
         required: true
         type: boolean
         default: false
@@ -42,72 +99,72 @@ on:
         required: true
         type: choice
         options:
-          - wireguard
-          - openvpn
-        default: wireguard
+          - 'wireguard'
+          - 'openvpn'
+        default: 'wireguard'
 
       concurrent_downloads:
-        description: "⚡ Concurrent URL download workers"
+        description: "⚡ Concurrent URL download workers (higher = faster, but more CPU/RAM)"
         required: true
         type: number
         default: 3
 
       retry_count:
-        description: "🔄 Retries per URL"
+        description: "🔄 Retries per URL (helps with temporary network blocks)"
         required: true
         type: number
         default: 2
 
       impersonate:
-        description: "🎭 Impersonate browser client (curl_cffi) – leave 'None' to disable"
+        description: "🎭 Impersonate browser client (curl_cffi) – bypasses basic bot protections"
         required: true
         type: choice
         options:
-          - None
-          - Chrome-133:Macos-15
-          - Chrome-136:Macos-15
-          - Safari-17.2:Ios-17.2
-          - Safari-18.0:Ios-18.0
-          - Safari-18.4:Ios-18.4
-          - Safari-26.0:Ios-26.0
-          - Chrome-99:Android-12
-          - Chrome-131:Android-14
-          - Tor-14.5:Macos-14
-          - Edge-99:Windows-10
-          - Edge-101:Windows-10
-          - Firefox-133:Macos-14
-          - Firefox-135:Macos-14
-          - Safari-15.3:Macos-14
-          - Safari-15.5:Macos-14
-          - Safari-17.0:Macos-14
-          - Safari-18.0:Macos-15
-          - Safari-18.4:Macos-15
-          - Safari-26.0:Macos-26
-          - Chrome-99:Windows-10
-          - Chrome-100:Windows-10
-          - Chrome-101:Windows-10
-          - Chrome-104:Windows-10
-          - Chrome-107:Windows-10
-          - Chrome-110:Windows-10
-          - Chrome-116:Windows-10
-          - Chrome-119:Macos-14
-          - Chrome-120:Macos-14
-          - Chrome-123:Macos-14
-          - Chrome-124:Macos-14
-          - Chrome-131:Macos-14
-        default: None
+          - 'None'
+          - 'Chrome-133:Macos-15'
+          - 'Chrome-136:Macos-15'
+          - 'Safari-17.2:Ios-17.2'
+          - 'Safari-18.0:Ios-18.0'
+          - 'Safari-18.4:Ios-18.4'
+          - 'Safari-26.0:Ios-26.0'
+          - 'Chrome-99:Android-12'
+          - 'Chrome-131:Android-14'
+          - 'Tor-14.5:Macos-14'
+          - 'Edge-99:Windows-10'
+          - 'Edge-101:Windows-10'
+          - 'Firefox-133:Macos-14'
+          - 'Firefox-135:Macos-14'
+          - 'Safari-15.3:Macos-14'
+          - 'Safari-15.5:Macos-14'
+          - 'Safari-17.0:Macos-14'
+          - 'Safari-18.0:Macos-15'
+          - 'Safari-18.4:Macos-15'
+          - 'Safari-26.0:Macos-26'
+          - 'Chrome-99:Windows-10'
+          - 'Chrome-100:Windows-10'
+          - 'Chrome-101:Windows-10'
+          - 'Chrome-104:Windows-10'
+          - 'Chrome-107:Windows-10'
+          - 'Chrome-110:Windows-10'
+          - 'Chrome-116:Windows-10'
+          - 'Chrome-119:Macos-14'
+          - 'Chrome-120:Macos-14'
+          - 'Chrome-123:Macos-14'
+          - 'Chrome-124:Macos-14'
+          - 'Chrome-131:Macos-14'
+        default: 'Chrome-131:Android-14'
 
       raw_logs:
-        description: "🧪 Show raw verbose logs in console?"
+        description: "🧪 Show raw verbose yt-dlp logs in console? (Useful for debugging)"
         required: true
         type: boolean
         default: false
 
       fail_on_partial:
-        description: "❌ Fail workflow if any URL fails?"
+        description: "❌ Fail entire workflow if any single URL fails?"
         required: true
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
@@ -294,10 +351,25 @@ jobs:
       - name: "📝 Parse URLs and execution parameters"
         env:
           RAW_INPUT: ${{ inputs.url }}
+          GLOBAL_TYPE: ${{ inputs.default_type }}
+          GLOBAL_VQ: ${{ inputs.video_quality }}
+          GLOBAL_AQ: ${{ inputs.audio_quality }}
+          GLOBAL_VF: ${{ inputs.video_format }}
+          GLOBAL_AF: ${{ inputs.audio_format }}
         run: |
           set -Eeuo pipefail
 
           : > work/jobs.tsv
+
+          GLOBAL_TYPE="${GLOBAL_TYPE%% *}" # Extract 'v' or 'a'
+
+          def_vq=$(echo "$GLOBAL_VQ" | grep -oE '[0-9]+' | head -1 || echo "1080")
+          [ "$GLOBAL_VQ" = "best" ] && def_vq="max"
+          [ "$GLOBAL_VQ" = "min" ] && def_vq="min"
+
+          def_aq=$(echo "$GLOBAL_AQ" | grep -oE '[0-9]+' | head -1 || echo "192")
+          [ "$GLOBAL_AQ" = "best" ] && def_aq="max"
+          [ "$GLOBAL_AQ" = "min" ] && def_aq="min"
 
           index=0
 
@@ -335,12 +407,15 @@ jobs:
                   printf '%s' "$raw_args" > "${task_dir}/raw_args.txt"
                 else
                   mode="shortcut"
-                  type="v"
-                  val="max"
+                  type="$GLOBAL_TYPE"
+                  fmt="$([ "$type" = "a" ] && echo "$GLOBAL_AF" || echo "$GLOBAL_VF")"
+                  val="$([ "$type" = "a" ] && echo "$def_aq" || echo "$def_vq")"
 
                   if [ ${#args[@]} -ge 1 ]; then
                     if [ "${args[0]}" = "v" ] || [ "${args[0]}" = "a" ]; then
                       type="${args[0]}"
+                      fmt="$([ "$type" = "a" ] && echo "$GLOBAL_AF" || echo "$GLOBAL_VF")"
+                      val="$([ "$type" = "a" ] && echo "$def_aq" || echo "$def_vq")"
                       if [ ${#args[@]} -ge 2 ]; then
                         val="${args[1]}"
                       fi
@@ -350,6 +425,7 @@ jobs:
                   printf 'shortcut' > "${task_dir}/mode.txt"
                   printf '%s' "$type" > "${task_dir}/type.txt"
                   printf '%s' "$val" > "${task_dir}/val.txt"
+                  printf '%s' "$fmt" > "${task_dir}/fmt.txt"
                 fi
 
                 printf '%d\t%s\n' "$index" "$link" >> work/jobs.tsv
@@ -568,7 +644,7 @@ jobs:
             local task_dir="work/tasks/${id}"
             local logfile="work/logs/${id}-run.log"
 
-            local url mode type val raw_args
+            local url mode type val raw_args fmt
             url="$(cat "${task_dir}/url.txt")"
             mode="$(cat "${task_dir}/mode.txt")"
 
@@ -603,6 +679,15 @@ jobs:
 
             if [ "$mode" = "raw" ]; then
               raw_args="$(cat "${task_dir}/raw_args.txt")"
+              
+              # Fix/Concern for Raw Mode: Ensure MP4 has faststart for seeking
+              if [[ "$raw_args" == *"--merge-output-format mp4"* ]] || [[ "$raw_args" == *"-f mp4"* ]] || [[ "$raw_args" == *"--remux-video mp4"* ]]; then
+                if [[ "$raw_args" != *"+faststart"* ]]; then
+                  safe_log "⚠️ [Raw Mode] MP4 output detected without '+faststart'. Injecting for seek compatibility."
+                  raw_args="$raw_args --postprocessor-args \"ffmpeg:-movflags +faststart\""
+                fi
+              fi
+
               if ! grep -qE -- '(-o|--output)' <<< "$raw_args"; then
                 cmd+=(-o "${dir}/%(title)s.%(ext)s")
               fi
@@ -611,14 +696,19 @@ jobs:
             else
               type="$(cat "${task_dir}/type.txt")"
               val="$(cat "${task_dir}/val.txt")"
+              fmt="$(cat "${task_dir}/fmt.txt")"
 
               if [ "$type" = "a" ]; then
-                cmd+=(
-                  -x
-                  --audio-format mp3
-                  --audio-quality "${val:-320k}"
-                  -o "${dir}/%(title)s-${val}kbps.%(ext)s"
-                )
+                if [ "$fmt" = "mp3" ]; then
+                  cmd+=(-x --audio-format mp3 --audio-quality "${val:-192k}")
+                elif [ "$fmt" = "m4a" ]; then
+                  cmd+=(-x --audio-format m4a --audio-quality "${val:-192k}")
+                elif [ "$fmt" = "flac" ]; then
+                  cmd+=(-x --audio-format flac)
+                else # opus
+                  cmd+=(-x --audio-format opus --audio-quality "${val:-192k}")
+                fi
+                cmd+=(-o "${dir}/%(title)s-${val}kbps.%(ext)s")
               else
                 local fmt_selector
                 case "$val" in
@@ -630,9 +720,25 @@ jobs:
                   min) fmt_selector="wv*+wa/w" ;;
                   *) fmt_selector="bv*[height<=${val}]+ba/b[height<=${val}]/best" ;;
                 esac
+                
+                if [ "$fmt" = "mp4" ]; then
+                  # Strict MP4 selection to avoid incompatible codecs (VP9/Opus) and inject faststart
+                  case "$val" in
+                    max|best|4k|2160) fmt_selector="bv*[ext=mp4][height<=2160]+ba[ext=m4a]/b[ext=mp4][height<=2160]" ;;
+                    1080) fmt_selector="bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]" ;;
+                    720) fmt_selector="bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]" ;;
+                    480) fmt_selector="bv*[ext=mp4][height<=480]+ba[ext=m4a]/b[ext=mp4][height<=480]" ;;
+                    360) fmt_selector="bv*[ext=mp4][height<=360]+ba[ext=m4a]/b[ext=mp4][height<=360]" ;;
+                    min) fmt_selector="wv*[ext=mp4]+wa[ext=m4a]/w[ext=mp4]" ;;
+                    *) fmt_selector="bv*[ext=mp4][height<=${val}]+ba[ext=m4a]/b[ext=mp4][height<=${val}]" ;;
+                  esac
+                  cmd+=(--merge-output-format mp4 --postprocessor-args "ffmpeg:-movflags +faststart")
+                else
+                  cmd+=(--merge-output-format "$fmt")
+                fi
+
                 cmd+=(
                   -f "$fmt_selector"
-                  --merge-output-format mp4
                   -o "${dir}/%(title)s-${val}p.%(ext)s"
                 )
               fi
@@ -698,7 +804,8 @@ jobs:
             else
               local t="$(cat "${task_dir}/type.txt")"
               local v="$(cat "${task_dir}/val.txt")"
-              [ "$t" = "a" ] && mode_label="Audio (${v}kbps)" || mode_label="Video (${v}p)"
+              local f="$(cat "${task_dir}/fmt.txt")"
+              [ "$t" = "a" ] && mode_label="Audio (${v}kbps, ${f})" || mode_label="Video (${v}p, ${f})"
             fi
 
             safe_log "[$(now)] 🚀 #${id_fmt} (leecher) STARTING  │ ${link} [${mode_label}]"
@@ -990,6 +1097,11 @@ jobs:
           VPN_INPUT: ${{ inputs.vpn_enabled }}
           VPN_TYPE: ${{ inputs.vpn_type }}
           IMPERSONATE_TARGET: ${{ inputs.impersonate }}
+          GLOBAL_TYPE: ${{ inputs.default_type }}
+          GLOBAL_VF: ${{ inputs.video_format }}
+          GLOBAL_AF: ${{ inputs.audio_format }}
+          GLOBAL_VQ: ${{ inputs.video_quality }}
+          GLOBAL_AQ: ${{ inputs.audio_quality }}
         run: |
           set -Eeuo pipefail
 
@@ -1007,6 +1119,11 @@ jobs:
             echo
             echo "| Setting | Value |"
             echo "|---|---|"
+            echo "| Default Media Type | \`$GLOBAL_TYPE\` |"
+            echo "| Video Format | \`$GLOBAL_VF\` |"
+            echo "| Audio Format | \`$GLOBAL_AF\` |"
+            echo "| Video Quality | \`$GLOBAL_VQ\` |"
+            echo "| Audio Quality | \`$GLOBAL_AQ\` |"
             echo "| Upload Destination | \`$UPLOAD_INPUT\` |"
             echo "| Bundle into Single ZIP | \`$BUNDLE_INPUT\` |"
             echo "| Browser Impersonation | \`$IMPERSONATE_TARGET\` |"
