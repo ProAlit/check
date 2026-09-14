@@ -70,7 +70,7 @@ on:
         description: "🔒 Enable VPN?"
         required: true
         type: boolean
-        default: false
+        default: true
 
       vpn_type:
         description: "🛡️ VPN Type (if VPN enabled)"
@@ -79,7 +79,7 @@ on:
         options:
           - wireguard
           - openvpn
-        default: wireguard
+        default: openvpn
 
       fallback_soundcloud:
         description: "☁️ Fallback: SoundCloud?"
