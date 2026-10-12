@@ -466,6 +466,10 @@ jobs:
             local dir="work/downloads/${id}"
             local logfile="work/logs/${id}-attempt-${attempt}.log"
 
+            # Format the ID to 4 digits (e.g., 0001) and generate a 10-character random hex string
+            local id_fmt="$(printf '%04d' "$id")"
+            local random_str="$(openssl rand -hex 5)"
+
             local format=""
             local extract_audio=false
 
@@ -507,10 +511,12 @@ jobs:
               if [ -n "$AUDIO_BITRATE" ] && [ "$AUDIO_BITRATE" != "best" ]; then
                 cmd+=(--audio-quality "$AUDIO_BITRATE")
               fi
-              cmd+=(-o "${dir}/%(title)s-%(id)s.%(ext)s")
+              # Apply custom numbered & random naming here
+              cmd+=(-o "${dir}/[${id_fmt}]_${random_str}.%(ext)s")
             else
               cmd+=(--merge-output-format "$MERGE_FORMAT")
-              cmd+=(-o "${dir}/%(title)s-%(id)s.${MERGE_FORMAT}")
+              # Apply custom numbered & random naming here
+              cmd+=(-o "${dir}/[${id_fmt}]_${random_str}.${MERGE_FORMAT}")
             fi
 
             if [ -n "$CUSTOM_ARGS" ]; then
@@ -832,7 +838,11 @@ jobs:
             done < <(find work/package -maxdepth 1 -type f -print0 | sort -z)
           fi
 
-          find work/archive -maxdepth 1 -type f \( -name '*.zip' -o -name '*.z[0-9][0-9]' \) -exec cp -p {} output/ \;
+          # Clean original media files from output to prevent duplicate uploads
+          find output -maxdepth 1 -type f ! -name 'FAILED-DOWNLOADS-*' -exec rm -f {} +
+          
+          # Move packaged (or fallback raw) files back to output
+          find work/archive -maxdepth 1 -type f -exec cp -p {} output/ \;
 
           echo "HAS_ASSETS=true" >> "$GITHUB_OUTPUT"
           echo
