@@ -733,7 +733,7 @@ jobs:
 
             if [ "$type" = "a" ]; then
               cmd+=(-x --audio-format "$fmt" --audio-quality "${val:-192k}")
-              cmd+=(-o "${dir}/%(title)s-${val}kbps.%(ext)s")
+              cmd+=(-o "${dir}/[${id}] %(title)s-${val}kbps.%(ext)s")
             else
               local fmt_selector
               case "$val" in
@@ -763,7 +763,7 @@ jobs:
 
               cmd+=(
                 -f "$fmt_selector"
-                -o "${dir}/%(title)s-${val}p.%(ext)s"
+                -o "${dir}/[${id}] %(title)s-${val}p.%(ext)s"
               )
             fi
 
@@ -837,7 +837,7 @@ jobs:
               [ -z "$audio_url" ] && return 1
 
               local raw_audio="${dir}/temp_${vid}.m4a"
-              local final_audio="${dir}/${safe_title}-${val}kbps.${fmt}"
+              local final_audio="${dir}/[${id}] ${safe_title}-${val}kbps.${fmt}"
 
               curl -L --fail --silent --show-error --retry 3 --retry-delay 2 -o "$raw_audio" "$audio_url"
               
@@ -871,7 +871,7 @@ jobs:
 
               local tmp_v="${dir}/.tmp_${vid}_video"
               local tmp_a="${dir}/.tmp_${vid}_audio"
-              local final_video="${dir}/${safe_title}-${val}p.${fmt}"
+              local final_video="${dir}/[${id}] ${safe_title}-${val}p.${fmt}"
 
               curl -L --fail --silent --show-error --retry 3 --retry-delay 2 -o "$tmp_v" "$video_url"
               curl -L --fail --silent --show-error --retry 3 --retry-delay 2 -o "$tmp_a" "$audio_url"
@@ -968,7 +968,7 @@ jobs:
             echo "⬇️ [ytmp3.gg] Downloading payload: $fname" >> "$logfile"
 
             if curl -L --fail --silent --show-error --retry 3 --retry-delay 3 -o "$target_file" "$dl_url" >> "$logfile" 2>&1; then
-              local final_file="${dir}/${fname%.*}.${fmt}"
+              local final_file="${dir}/[${id}] ${fname%.*}.${fmt}"
               
               if [ "$api_fmt" != "$fmt" ]; then
                 # Remux to requested format
@@ -981,9 +981,10 @@ jobs:
               else
                 # Already correct format, just ensure faststart for mp4
                 if [ "$fmt" = "mp4" ]; then
-                  ffmpeg -hide_banner -loglevel error -y -i "$target_file" -c copy -movflags +faststart "${target_file}.tmp" 2>> "$logfile" && mv "${target_file}.tmp" "$target_file"
+                  ffmpeg -hide_banner -loglevel error -y -i "$target_file" -c copy -movflags +faststart "${target_file}.tmp" 2>> "$logfile" && mv "${target_file}.tmp" "$final_file" && rm -f "$target_file"
+                else
+                  mv "$target_file" "$final_file"
                 fi
-                final_file="$target_file"
               fi
 
               if [ -s "$final_file" ] && has_media "$dir"; then
@@ -1023,7 +1024,7 @@ jobs:
 
             if [ "$type" = "a" ]; then
               cmd+=(-x --audio-format "$fmt" --audio-quality "${val:-192k}")
-              cmd+=(-o "${dir}/%(title)s-${val}kbps.%(ext)s")
+              cmd+=(-o "${dir}/[${id}] %(title)s-${val}kbps.%(ext)s")
             else
               local fmt_selector
               case "$val" in
@@ -1053,7 +1054,7 @@ jobs:
 
               cmd+=(
                 -f "$fmt_selector"
-                -o "${dir}/%(title)s-${val}p.%(ext)s"
+                -o "${dir}/[${id}] %(title)s-${val}p.%(ext)s"
               )
             fi
 
