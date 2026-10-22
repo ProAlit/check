@@ -736,7 +736,7 @@ jobs:
 
             for provider in "${candidates[@]}"; do
               if [ -n "$choices" ]; then
-                if [[ "$choices" == *"'${provider}'"* ]]; then
+                if [[ "$choices" == *"${provider}"* ]]; then
                   SUPPORTED_PROVIDERS+=("$provider")
                 fi
               elif grep -Fq "$provider" <<< "$help_text"; then
